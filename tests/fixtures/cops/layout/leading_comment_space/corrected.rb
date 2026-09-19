@@ -13,3 +13,8 @@ y = 2
 # !self.collection_items.anonymous.empty?
 
 # #!/usr/bin/env ruby
+
+# Some comment
+# -
+class Foo
+end

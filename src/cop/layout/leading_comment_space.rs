@@ -99,6 +99,19 @@ use crate::parse::source::SourceFile;
 /// `#!` on line 1, so it incorrectly flagged the continuation line. Fixed by
 /// tracking whether the immediately previous comment was an allowed shebang and
 /// only exempting directly consecutive `#!` lines in that narrow case.
+///
+/// ## `AllowYARDCommentBlockSeparator` (rubocop 1.91, vendor bump 2026-09)
+///
+/// When `true` (default `false`), a comment that is exactly `#-` followed by
+/// only whitespace (RuboCop's `/\A#-\s*\z/`) — the YARD convention for
+/// separating a comment block from the code it documents — is exempt from
+/// the "missing space after `#`" check.
+///
+/// NOTE: `AllowDoxygenCommentStyle`, `AllowGemfileRubyComment`,
+/// `AllowRBSInlineAnnotation`, and `AllowSteepAnnotation` are read into local
+/// bindings above but not yet wired into the offense logic (pre-existing gap,
+/// unrelated to this change — out of scope here since they were not part of
+/// the rubocop 1.91 vendor bump's new options).
 pub struct LeadingCommentSpace;
 
 impl Cop for LeadingCommentSpace {
@@ -123,6 +136,7 @@ impl Cop for LeadingCommentSpace {
         let _allow_gemfile_ruby = config.get_bool("AllowGemfileRubyComment", false);
         let _allow_rbs_inline = config.get_bool("AllowRBSInlineAnnotation", false);
         let _allow_steep = config.get_bool("AllowSteepAnnotation", false);
+        let allow_yard_separator = config.get_bool("AllowYARDCommentBlockSeparator", false);
         let bytes = source.as_bytes();
         let mut previous_comment_line = None;
         let mut previous_comment_allowed_shebang = false;
@@ -173,6 +187,13 @@ impl Cop for LeadingCommentSpace {
                 previous_comment_allowed_shebang = false;
                 continue;
             }
+
+            // Skip YARD comment block separators (`#-`) when configured.
+            if allow_yard_separator && is_yard_comment_block_separator(text) {
+                previous_comment_line = Some(line);
+                previous_comment_allowed_shebang = false;
+                continue;
+            }
             let mut diag =
                 self.diagnostic(source, line, column, "Missing space after `#`.".to_string());
             if let Some(ref mut corr) = corrections {
@@ -189,6 +210,14 @@ impl Cop for LeadingCommentSpace {
             previous_comment_line = Some(line);
             previous_comment_allowed_shebang = false;
         }
+    }
+}
+
+/// Matches RuboCop's `/\A#-\s*\z/`: exactly `#-` followed by only whitespace.
+fn is_yard_comment_block_separator(text: &[u8]) -> bool {
+    match text.strip_prefix(b"#-") {
+        Some(rest) => rest.iter().all(|&b| b.is_ascii_whitespace()),
+        None => false,
     }
 }
 
@@ -231,6 +260,11 @@ mod tests {
 
     crate::cop_fixture_tests!(LeadingCommentSpace, "cops/layout/leading_comment_space");
     crate::cop_autocorrect_fixture_tests!(LeadingCommentSpace, "cops/layout/leading_comment_space");
+    crate::cop_variant_fixture_tests!(
+        LeadingCommentSpace,
+        "cops/layout/leading_comment_space",
+        allow_yard_comment_block_separator_true,
+    );
 
     #[test]
     fn autocorrect_insert_space() {
@@ -349,5 +383,36 @@ mod tests {
             "app.rb",
         );
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn allow_yard_comment_block_separator_still_flags_content_after_dash() {
+        use std::collections::HashMap;
+
+        let config = crate::cop::CopConfig {
+            options: HashMap::from([(
+                "AllowYARDCommentBlockSeparator".into(),
+                serde_yml::Value::Bool(true),
+            )]),
+            ..crate::cop::CopConfig::default()
+        };
+        let diags =
+            crate::testutil::run_cop_full_with_config(&LeadingCommentSpace, b"#-foo\n", config);
+        assert_eq!(
+            diags.len(),
+            1,
+            "AllowYARDCommentBlockSeparator only exempts bare `#-`, not `#-foo`"
+        );
+    }
+
+    #[test]
+    fn allow_yard_comment_block_separator_autocorrects_when_disabled() {
+        let input = b"# Some comment\n#-\nclass Foo\nend\n";
+        let (_diags, corrections) =
+            crate::testutil::run_cop_autocorrect(&LeadingCommentSpace, input);
+        assert!(!corrections.is_empty());
+        let cs = crate::correction::CorrectionSet::from_vec(corrections);
+        let corrected = cs.apply(input);
+        assert_eq!(corrected, b"# Some comment\n# -\nclass Foo\nend\n");
     }
 }
