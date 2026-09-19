@@ -26,7 +26,8 @@ Planning branch, not for upstream. Read this first when resuming.
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); #21 discovery open | in progress |
-| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; synth (ir_synth.py) + verify (ir_verify.py) after IrCop lands | in progress |
+| W7 | Post-merge follow-ups: shared tab-aware `indentation_of` + dedup; `Severity:` config parity; HashAlignment 1.91 semantics; MethodCallWithArgsParentheses omit_parentheses reparse rule | blocked on merges |
+| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; ir_synth.py + ir_verify.py + CI job in progress (branch ir/translator-synth-verify, base #23) | in progress |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
@@ -54,7 +55,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #2 vendor: bump rubocop 1.91.0 / rails 2.37.0 / rspec 3.10.2 / performance 1.27.0 / ast 1.50.0 (see 05-vendor-bump-scope.md; 280 implemented cops have upstream behavior changes; oracle re-run on main after merge measures drift)
 
 ## Cross-cutting findings
-- Tab-indented files: `shared::util::indentation_of` counts spaces only; RuboCop's `indentation` uses `/\S/`. Bit three Layout cops (#17, #20, HashAlignment-adjacent). Each fix so far is cop-local; a shared audit of every `indentation_of` caller is pending.
+- Tab-indented files: `shared::util::indentation_of` counts spaces only; RuboCop's `indentation` uses `/\S/`. Bit three Layout cops (#17, #20, HashAlignment-adjacent). Audit in 07-tab-indentation-audit.md: fix `src/cop/shared/util.rs::indentation_of` in place (count `\t`), delete 5 cop-local reimplementations (pure dedup, corpus-neutral), then per-cop gated PRs for the 3 remaining spaces-only decision sites. **Do after #17/#20 merge** (they added local helpers that the dedup removes).
 - `gen_repo_config.py` writes to a fixed `/tmp/nitrocop_corpus_configs/corpus_config_<repo>.yml`; running `run_nitrocop.py` between generating a variant overlay and invoking RuboCop silently reverts the variant.
 - Local runs must be wrapped in `mise exec --` or `bundle info --path` plugin lookups fail silently and create phantom divergence.
 
