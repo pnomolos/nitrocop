@@ -28,6 +28,8 @@ pub enum Token {
     ParamRef(String),      // %1, %param
     Caret,                 // ^ (parent node ref)
     Backtick,              // ` (descend operator)
+    LAngle,                // < (any-order group)
+    RAngle,                // > (any-order group)
 }
 
 pub struct Lexer<'a> {
@@ -143,6 +145,14 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     tokens.push(Token::Backtick);
                 }
+                b'<' => {
+                    self.advance();
+                    tokens.push(Token::LAngle);
+                }
+                b'>' => {
+                    self.advance();
+                    tokens.push(Token::RAngle);
+                }
                 b'!' => {
                     self.advance();
                     tokens.push(Token::Negation);
@@ -166,7 +176,18 @@ impl<'a> Lexer<'a> {
                     // that runs to end of line (`lexer.rex`: `/\#(CALL)/` is
                     // tried before `/\#.*/`).
                     if self.peek().is_some_and(Self::is_call_start) {
-                        let name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        let mut name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        // `CALL` in `lexer.rex` is `(?:CONST_NAME\.)?IDENTIFIER[!?]?`,
+                        // so `#Examples.all` is a single function-call token.
+                        if name.starts_with(|c: char| c.is_ascii_uppercase())
+                            && self.peek() == Some(b'.')
+                        {
+                            self.advance();
+                            name.push('.');
+                            name.push_str(
+                                &self.read_while(|c| Self::is_ident_char(c) || c == b'?'),
+                            );
+                        }
                         tokens.push(Token::HelperCall(name));
                     } else if self.peek() == Some(b'{') {
                         // Ruby string interpolation left in a pattern extracted
@@ -247,9 +268,12 @@ impl<'a> Lexer<'a> {
                         _ if word.ends_with("_type?") => {
                             // Generic _type? predicate: strip `_type?` suffix
                             let stem = &word[..word.len() - 6]; // strip "_type?"
-                            tokens.push(Token::TypePredicate(stem.to_string()));
+                            tokens.push(Token::TypePredicate(stem.replace('-', "_")));
                         }
-                        _ => tokens.push(Token::Ident(word)),
+                        // RuboCop compiles a node type to `#{type.tr('-', '_')}_type?`
+                        // (`node_pattern_subcompiler.rb:88-90`), so `block-pass`
+                        // and `block_pass` are the same type.
+                        _ => tokens.push(Token::Ident(word.replace('-', "_"))),
                     }
                 }
                 _ => {
@@ -372,6 +396,17 @@ mod tests {
     }
 
     #[test]
+    fn test_lexer_hyphenated_node_types_are_normalized() {
+        let mut lexer = Lexer::new("(block-pass (sym :foo))");
+        assert_eq!(lexer.tokenize()[1], Token::Ident("block_pass".to_string()));
+        let mut lexer = Lexer::new("op-asgn_type?");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::TypePredicate("op_asgn".to_string())]
+        );
+    }
+
+    #[test]
     fn test_lexer_cbase() {
         let mut lexer = Lexer::new("::");
         let tokens = lexer.tokenize();
@@ -438,6 +473,62 @@ mod tests {
         let tokens = lexer.tokenize();
         assert_eq!(tokens.iter().filter(|t| **t == Token::LParen).count(), 2);
         assert_eq!(tokens.last(), Some(&Token::RBrace));
+    }
+
+    #[test]
+    fn test_lexer_any_order() {
+        let mut lexer = Lexer::new("<(sym :a) ...>");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0], Token::LAngle);
+        assert_eq!(tokens[1], Token::LParen);
+        assert_eq!(tokens[tokens.len() - 2], Token::Rest);
+        assert_eq!(tokens[tokens.len() - 1], Token::RAngle);
+    }
+
+    #[test]
+    fn test_lexer_captured_any_order() {
+        let mut lexer = Lexer::new("$<int str>");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::Capture,
+                Token::LAngle,
+                Token::Ident("int".to_string()),
+                Token::Ident("str".to_string()),
+                Token::RAngle,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_operator_symbols_are_not_angle_brackets() {
+        let mut lexer = Lexer::new("{:< :> :<=> :<<}");
+        let tokens = lexer.tokenize();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LBrace,
+                Token::SymbolLiteral("<".to_string()),
+                Token::SymbolLiteral(">".to_string()),
+                Token::SymbolLiteral("<=>".to_string()),
+                Token::SymbolLiteral("<<".to_string()),
+                Token::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_const_qualified_function_call() {
+        let mut lexer = Lexer::new("{#ExampleGroups.all #Examples.all}");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::LBrace,
+                Token::HelperCall("ExampleGroups.all".to_string()),
+                Token::HelperCall("Examples.all".to_string()),
+                Token::RBrace,
+            ]
+        );
     }
 
     #[test]

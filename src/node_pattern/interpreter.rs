@@ -8,7 +8,15 @@
 //!
 //! NodeMatch, Wildcard, Rest, NilPredicate, SymbolLiteral, IntLiteral,
 //! StringLiteral, TrueLiteral, FalseLiteral, NilLiteral, Alternatives,
-//! Conjunction, Negation, Capture, TypePredicate, Ident.
+//! Subsequence, AnyOrder, Conjunction, Negation, Capture, TypePredicate, Ident.
+//!
+//! ## Any-order groups
+//!
+//! `<a b ...>` matches when every term matches a distinct child, in any order.
+//! The matcher backtracks over child-to-term assignments (see
+//! [`assign_any_order`]) where RuboCop compiles a greedy first-fit loop; the
+//! parser caps a group at `ANY_ORDER_MAX_TERMS` non-rest terms so the search
+//! cannot blow up.
 //!
 //! ## Captures
 //!
@@ -21,8 +29,6 @@
 //! Known divergences from RuboCop's compiler, in addition to the stubs below:
 //!
 //! - `(int $_)` / `(float $_)` bind the literal node, not the numeric value.
-//! - `{a b | c}` does not build a subsequence for the multi-term group, so each
-//!   term is treated as its own branch (`builder.rb:57-68`).
 //! - A pattern list without `...` still tolerates extra trailing children,
 //!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
@@ -48,6 +54,20 @@ pub enum MatchChild<'pr> {
     Absent,
     /// A name or value as raw bytes (method name, variable name, symbol value).
     Name(&'pr [u8]),
+    /// A Parser-gem child node that Prism does not materialize, reduced to its
+    /// type and its single value.
+    ///
+    /// Prism stores some Parser-gem subtrees as flat data on the parent: a
+    /// regexp's body and options are a location plus a flag bitset, not
+    /// `(str …)` and `(regopt …)` children; a numbered block's parameter count
+    /// is a `u8`; `it` is a flag on the parameters node. Those children are
+    /// synthesized so the patterns that address them still match.
+    Synthetic {
+        /// The Parser-gem type this stands in for (`str`, `regopt`, `int`, …).
+        parser_type: &'static str,
+        /// The value the synthesized node carries.
+        value: &'pr [u8],
+    },
 }
 
 /// A parsed NodePattern plus the number of capture slots it allocates.
@@ -124,6 +144,114 @@ pub fn match_with_captures<'pr>(
     CompiledPattern::compile(pattern_str)?.match_captures(node)
 }
 
+/// Parser-gem type → the group type it also answers to.
+///
+/// Verbatim from rubocop-ast's `GROUP_FOR_TYPE`
+/// (`vendor/rubocop-ast/lib/rubocop/ast/node.rb:89-129`); `(call …)`,
+/// `(any_block …)`, `numeric?` and friends are compiled to a `<group>_type?`
+/// test, so a group name is usable anywhere a type name is.
+const GROUP_FOR_TYPE: &[(&str, &str)] = &[
+    ("def", "any_def"),
+    ("defs", "any_def"),
+    ("arg", "argument"),
+    ("optarg", "argument"),
+    ("restarg", "argument"),
+    ("kwarg", "argument"),
+    ("kwoptarg", "argument"),
+    ("kwrestarg", "argument"),
+    ("blockarg", "argument"),
+    ("forward_arg", "argument"),
+    ("shadowarg", "argument"),
+    ("true", "boolean"),
+    ("false", "boolean"),
+    ("int", "numeric"),
+    ("float", "numeric"),
+    ("rational", "numeric"),
+    ("complex", "numeric"),
+    ("str", "any_str"),
+    ("dstr", "any_str"),
+    ("xstr", "any_str"),
+    ("sym", "any_sym"),
+    ("dsym", "any_sym"),
+    ("irange", "range"),
+    ("erange", "range"),
+    ("send", "call"),
+    ("csend", "call"),
+    ("block", "any_block"),
+    ("numblock", "any_block"),
+    ("itblock", "any_block"),
+    ("match_pattern", "any_match_pattern"),
+    ("match_pattern_p", "any_match_pattern"),
+];
+
+/// The group type `parser_type` belongs to, if any.
+fn group_of(parser_type: &str) -> Option<&'static str> {
+    GROUP_FOR_TYPE
+        .iter()
+        .find(|(ty, _)| *ty == parser_type)
+        .map(|(_, group)| *group)
+}
+
+/// Whether a node of Parser type `actual` answers to the pattern type
+/// `pattern_type`, directly or through its group.
+fn type_answers(actual: &str, pattern_type: &str) -> bool {
+    actual == pattern_type || group_of(actual) == Some(pattern_type)
+}
+
+/// The Parser-gem block type a node answers to *as a block node*.
+///
+/// Prism has no node for Parser's `block`: `foo { }` is a `CallNode` whose
+/// `block` is a `BlockNode`, and `-> { }` is a `LambdaNode`. Parser instead
+/// wraps the call: `(block (send nil :foo) (args) body)`. A `CallNode` carrying
+/// a literal block therefore answers to *both* `send`/`csend` (Parser's inner
+/// send node, which is also what `on_send` visits) and `block` — which is a
+/// deliberate over-match: `(send …)` matched directly against a Parser `block`
+/// node is false upstream and true here.
+fn block_type_of(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    if let Some(call) = node.as_call_node() {
+        let block = call.block()?;
+        return Some(block_node_type(&block.as_block_node()?));
+    }
+    if node.as_lambda_node().is_some() {
+        return Some("block");
+    }
+    None
+}
+
+/// `block` / `numblock` / `itblock` for a Prism `BlockNode`.
+///
+/// Parser gives `{ _1 }` and `{ it }` their own node types; Prism keeps one
+/// `BlockNode` and varies the parameters node.
+fn block_node_type(block: &ruby_prism::BlockNode<'_>) -> &'static str {
+    match block.parameters() {
+        Some(ruby_prism::Node::NumberedParametersNode { .. }) => "numblock",
+        Some(ruby_prism::Node::ItParametersNode { .. }) => "itblock",
+        _ => "block",
+    }
+}
+
+/// The concrete Parser type to read children for when `node` is matched
+/// against a pattern written for `pattern_type`, or `None` if it does not
+/// answer to that type at all.
+fn concrete_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> Option<&'static str> {
+    if let Some(actual) = parser_type_for_node(node)
+        && type_answers(actual, pattern_type)
+    {
+        return Some(actual);
+    }
+    if let Some(block_type) = block_type_of(node)
+        && type_answers(block_type, pattern_type)
+    {
+        return Some(block_type);
+    }
+    None
+}
+
+/// Whether `node` answers to the Parser type `pattern_type`.
+fn node_has_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> bool {
+    concrete_type(node, pattern_type).is_some()
+}
+
 /// Get the NodePattern type name for a Prism node.
 ///
 /// Returns the Parser gem type name (e.g. "send", "block", "if") that
@@ -143,7 +271,7 @@ fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
 
     // Use matches! for everything else
     match node {
-        ruby_prism::Node::BlockNode { .. } => Some("block"),
+        ruby_prism::Node::BlockNode { .. } => node.as_block_node().as_ref().map(block_node_type),
         ruby_prism::Node::DefNode { .. } => {
             // def vs defs: defs has a receiver
             if let Some(def) = node.as_def_node() {
@@ -158,9 +286,27 @@ fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
         }
         ruby_prism::Node::ConstantReadNode { .. } => Some("const"),
         ruby_prism::Node::ConstantPathNode { .. } => Some("const"),
-        ruby_prism::Node::BeginNode { .. } => Some("begin"),
+        // Parser splits Prism's `BeginNode`: `begin … end` is `kwbegin`, while
+        // an implicit body wrapper is just the statement list.
+        ruby_prism::Node::BeginNode { .. } => Some(
+            if node
+                .as_begin_node()
+                .is_some_and(|begin| begin.begin_keyword_loc().is_some())
+            {
+                "kwbegin"
+            } else {
+                "begin"
+            },
+        ),
+        // Parser's `begin` is a statement list; Prism spells that three ways.
+        ruby_prism::Node::StatementsNode { .. }
+        | ruby_prism::Node::ParenthesesNode { .. }
+        | ruby_prism::Node::EmbeddedStatementsNode { .. } => Some("begin"),
         ruby_prism::Node::AssocNode { .. } => Some("pair"),
         ruby_prism::Node::HashNode { .. } => Some("hash"),
+        // `foo(k: 1)` is a `KeywordHashNode` in Prism and a plain `hash` in the
+        // Parser gem.
+        ruby_prism::Node::KeywordHashNode { .. } => Some("hash"),
         ruby_prism::Node::LocalVariableReadNode { .. } => Some("lvar"),
         ruby_prism::Node::InstanceVariableReadNode { .. } => Some("ivar"),
         ruby_prism::Node::ClassVariableReadNode { .. } => Some("cvar"),
@@ -196,9 +342,145 @@ fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
         ruby_prism::Node::LambdaNode { .. } => Some("lambda"),
         ruby_prism::Node::InterpolatedStringNode { .. } => Some("dstr"),
         ruby_prism::Node::InterpolatedSymbolNode { .. } => Some("dsym"),
-        ruby_prism::Node::ParametersNode { .. } => Some("args"),
+        ruby_prism::Node::ParametersNode { .. } | ruby_prism::Node::BlockParametersNode { .. } => {
+            Some("args")
+        }
+
+        // Parameters (`argument` group).
+        ruby_prism::Node::RequiredParameterNode { .. } => Some("arg"),
+        ruby_prism::Node::OptionalParameterNode { .. } => Some("optarg"),
+        ruby_prism::Node::RestParameterNode { .. } => Some("restarg"),
+        ruby_prism::Node::RequiredKeywordParameterNode { .. } => Some("kwarg"),
+        ruby_prism::Node::OptionalKeywordParameterNode { .. } => Some("kwoptarg"),
+        ruby_prism::Node::KeywordRestParameterNode { .. } => Some("kwrestarg"),
+        ruby_prism::Node::BlockParameterNode { .. } => Some("blockarg"),
+        ruby_prism::Node::ForwardingParameterNode { .. } => Some("forward_arg"),
+        ruby_prism::Node::BlockLocalVariableNode { .. } => Some("shadowarg"),
+        ruby_prism::Node::MultiTargetNode { .. } => Some("mlhs"),
+
+        ruby_prism::Node::BlockArgumentNode { .. } => Some("block_pass"),
+        ruby_prism::Node::AssocSplatNode { .. } => Some("kwsplat"),
+        ruby_prism::Node::CaseMatchNode { .. } => Some("case_match"),
+        ruby_prism::Node::InNode { .. } => Some("in_pattern"),
+        ruby_prism::Node::SingletonClassNode { .. } => Some("sclass"),
+        ruby_prism::Node::MultiWriteNode { .. } => Some("masgn"),
+        ruby_prism::Node::ClassVariableWriteNode { .. } => Some("cvasgn"),
+        ruby_prism::Node::GlobalVariableWriteNode { .. } => Some("gvasgn"),
+        ruby_prism::Node::NextNode { .. } => Some("next"),
+        ruby_prism::Node::BreakNode { .. } => Some("break"),
+        ruby_prism::Node::DefinedNode { .. } => Some("defined?"),
+        ruby_prism::Node::RescueNode { .. } => Some("resbody"),
+        ruby_prism::Node::RationalNode { .. } => Some("rational"),
+        ruby_prism::Node::ImaginaryNode { .. } => Some("complex"),
+
+        ruby_prism::Node::XStringNode { .. } | ruby_prism::Node::InterpolatedXStringNode { .. } => {
+            Some("xstr")
+        }
+        ruby_prism::Node::InterpolatedRegularExpressionNode { .. } => Some("regexp"),
+        // `..` vs `...` is a flag on Prism's `RangeNode`.
+        ruby_prism::Node::RangeNode { .. } => Some(
+            if node.as_range_node().is_some_and(|r| r.is_exclude_end()) {
+                "erange"
+            } else {
+                "irange"
+            },
+        ),
+
+        // `x += 1` / `x ||= 1` / `x &&= 1`. Prism has one node type per
+        // assignment target kind; Parser has one per operator kind.
+        ruby_prism::Node::LocalVariableOperatorWriteNode { .. }
+        | ruby_prism::Node::InstanceVariableOperatorWriteNode { .. }
+        | ruby_prism::Node::ClassVariableOperatorWriteNode { .. }
+        | ruby_prism::Node::GlobalVariableOperatorWriteNode { .. }
+        | ruby_prism::Node::ConstantOperatorWriteNode { .. }
+        | ruby_prism::Node::ConstantPathOperatorWriteNode { .. }
+        | ruby_prism::Node::CallOperatorWriteNode { .. }
+        | ruby_prism::Node::IndexOperatorWriteNode { .. } => Some("op_asgn"),
+        ruby_prism::Node::LocalVariableOrWriteNode { .. }
+        | ruby_prism::Node::InstanceVariableOrWriteNode { .. }
+        | ruby_prism::Node::ClassVariableOrWriteNode { .. }
+        | ruby_prism::Node::GlobalVariableOrWriteNode { .. }
+        | ruby_prism::Node::ConstantOrWriteNode { .. }
+        | ruby_prism::Node::ConstantPathOrWriteNode { .. }
+        | ruby_prism::Node::CallOrWriteNode { .. }
+        | ruby_prism::Node::IndexOrWriteNode { .. } => Some("or_asgn"),
+        ruby_prism::Node::LocalVariableAndWriteNode { .. }
+        | ruby_prism::Node::InstanceVariableAndWriteNode { .. }
+        | ruby_prism::Node::ClassVariableAndWriteNode { .. }
+        | ruby_prism::Node::GlobalVariableAndWriteNode { .. }
+        | ruby_prism::Node::ConstantAndWriteNode { .. }
+        | ruby_prism::Node::ConstantPathAndWriteNode { .. }
+        | ruby_prism::Node::CallAndWriteNode { .. }
+        | ruby_prism::Node::IndexAndWriteNode { .. } => Some("and_asgn"),
         _ => None,
     }
+}
+
+/// The `max_numparam` child of a Parser `numblock`, as decimal digits.
+fn numbered_parameter_count(params: Option<&ruby_prism::Node<'_>>) -> &'static [u8] {
+    const DIGITS: [&[u8]; 10] = [b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9"];
+    let maximum = params
+        .and_then(ruby_prism::Node::as_numbered_parameters_node)
+        .map_or(0, |p| p.maximum());
+    DIGITS[usize::from(maximum).min(9)]
+}
+
+/// The `regopt` child of a Parser `regexp`, as its option letters.
+fn regexp_options(ignore_case: bool, extended: bool, multi_line: bool) -> &'static [u8] {
+    const OPTIONS: [&[u8]; 8] = [b"", b"i", b"m", b"im", b"x", b"ix", b"mx", b"imx"];
+    OPTIONS[usize::from(ignore_case) | usize::from(multi_line) << 1 | usize::from(extended) << 2]
+}
+
+/// The operator and value of an `op_asgn` / `or_asgn` / `and_asgn` node.
+///
+/// The operator is `None` for `||=` and `&&=`, which Parser spells as the node
+/// type rather than as a child.
+fn operator_write_parts<'pr>(
+    node: &ruby_prism::Node<'pr>,
+) -> Option<(Option<&'pr [u8]>, ruby_prism::Node<'pr>)> {
+    macro_rules! binary {
+        ($accessor:ident) => {
+            if let Some(typed) = node.$accessor() {
+                return Some((Some(typed.binary_operator().as_slice()), typed.value()));
+            }
+        };
+    }
+    macro_rules! logical {
+        ($accessor:ident) => {
+            if let Some(typed) = node.$accessor() {
+                return Some((None, typed.value()));
+            }
+        };
+    }
+
+    binary!(as_local_variable_operator_write_node);
+    binary!(as_instance_variable_operator_write_node);
+    binary!(as_class_variable_operator_write_node);
+    binary!(as_global_variable_operator_write_node);
+    binary!(as_constant_operator_write_node);
+    binary!(as_constant_path_operator_write_node);
+    binary!(as_call_operator_write_node);
+    binary!(as_index_operator_write_node);
+
+    logical!(as_local_variable_or_write_node);
+    logical!(as_instance_variable_or_write_node);
+    logical!(as_class_variable_or_write_node);
+    logical!(as_global_variable_or_write_node);
+    logical!(as_constant_or_write_node);
+    logical!(as_constant_path_or_write_node);
+    logical!(as_call_or_write_node);
+    logical!(as_index_or_write_node);
+
+    logical!(as_local_variable_and_write_node);
+    logical!(as_instance_variable_and_write_node);
+    logical!(as_class_variable_and_write_node);
+    logical!(as_global_variable_and_write_node);
+    logical!(as_constant_and_write_node);
+    logical!(as_constant_path_and_write_node);
+    logical!(as_call_and_write_node);
+    logical!(as_index_and_write_node);
+
+    None
 }
 
 /// Build the children list for a node given its Parser gem type.
@@ -227,19 +509,55 @@ fn get_children<'pr>(
                     children.push(MatchChild::Node(arg));
                 }
             }
-        }
-        "block" | "any_block" => {
-            let block = node.as_block_node()?;
-            // In Prism, the call is the parent of the BlockNode, not a child.
-            // We push Absent here and let the pattern wildcard match it.
-            // Most NodePattern block patterns use _ or a specific call pattern
-            // which we handle permissively in Phase 1.
-            children.push(MatchChild::Absent);
-            match block.parameters() {
-                Some(p) => children.push(MatchChild::Node(p)),
-                None => children.push(MatchChild::Absent),
+            // `&blk` is the last argument upstream; Prism hangs it off `block`
+            // alongside literal blocks, so only a block *argument* counts.
+            if let Some(block) = call.block()
+                && block.as_block_argument_node().is_some()
+            {
+                children.push(MatchChild::Node(block));
             }
-            match block.body() {
+        }
+        "block" | "numblock" | "itblock" => {
+            // Parser: `(block send-node args body)`, `(numblock send-node
+            // max_numparam body)`, `(itblock send-node :it body)`.
+            let (params, body) = if let Some(call) = node.as_call_node() {
+                // The Parser `block` node wraps the call, so the call is this
+                // very node minus its block (Prism keeps no separate send node).
+                let block = call.block()?.as_block_node()?;
+                children.push(MatchChild::Node(dup_node(node)));
+                (block.parameters(), block.body())
+            } else if let Some(block) = node.as_block_node() {
+                // Reached directly (e.g. via `call.block()`): Prism's `BlockNode`
+                // has no back-pointer, so the send child is unavailable and only
+                // `_` can match it.
+                children.push(MatchChild::Absent);
+                (block.parameters(), block.body())
+            } else if let Some(lambda) = node.as_lambda_node() {
+                // Parser: `-> { }` is `(block (lambda) (args) body)`.
+                children.push(MatchChild::Synthetic {
+                    parser_type: "lambda",
+                    value: b"",
+                });
+                (lambda.parameters(), lambda.body())
+            } else {
+                return None;
+            };
+
+            match parser_type {
+                "numblock" => children.push(MatchChild::Synthetic {
+                    parser_type: "int",
+                    value: numbered_parameter_count(params.as_ref()),
+                }),
+                "itblock" => children.push(MatchChild::Synthetic {
+                    parser_type: "sym",
+                    value: b"it",
+                }),
+                _ => match params {
+                    Some(p) => children.push(MatchChild::Node(p)),
+                    None => children.push(MatchChild::Absent),
+                },
+            }
+            match body {
                 Some(b) => children.push(MatchChild::Node(b)),
                 None => children.push(MatchChild::Absent),
             }
@@ -292,10 +610,32 @@ fn get_children<'pr>(
             }
         }
         "begin" => {
-            let b = node.as_begin_node()?;
-            match b.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
+            // Parser's `begin` is a flat statement list, so the statements are
+            // the children — `(x % 2)` is `(begin (send …))`, not a node
+            // wrapping a list node.
+            let statements = if let Some(stmts) = node.as_statements_node() {
+                Some(stmts)
+            } else if let Some(parens) = node.as_parentheses_node() {
+                parens.body().and_then(|b| b.as_statements_node())
+            } else if let Some(embedded) = node.as_embedded_statements_node() {
+                embedded.statements()
+            } else {
+                node.as_begin_node()?.statements()
+            };
+            if let Some(stmts) = statements {
+                for stmt in stmts.body().iter() {
+                    children.push(MatchChild::Node(stmt));
+                }
+            }
+        }
+        "kwbegin" => {
+            // Parser: `(kwbegin stmt …)`. A `rescue`/`ensure` clause is a child
+            // of the Parser node too; Prism keeps them in sibling fields, so
+            // only the statements are exposed here.
+            if let Some(stmts) = node.as_begin_node()?.statements() {
+                for stmt in stmts.body().iter() {
+                    children.push(MatchChild::Node(stmt));
+                }
             }
         }
         "pair" => {
@@ -304,9 +644,16 @@ fn get_children<'pr>(
             children.push(MatchChild::Node(assoc.value()));
         }
         "hash" => {
-            let hash = node.as_hash_node()?;
-            for elem in hash.elements().iter() {
-                children.push(MatchChild::Node(elem));
+            if let Some(hash) = node.as_hash_node() {
+                for elem in hash.elements().iter() {
+                    children.push(MatchChild::Node(elem));
+                }
+            } else if let Some(kw) = node.as_keyword_hash_node() {
+                for elem in kw.elements().iter() {
+                    children.push(MatchChild::Node(elem));
+                }
+            } else {
+                return None;
             }
         }
         "lvar" => {
@@ -431,7 +778,187 @@ fn get_children<'pr>(
             children.push(MatchChild::Node(o.right()));
         }
         "regexp" => {
-            // Content matched via special-case
+            // Parser: `(regexp (str "body") … (regopt :i :m))`. Prism keeps a
+            // plain regexp's body as a location and its options as flags, so
+            // both are synthesized. Multi-flag regexps are exposed as one
+            // `regopt` value ("im"), which no vendored pattern inspects — every
+            // one of them writes `(regopt)`, `(regopt _)` or `(regopt $...)`.
+            if let Some(re) = node.as_regular_expression_node() {
+                children.push(MatchChild::Synthetic {
+                    parser_type: "str",
+                    value: re.content_loc().as_slice(),
+                });
+                children.push(MatchChild::Synthetic {
+                    parser_type: "regopt",
+                    value: regexp_options(
+                        re.is_ignore_case(),
+                        re.is_extended(),
+                        re.is_multi_line(),
+                    ),
+                });
+            } else if let Some(re) = node.as_interpolated_regular_expression_node() {
+                for part in re.parts().iter() {
+                    children.push(MatchChild::Node(part));
+                }
+                children.push(MatchChild::Synthetic {
+                    parser_type: "regopt",
+                    value: regexp_options(
+                        re.is_ignore_case(),
+                        re.is_extended(),
+                        re.is_multi_line(),
+                    ),
+                });
+            } else {
+                return None;
+            }
+        }
+        "xstr" => {
+            // Parser: `` `foo` `` is `(xstr (str "foo"))`.
+            if let Some(x) = node.as_x_string_node() {
+                children.push(MatchChild::Synthetic {
+                    parser_type: "str",
+                    value: x.content_loc().as_slice(),
+                });
+            } else if let Some(x) = node.as_interpolated_x_string_node() {
+                for part in x.parts().iter() {
+                    children.push(MatchChild::Node(part));
+                }
+            } else {
+                return None;
+            }
+        }
+        // Parser: `(irange from to)` / `(erange from to)`; either end may be nil.
+        "irange" | "erange" => {
+            let range = node.as_range_node()?;
+            for end in [range.left(), range.right()] {
+                match end {
+                    Some(n) => children.push(MatchChild::Node(n)),
+                    None => children.push(MatchChild::Absent),
+                }
+            }
+        }
+        "block_pass" => {
+            // Parser: `(block_pass expr)`; `(block_pass nil)` when anonymous.
+            match node.as_block_argument_node()?.expression() {
+                Some(e) => children.push(MatchChild::Node(e)),
+                None => children.push(MatchChild::Absent),
+            }
+        }
+        "kwsplat" => match node.as_assoc_splat_node()?.value() {
+            Some(v) => children.push(MatchChild::Node(v)),
+            None => children.push(MatchChild::Absent),
+        },
+        "case_match" => {
+            // Parser: `(case_match expr in_pattern… else)`.
+            let case = node.as_case_match_node()?;
+            match case.predicate() {
+                Some(p) => children.push(MatchChild::Node(p)),
+                None => children.push(MatchChild::Absent),
+            }
+            for condition in case.conditions().iter() {
+                children.push(MatchChild::Node(condition));
+            }
+            match case.else_clause() {
+                Some(e) => children.push(MatchChild::Node(e.as_node())),
+                None => children.push(MatchChild::Absent),
+            }
+        }
+        "in_pattern" => {
+            // Parser: `(in_pattern pattern guard body)`. Prism folds the guard
+            // into the pattern node (`IfNode`/`UnlessNode`), so the guard slot
+            // is always absent here and `in x if y` presents as `(in_pattern
+            // (if …) nil? body)`.
+            let in_node = node.as_in_node()?;
+            children.push(MatchChild::Node(in_node.pattern()));
+            children.push(MatchChild::Absent);
+            match in_node.statements() {
+                Some(s) => children.push(MatchChild::Node(s.as_node())),
+                None => children.push(MatchChild::Absent),
+            }
+        }
+        "sclass" => {
+            // Parser: `(sclass expr body)`.
+            let sclass = node.as_singleton_class_node()?;
+            children.push(MatchChild::Node(sclass.expression()));
+            match sclass.body() {
+                Some(b) => children.push(MatchChild::Node(b)),
+                None => children.push(MatchChild::Absent),
+            }
+        }
+        "masgn" => {
+            // Parser: `(masgn (mlhs target…) value)`. Prism's `MultiWriteNode`
+            // holds the targets inline with no `mlhs` node to stand in for, so
+            // the first child is absent and only `_` can match it.
+            let masgn = node.as_multi_write_node()?;
+            children.push(MatchChild::Absent);
+            children.push(MatchChild::Node(masgn.value()));
+        }
+        "mlhs" => {
+            // Parser: `(mlhs target…)` — a nested destructuring target.
+            let mlhs = node.as_multi_target_node()?;
+            for target in mlhs.lefts().iter() {
+                children.push(MatchChild::Node(target));
+            }
+            if let Some(rest) = mlhs.rest() {
+                children.push(MatchChild::Node(rest));
+            }
+            for target in mlhs.rights().iter() {
+                children.push(MatchChild::Node(target));
+            }
+        }
+        // Parser: `(op-asgn (lvasgn :x) :+ value)`, `(or-asgn (lvasgn :x) value)`.
+        // Prism folds the target into the write node itself, so the target slot
+        // is absent; the operator and value are exact.
+        "op_asgn" | "or_asgn" | "and_asgn" => {
+            let (operator, value) = operator_write_parts(node)?;
+            children.push(MatchChild::Absent);
+            if let Some(operator) = operator {
+                children.push(MatchChild::Name(operator));
+            }
+            children.push(MatchChild::Node(value));
+        }
+        "cvasgn" | "gvasgn" => {
+            let (name, value) = if let Some(cv) = node.as_class_variable_write_node() {
+                (cv.name(), cv.value())
+            } else {
+                let gv = node.as_global_variable_write_node()?;
+                (gv.name(), gv.value())
+            };
+            children.push(MatchChild::Name(name.as_slice()));
+            children.push(MatchChild::Node(value));
+        }
+        "next" | "break" => {
+            let arguments = if let Some(n) = node.as_next_node() {
+                n.arguments()
+            } else {
+                node.as_break_node()?.arguments()
+            };
+            if let Some(args) = arguments {
+                for arg in args.arguments().iter() {
+                    children.push(MatchChild::Node(arg));
+                }
+            }
+        }
+        "defined?" => {
+            children.push(MatchChild::Node(node.as_defined_node()?.value()));
+        }
+        "resbody" => {
+            // Parser: `(resbody (array exception…) var body)`. Prism keeps the
+            // exception list flat, with no `array` node to stand in for, so the
+            // first child is absent.
+            let resbody = node.as_rescue_node()?;
+            children.push(MatchChild::Absent);
+            match resbody.reference() {
+                Some(r) => children.push(MatchChild::Node(r)),
+                None => children.push(MatchChild::Absent),
+            }
+            match resbody.statements() {
+                Some(s) => children.push(MatchChild::Node(s.as_node())),
+                None => children.push(MatchChild::Absent),
+            }
+        }
+        "rational" | "complex" => {
+            // Value-only nodes — matched via the literal special-cases.
         }
         "class" => {
             let c = node.as_class_node()?;
@@ -484,15 +1011,9 @@ fn get_children<'pr>(
             }
         }
         "lambda" => {
-            let l = node.as_lambda_node()?;
-            match l.parameters() {
-                Some(p) => children.push(MatchChild::Node(p)),
-                None => children.push(MatchChild::Absent),
-            }
-            match l.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            // Parser's `lambda` node is the bare `->`; the parameters and body
+            // belong to the `block` node wrapping it.
+            node.as_lambda_node()?;
         }
         "dstr" => {
             let isn = node.as_interpolated_string_node()?;
@@ -507,7 +1028,78 @@ fn get_children<'pr>(
             }
         }
         "args" => {
-            // ParametersNode — no positional children in simple patterns
+            // Parser: `(args (arg :a) (optarg :b …) …)`, in declaration order.
+            let params = if let Some(block_params) = node.as_block_parameters_node() {
+                block_params.parameters()
+            } else {
+                node.as_parameters_node()
+            };
+            if let Some(params) = params {
+                for p in params.requireds().iter() {
+                    children.push(MatchChild::Node(p));
+                }
+                for p in params.optionals().iter() {
+                    children.push(MatchChild::Node(p));
+                }
+                if let Some(rest) = params.rest() {
+                    children.push(MatchChild::Node(rest));
+                }
+                for p in params.posts().iter() {
+                    children.push(MatchChild::Node(p));
+                }
+                for p in params.keywords().iter() {
+                    children.push(MatchChild::Node(p));
+                }
+                if let Some(kwrest) = params.keyword_rest() {
+                    children.push(MatchChild::Node(kwrest));
+                }
+                if let Some(block) = params.block() {
+                    children.push(MatchChild::Node(block.as_node()));
+                }
+            }
+            if let Some(block_params) = node.as_block_parameters_node() {
+                for local in block_params.locals().iter() {
+                    children.push(MatchChild::Node(local));
+                }
+            }
+        }
+        // Parser: `(arg :name)`, `(kwarg :name)`, `(shadowarg :name)`.
+        "arg" | "kwarg" | "shadowarg" => {
+            let name = if let Some(a) = node.as_required_parameter_node() {
+                a.name()
+            } else if let Some(k) = node.as_required_keyword_parameter_node() {
+                k.name()
+            } else {
+                node.as_block_local_variable_node()?.name()
+            };
+            children.push(MatchChild::Name(name.as_slice()));
+        }
+        // Parser: `(optarg :name default)`.
+        "optarg" | "kwoptarg" => {
+            let (name, value) = if let Some(o) = node.as_optional_parameter_node() {
+                (o.name(), o.value())
+            } else {
+                let k = node.as_optional_keyword_parameter_node()?;
+                (k.name(), k.value())
+            };
+            children.push(MatchChild::Name(name.as_slice()));
+            children.push(MatchChild::Node(value));
+        }
+        // Parser: `(restarg :name)`, or `(restarg)` when anonymous.
+        "restarg" | "kwrestarg" | "blockarg" => {
+            let name = if let Some(r) = node.as_rest_parameter_node() {
+                r.name()
+            } else if let Some(k) = node.as_keyword_rest_parameter_node() {
+                k.name()
+            } else {
+                node.as_block_parameter_node()?.name()
+            };
+            if let Some(name) = name {
+                children.push(MatchChild::Name(name.as_slice()));
+            }
+        }
+        "forward_arg" => {
+            node.as_forwarding_parameter_node()?;
         }
         _ => return None,
     }
@@ -525,6 +1117,93 @@ fn matches_child<'pr>(
         MatchChild::Node(node) => matches_node(pattern, node, env),
         MatchChild::Absent => matches_absent(pattern, env),
         MatchChild::Name(bytes) => matches_name(pattern, bytes, bytes, env),
+        MatchChild::Synthetic { parser_type, value } => {
+            matches_synthetic(pattern, parser_type, value, env)
+        }
+    }
+}
+
+/// Match a pattern against a synthesized Parser-gem child
+/// ([`MatchChild::Synthetic`]).
+///
+/// The synthesized node has exactly one child — its value — so `(str $_)`,
+/// `(regopt)` and the bare literal forms (`:it`, `1`) all work; anything that
+/// addresses a deeper structure does not.
+fn matches_synthetic<'pr>(
+    pattern: &PatternNode,
+    parser_type: &'static str,
+    value: &'pr [u8],
+    env: &mut MatchEnv<'pr>,
+) -> bool {
+    match pattern {
+        PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Ident(name) | PatternNode::TypePredicate(name) => {
+            type_answers(parser_type, name)
+        }
+        PatternNode::SymbolLiteral(name) => parser_type == "sym" && value == name.as_bytes(),
+        PatternNode::StringLiteral(s) => parser_type == "str" && value == s.as_bytes(),
+        PatternNode::IntLiteral(n) => {
+            parser_type == "int"
+                && std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|text| text.parse::<i64>().ok())
+                    == Some(*n)
+        }
+        PatternNode::NodeMatch {
+            node_type,
+            children,
+        } => {
+            if !type_answers(parser_type, node_type) {
+                return false;
+            }
+            let mark = env.mark();
+            if matches_children_list(children, &[MatchChild::Name(value)], env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Alternatives(alts) => {
+            for alt in alts {
+                let mark = env.mark();
+                if matches_synthetic(alt, parser_type, value, env) {
+                    return true;
+                }
+                env.rollback(mark);
+            }
+            false
+        }
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items
+                .iter()
+                .all(|item| matches_synthetic(item, parser_type, value, env))
+            {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_synthetic(inner, parser_type, value, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Name(value));
+            if matches_synthetic(inner, parser_type, value, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::HelperCall(_)
+        | PatternNode::ParamRef(_)
+        | PatternNode::ParentRef(_)
+        | PatternNode::DescendRef(_) => true,
+        _ => false,
     }
 }
 
@@ -533,7 +1212,9 @@ fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
     match child {
         MatchChild::Node(node) => CaptureValue::Node(dup_node(node)),
         MatchChild::Absent => CaptureValue::Absent,
-        MatchChild::Name(bytes) => CaptureValue::Name(bytes),
+        MatchChild::Name(bytes) | MatchChild::Synthetic { value: bytes, .. } => {
+            CaptureValue::Name(bytes)
+        }
     }
 }
 
@@ -579,27 +1260,26 @@ fn matches_node<'pr>(
         PatternNode::TrueLiteral => node.as_true_node().is_some(),
         PatternNode::FalseLiteral => node.as_false_node().is_some(),
 
-        PatternNode::TypePredicate(typ) => parser_type_for_node(node) == Some(typ.as_str()),
+        PatternNode::TypePredicate(typ) => node_has_type(node, typ),
 
-        PatternNode::Ident(name) => parser_type_for_node(node) == Some(name.as_str()),
+        PatternNode::Ident(name) => node_has_type(node, name),
 
         PatternNode::NodeMatch {
             node_type,
             children: pattern_children,
         } => {
-            let actual_type = parser_type_for_node(node);
-            let type_matches = actual_type == Some(node_type.as_str())
-                || (node_type == "any_block" && actual_type == Some("block"));
-
-            if !type_matches {
+            // The pattern type can be a group (`call`, `any_block`, …) or a
+            // type Prism spells differently, so resolve it to the concrete type
+            // whose children we read.
+            let Some(effective_type) = concrete_type(node, node_type) else {
                 return false;
-            }
+            };
 
             let mark = env.mark();
 
             // Value-only nodes: (int 42), (str "foo"), (sym :bar)
             if !pattern_children.is_empty() {
-                match node_type.as_str() {
+                match effective_type {
                     "int" => {
                         if matches_node(&pattern_children[0], node, env) {
                             return true;
@@ -640,11 +1320,6 @@ fn matches_node<'pr>(
                 }
             }
 
-            let effective_type = if node_type == "any_block" {
-                "block"
-            } else {
-                node_type.as_str()
-            };
             let Some(actual_children) = get_children(effective_type, node) else {
                 return pattern_children.is_empty();
             };
@@ -710,6 +1385,11 @@ fn matches_node<'pr>(
         // A subsequence only has meaning as a `{}` branch inside a child list,
         // where `match_sequence` splices it; anywhere else it matches nothing.
         PatternNode::Subsequence(_) => false,
+
+        // Likewise `<>`: it consumes a run of children, so it is only
+        // meaningful as a term of a child list (RuboCop forbids it in sequence
+        // head position too — `ForbidInSeqHead`, `node.rb:179`).
+        PatternNode::AnyOrder(_) => false,
 
         PatternNode::Rest => true,
     }
@@ -839,7 +1519,8 @@ fn as_rest_term(pattern: &PatternNode) -> Option<Option<usize>> {
 /// (RuboCop's `Node#variadic?`).
 fn is_variadic_term(pattern: &PatternNode) -> bool {
     match pattern {
-        PatternNode::Subsequence(_) => true,
+        PatternNode::Subsequence(_) | PatternNode::AnyOrder(_) => true,
+        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => true,
         PatternNode::Alternatives(alts) => alts.iter().any(is_variadic_term),
         _ => as_rest_term(pattern).is_some(),
     }
@@ -848,11 +1529,146 @@ fn is_variadic_term(pattern: &PatternNode) -> bool {
 /// Whether a term can consume an unbounded number of children.
 fn contains_rest(pattern: &PatternNode) -> bool {
     match pattern {
-        PatternNode::Alternatives(items) | PatternNode::Subsequence(items) => {
-            items.iter().any(contains_rest)
+        PatternNode::Alternatives(items)
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => items.iter().any(contains_rest),
+        // `$<a ...>` is unbounded exactly when the group it wraps is.
+        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => {
+            contains_rest(inner)
         }
         _ => as_rest_term(pattern).is_some(),
     }
+}
+
+/// `Some((capture_slot, children))` if `pattern` is a `<>` any-order group,
+/// optionally wrapped in a `$`.
+fn as_any_order_term(pattern: &PatternNode) -> Option<(Option<usize>, &[PatternNode])> {
+    match pattern {
+        PatternNode::AnyOrder(items) => Some((None, items.as_slice())),
+        PatternNode::Capture { slot, inner } => match &**inner {
+            PatternNode::AnyOrder(items) => Some((Some(*slot), items.as_slice())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Split an any-order group's children into its terms and its trailing rest
+/// (`term_nodes` / `rest_node`, `node.rb:184-196`).
+fn split_any_order(items: &[PatternNode]) -> (&[PatternNode], Option<Option<usize>>) {
+    match items.last().and_then(as_rest_term) {
+        Some(slot) => (&items[..items.len() - 1], Some(slot)),
+        None => (items, None),
+    }
+}
+
+/// Assign `actuals` to `terms` so that every term matches a distinct child.
+///
+/// Children are walked in order; each is tried against every still-unused term
+/// and, when the group has a trailing rest, against the rest bucket. This is a
+/// full backtracking search, where RuboCop compiles a greedy first-fit loop
+/// (`sequence_subcompiler.rb:88-107`): the search accepts every assignment
+/// first-fit accepts plus a few first-fit rejects (`<_ int>` against `(1 :a)`,
+/// where the wildcard has to give up the integer). The divergence needs two
+/// terms that can match the same child *and* an order that defeats first-fit;
+/// no vendored `<>` pattern is in that shape.
+fn assign_any_order<'pr>(
+    terms: &[PatternNode],
+    actuals: &[MatchChild<'pr>],
+    index: usize,
+    used: &mut [bool],
+    leftovers: &mut Vec<usize>,
+    has_rest: bool,
+    env: &mut MatchEnv<'pr>,
+) -> bool {
+    if index == actuals.len() {
+        return used.iter().all(|matched| *matched);
+    }
+    // Every remaining term still needs a child of its own.
+    let unused = used.iter().filter(|matched| !**matched).count();
+    if actuals.len() - index < unused {
+        return false;
+    }
+
+    for (slot, term) in terms.iter().enumerate() {
+        if used[slot] {
+            continue;
+        }
+        let mark = env.mark();
+        used[slot] = true;
+        if matches_child(term, &actuals[index], env)
+            && assign_any_order(terms, actuals, index + 1, used, leftovers, has_rest, env)
+        {
+            return true;
+        }
+        used[slot] = false;
+        env.rollback(mark);
+    }
+
+    if has_rest {
+        leftovers.push(index);
+        if assign_any_order(terms, actuals, index + 1, used, leftovers, has_rest, env) {
+            return true;
+        }
+        leftovers.pop();
+    }
+    false
+}
+
+/// Match a `<>` group against the head of `actuals`, then the rest of the
+/// sequence against what is left.
+fn match_any_order<'pr>(
+    group_slot: Option<usize>,
+    items: &[PatternNode],
+    rest_terms: &[&PatternNode],
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr>,
+    exact: bool,
+) -> bool {
+    let (terms, rest) = split_any_order(items);
+    let has_rest = rest.is_some();
+    // Arity: exactly `terms.len()` children without a rest, `terms.len()..∞`
+    // with one (`node.rb:197-201`).
+    let max_take = if has_rest { actuals.len() } else { terms.len() };
+
+    for take in terms.len()..=max_take {
+        if take > actuals.len() {
+            break;
+        }
+        let mark = env.mark();
+        let mut used = vec![false; terms.len()];
+        let mut leftovers = Vec::new();
+        if assign_any_order(
+            terms,
+            &actuals[..take],
+            0,
+            &mut used,
+            &mut leftovers,
+            has_rest,
+            env,
+        ) {
+            if let Some(Some(slot)) = rest {
+                // A captured rest accumulates the children that matched no
+                // term, in child order (`sequence_subcompiler.rb:141-152`).
+                let run = leftovers
+                    .iter()
+                    .map(|i| capture_value_for(&actuals[*i]))
+                    .collect();
+                env.set(slot, CaptureValue::List(run));
+            }
+            if let Some(slot) = group_slot {
+                // `$<...>` binds the whole run the group consumed
+                // (`visit_capture`, `sequence_subcompiler.rb:155-162`).
+                let run = actuals[..take].iter().map(capture_value_for).collect();
+                env.set(slot, CaptureValue::List(run));
+            }
+            if match_sequence(rest_terms, &actuals[take..], env, exact) {
+                return true;
+            }
+        }
+        env.rollback(mark);
+    }
+    false
 }
 
 /// Match a list of pattern children against a list of actual children.
@@ -906,6 +1722,10 @@ fn match_sequence<'pr>(
             env.rollback(mark);
         }
         return false;
+    }
+
+    if let Some((group_slot, items)) = as_any_order_term(term) {
+        return match_any_order(group_slot, items, rest_terms, actuals, env, exact);
     }
 
     if let Some(capture_slot) = as_rest_term(term) {
@@ -1570,5 +2390,415 @@ mod tests {
         let pat = "{(send _ :foo) (csend _ :foo)}";
         assert!(interpret_pattern(pat, &node_send));
         assert!(interpret_pattern(pat, &node_csend));
+    }
+
+    // ── `<>` any-order groups ─────────────────────────────────────────────
+
+    #[test]
+    fn test_any_order_matches_in_either_order() {
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        for source in [b"foo(:a, 'b')".as_slice(), b"foo('b', :a)".as_slice()] {
+            let result = ruby_prism::parse(source);
+            let node = first_stmt(&result);
+            assert!(
+                interpret_pattern(pattern, &node),
+                "{} should match",
+                String::from_utf8_lossy(source)
+            );
+        }
+    }
+
+    #[test]
+    fn test_any_order_requires_every_term() {
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        // Missing the string element.
+        let result = ruby_prism::parse(b"foo(:a, :b)");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_without_rest_has_exact_arity() {
+        // Without a trailing `...` the group consumes exactly as many children
+        // as it has terms, so an extra child inside its run is fatal. (An extra
+        // child *after* it is still tolerated by the pre-existing child-list
+        // permissiveness documented in the module header.)
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        let result = ruby_prism::parse(b"foo(1, :a, 'b')");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_with_rest_absorbs_extra_children() {
+        let pattern = "(send nil? :foo <(sym _) ...>)";
+        let result = ruby_prism::parse(b"foo(1, 'b', :a, 2)");
+        let node = first_stmt(&result);
+        assert!(interpret_pattern(pattern, &node));
+
+        // Still requires the term itself.
+        let result = ruby_prism::parse(b"foo(1, 'b', 2)");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_captured_rest_collects_unmatched_children() {
+        let pattern = "(send nil? :foo <(sym _) $...>)";
+        let result = ruby_prism::parse(b"foo(1, :a, 'b')");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures(pattern, &node).unwrap();
+        let run = captures[0].as_list().expect("rest binds a list");
+        assert_eq!(run.len(), 2);
+        let texts: Vec<&str> = run
+            .iter()
+            .map(|value| {
+                std::str::from_utf8(value.as_node().unwrap().location().as_slice()).unwrap()
+            })
+            .collect();
+        assert_eq!(texts, vec!["1", "'b'"]);
+    }
+
+    #[test]
+    fn test_captured_any_order_binds_whole_run() {
+        let pattern = "(send nil? :foo $<(sym _) (str _)>)";
+        let result = ruby_prism::parse(b"foo('b', :a)");
+        let node = first_stmt(&result);
+
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+        let captures = compiled.match_captures(&node).unwrap();
+        let run = captures[0].as_list().expect("group binds a list");
+        assert_eq!(run.len(), 2);
+    }
+
+    #[test]
+    fn test_any_order_capture_slots_are_numbered_outside_in() {
+        // The `$` on the group takes the lower slot, then the inner `$`.
+        let compiled = CompiledPattern::compile("(send nil? :foo $<(sym $_) ...>)").unwrap();
+        assert_eq!(compiled.capture_count(), 2);
+
+        let result = ruby_prism::parse(b"foo(1, :a)");
+        let node = first_stmt(&result);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captures[0].as_list().unwrap().len(), 2);
+        assert_eq!(captured_name(&captures, 1), "a");
+    }
+
+    #[test]
+    fn test_any_order_inside_union_branch() {
+        // Both branches declare one capture, as RuboCop requires.
+        let pattern = "(send nil? :foo {<(sym $_) ...> (hash <(pair (sym $_) true) ...>)})";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+
+        let result = ruby_prism::parse(b"foo(1, :skip)");
+        let node = first_stmt(&result);
+        assert_eq!(
+            captured_name(&compiled.match_captures(&node).unwrap(), 0),
+            "skip"
+        );
+
+        let result = ruby_prism::parse(b"foo(a: 1, skip: true)");
+        let node = first_stmt(&result);
+        assert_eq!(
+            captured_name(&compiled.match_captures(&node).unwrap(), 0),
+            "skip"
+        );
+
+        let result = ruby_prism::parse(b"foo(a: 1, skip: false)");
+        let node = first_stmt(&result);
+        assert!(compiled.match_captures(&node).is_none());
+    }
+
+    #[test]
+    fn test_vendor_pending_without_reason_pattern() {
+        // rubocop-rspec `RSpec/PendingWithoutReason#metadata_without_reason?`,
+        // verbatim — the one vendored pattern that needs `<>`.
+        let pattern = "(send #rspec?\n \
+            {#ExampleGroups.all #Examples.all} ...\n \
+            {\n \
+              <(sym ${:pending :skip}) ...>\n \
+              (hash <(pair (sym ${:pending :skip}) true) ...>)\n \
+            }\n \
+          )";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', :pending do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert_eq!(
+            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            "pending"
+        );
+
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', skip: true do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert_eq!(
+            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            "skip"
+        );
+
+        // No pending/skip metadata at all.
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', :focus do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert!(compiled.match_captures(&call).is_none());
+    }
+
+    #[test]
+    fn test_any_order_term_cap_is_enforced_at_compile_time() {
+        use super::super::parser::{ANY_ORDER_MAX_TERMS, Parser, PatternError};
+
+        let terms = (0..=ANY_ORDER_MAX_TERMS)
+            .map(|i| format!("(sym :s{i})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pattern = format!("(send nil? :foo <{terms}>)");
+        assert!(CompiledPattern::compile(&pattern).is_none());
+
+        let mut lexer = Lexer::new(&pattern);
+        let mut parser = Parser::new(lexer.tokenize());
+        assert!(parser.parse().is_none());
+        assert_eq!(
+            parser.error(),
+            Some(&PatternError::AnyOrderTooManyTerms {
+                found: ANY_ORDER_MAX_TERMS + 1,
+                max: ANY_ORDER_MAX_TERMS,
+            })
+        );
+
+        // One fewer term is fine.
+        let terms = (0..ANY_ORDER_MAX_TERMS)
+            .map(|i| format!("(sym :s{i})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(CompiledPattern::compile(&format!("(send nil? :foo <{terms}>)")).is_some());
+    }
+
+    #[test]
+    fn test_any_order_rest_must_be_last() {
+        assert!(CompiledPattern::compile("(send nil? :foo <... (sym _)>)").is_none());
+    }
+
+    // ── Parser-gem → Prism type mapping ───────────────────────────────────
+
+    /// `(source, must_match, must_not_match)` for each newly mapped type.
+    ///
+    /// The pattern is matched against the first statement of `source`.
+    const MAPPING_CASES: &[(&str, &str, &str)] = &[
+        // Blocks. A Prism `CallNode` carrying a block answers to the Parser
+        // `block` node that wraps it, so the send child is reachable.
+        (
+            "items.each { |x| x }",
+            "(block (send _ :each) (args (arg :x)) _)",
+            "(block (send _ :map) _ _)",
+        ),
+        (
+            "items.each { _1 }",
+            "(numblock (send _ :each) 1 _)",
+            "(numblock (send _ :each) 2 _)",
+        ),
+        (
+            "items.each { it }",
+            "(itblock (send _ :each) :it _)",
+            "(numblock _ _ _)",
+        ),
+        (
+            "items.each { |x| x }",
+            "(any_block _ _ _)",
+            "(numblock _ _ _)",
+        ),
+        ("items.each { _1 }", "(any_block _ _ _)", "(itblock _ _ _)"),
+        ("items.each { it }", "(any_block _ _ _)", "(block _ _ _)"),
+        // `-> { }` is `(block (lambda) (args) body)` upstream.
+        (
+            "-> (x) { x }",
+            "(block (lambda) (args (arg :x)) _)",
+            "(block (send nil? :lambda) _ _)",
+        ),
+        // `call` group.
+        ("foo.bar", "(call _ :bar)", "(call _ :baz)"),
+        ("foo&.bar", "(call _ :bar)", "(send _ :bar)"),
+        // Statement lists and `begin … end`.
+        (
+            "(x % 2) == 0",
+            "(send (begin (send _ :% (int 2))) :== (int 0))",
+            "(send (kwbegin _) :== _)",
+        ),
+        (
+            "begin; foo; end",
+            "(kwbegin (send nil? :foo))",
+            "(begin (send nil? :foo))",
+        ),
+        // Arguments.
+        (
+            "def m(a, b = 1, *c, d:, e: 2, **f, &g); end",
+            "(def :m (args (arg :a) (optarg :b (int 1)) (restarg :c) (kwarg :d) (kwoptarg :e (int 2)) (kwrestarg :f) (blockarg :g)) nil?)",
+            "(def :m (args (optarg :a ...) ...) nil?)",
+        ),
+        (
+            "def m(*); end",
+            "(def :m (args (restarg)) nil?)",
+            "(def :m (args (restarg :x)) nil?)",
+        ),
+        (
+            "def m(...); end",
+            "(def :m (args (forward_arg)) nil?)",
+            "(def :m (args (restarg)) nil?)",
+        ),
+        (
+            "def m(a); end",
+            "(def :m (args argument) nil?)",
+            "(def :m (args (optarg ...)) nil?)",
+        ),
+        // Block pass.
+        (
+            "foo(&:bar)",
+            "(send nil? :foo (block_pass (sym :bar)))",
+            "(send nil? :foo (block_pass (sym :baz)))",
+        ),
+        (
+            "foo(&blk)",
+            "(send nil? :foo (block-pass (send nil? :blk)))",
+            "(send nil? :foo (block_pass nil?))",
+        ),
+        // Pattern matching.
+        (
+            "case x; in Integer then 1; end",
+            "(case_match (send nil? :x) (in_pattern (const nil? :Integer) nil? _) nil?)",
+            "(case ...)",
+        ),
+        // Strings.
+        ("`ls`", "(xstr (str 'ls'))", "(str 'ls')"),
+        ("'a'", "any_str", "(dstr ...)"),
+        (
+            "\"a#{b}\"",
+            "(dstr (str 'a') (begin (send nil? :b)))",
+            "(str _)",
+        ),
+        // Regexps.
+        (
+            "/foo/i",
+            "(regexp (str 'foo') (regopt :i))",
+            "(regexp (str 'foo') (regopt :m))",
+        ),
+        (
+            "/foo/",
+            "(regexp (str $_) (regopt))",
+            "(regexp (str 'bar') _)",
+        ),
+        (
+            "/a#{b}/",
+            "(regexp (str 'a') (begin _) (regopt))",
+            "(regexp (str 'a') (regopt))",
+        ),
+        // Ranges.
+        ("1..2", "(irange (int 1) (int 2))", "(erange ...)"),
+        ("1...2", "(erange (int 1) (int 2))", "(irange ...)"),
+        ("1..", "range", "(irange _ (int 2))"),
+        // Multiple assignment.
+        (
+            "a, b = 1, 2",
+            "(masgn _ (array (int 1) (int 2)))",
+            "(masgn _ (int 1))",
+        ),
+        (
+            "foo { |(a, b)| a }",
+            "(block _ (args (mlhs (arg :a) (arg :b))) _)",
+            "(block _ (args (arg :a)) _)",
+        ),
+        // Operator assignment.
+        ("x += 1", "(op_asgn _ :+ (int 1))", "(op_asgn _ :- _)"),
+        ("x ||= 1", "(or_asgn _ (int 1))", "(and_asgn _ _)"),
+        ("x &&= 1", "(and_asgn _ (int 1))", "(op_asgn ...)"),
+        // Singleton class and definitions.
+        ("class << self; end", "(sclass (self) nil?)", "(class ...)"),
+        (
+            "def self.m; end",
+            "(defs (self) :m nil? nil?)",
+            "(def :m nil? nil?)",
+        ),
+        ("def m; end", "any_def", "(defs ...)"),
+        // Keyword forms.
+        ("yield 1", "(yield (int 1))", "(super ...)"),
+        ("super 1", "(super (int 1))", "(zsuper)"),
+        ("super", "(zsuper)", "(super _)"),
+        ("next 1", "(next (int 1))", "(break _)"),
+        (
+            "foo(**opts)",
+            "(send nil? :foo (hash (kwsplat (send nil? :opts))))",
+            "(send nil? :foo (hash (pair ...)))",
+        ),
+    ];
+
+    #[test]
+    fn test_mapping_table_cases() {
+        for (source, must_match, must_not_match) in MAPPING_CASES {
+            let result = ruby_prism::parse(source.as_bytes());
+            let node = first_stmt(&result);
+            assert!(
+                interpret_pattern(must_match, &node),
+                "`{must_match}` should match `{source}`"
+            );
+            assert!(
+                !interpret_pattern(must_not_match, &node),
+                "`{must_not_match}` should not match `{source}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_node_reached_directly_has_no_send_child() {
+        // Prism's `BlockNode` has no back-pointer to its call, so only `_` can
+        // match the send child when the block node is matched on its own.
+        let result = ruby_prism::parse(b"items.each { |x| x }");
+        let node = first_stmt(&result);
+        let block = node.as_call_node().unwrap().block().unwrap();
+
+        assert!(interpret_pattern("(block _ _ _)", &block));
+        assert!(!interpret_pattern("(block (send _ :each) _ _)", &block));
+    }
+
+    #[test]
+    fn test_group_types_cover_their_members() {
+        for (source, group) in [
+            ("1", "numeric"),
+            ("1.0", "numeric"),
+            ("true", "boolean"),
+            ("'a'", "any_str"),
+            (":a", "any_sym"),
+            ("foo.bar", "call"),
+            ("def m; end", "any_def"),
+        ] {
+            let result = ruby_prism::parse(source.as_bytes());
+            let node = first_stmt(&result);
+            assert!(
+                interpret_pattern(group, &node),
+                "`{group}` should match `{source}`"
+            );
+            assert!(
+                interpret_pattern(&format!("{group}_type?"), &node),
+                "`{group}_type?` should match `{source}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_captures_through_synthesized_children() {
+        let result = ruby_prism::parse(b"/foo/i");
+        let node = first_stmt(&result);
+        let captures = match_with_captures("(regexp (str $_) (regopt $_))", &node).unwrap();
+        assert_eq!(captured_name(&captures, 0), "foo");
+        assert_eq!(captured_name(&captures, 1), "i");
+
+        let result = ruby_prism::parse(b"items.each { _2 }");
+        let node = first_stmt(&result);
+        let captures = match_with_captures("(numblock $(send _ :each) $_ _)", &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "items.each { _2 }");
+        assert_eq!(captured_name(&captures, 1), "2");
     }
 }
