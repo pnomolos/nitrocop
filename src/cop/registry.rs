@@ -88,8 +88,8 @@ mod tests {
     fn default_registry_has_cops() {
         let reg = CopRegistry::default_registry();
         assert!(!reg.is_empty());
-        // 919 supported + 5 no-ops (obsolete on Ruby 3.4+)
-        assert_eq!(reg.len(), 919 + 5);
+        // 920 supported + 5 no-ops (obsolete on Ruby 3.4+)
+        assert_eq!(reg.len(), 920 + 5);
         // Spot-check cops from each department
         assert!(reg.get("Layout/TrailingWhitespace").is_some());
         assert!(reg.get("Layout/LineLength").is_some());
