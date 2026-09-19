@@ -695,11 +695,10 @@ impl ChainVisitor<'_> {
                 return Some(rhs_col); // Accept — aligned with first line dot
             }
 
-            // Block chain continuation. RuboCop only lets this override the
-            // hash-pair base when the value starts on the key line.
-            if hash_pair_value_starts_on_key_line(self.source, call_node, &self.ancestors)
-                && let Some(col) = find_block_chain_col(self.source, receiver, rhs_line)
-            {
+            // RuboCop's `find_hash_pair_alignment_base`: only when the chain's
+            // base receiver is a hash literal does the pair value align with
+            // the chain's first dot instead of the left-hand side.
+            if let Some(col) = find_hash_pair_alignment_base_col(self.source, call_node) {
                 return Some(col);
             }
         }
@@ -1753,6 +1752,40 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
 /// Block chain alignment ONLY (no continuation dot search). Used for hash
 /// pair values where continuation dot alignment is NOT wanted, but block
 /// chain continuation IS.
+/// RuboCop's `find_hash_pair_alignment_base`: inside a hash pair value the
+/// alignment base is the chain's first dotted call *only* when the chain's
+/// base receiver is a hash literal; otherwise the base is the left-hand side.
+///
+/// There is no block-chain escape hatch on this path — `check_hash_pair_indentation`
+/// consults `find_hash_pair_alignment_base` and `aligned_with_first_line_dot?`
+/// and nothing else, so `prev: @ivar\n  .select { }\n  .collect { }` keeps
+/// reporting every continuation line against the `@ivar` column.
+fn find_hash_pair_alignment_base_col(
+    source: &SourceFile,
+    call_node: &ruby_prism::CallNode<'_>,
+) -> Option<usize> {
+    let receiver = call_node.receiver()?;
+    if !chain_base_receiver_is_hash(&receiver) {
+        return None;
+    }
+    let (_, col, _) = find_first_call_dot(source, &receiver)?;
+    Some(col)
+}
+
+/// RuboCop's `find_base_receiver(...).hash_type?`: walk `.receiver` down to the
+/// chain root and report whether that root is a hash literal (`{ ... }` or a
+/// braceless keyword hash, both `:hash` in the parser gem).
+fn chain_base_receiver_is_hash(node: &ruby_prism::Node<'_>) -> bool {
+    if let Some(call) = node.as_call_node() {
+        return match call.receiver() {
+            Some(receiver) => chain_base_receiver_is_hash(&receiver),
+            None => false,
+        };
+    }
+    node.as_hash_node().is_some() || node.as_keyword_hash_node().is_some()
+}
+
+#[allow(dead_code)]
 fn find_block_chain_col(
     source: &SourceFile,
     receiver: &ruby_prism::Node<'_>,
@@ -1785,10 +1818,18 @@ fn has_matching_dot_on_line(
     if let Some((fc_line, fc_col, fc_offset)) = first_call_dot {
         // Check `first_call == node.receiver`: if the first call's dot
         // belongs to the direct receiver, skip (return false).
+        //
+        // Prism caveat: a call with a real block is one `CallNode`, while the
+        // parser gem wraps the send in a `block` node. When the receiver
+        // carries a block, RuboCop's `node.receiver` is that block node and
+        // therefore never equal to the `send` returned by
+        // `first_call_has_a_dot`, so the identity check must not fire.
         if let Some(call) = receiver.as_call_node() {
-            if let Some(dot_loc) = call.call_operator_loc() {
-                if dot_loc.start_offset() == fc_offset {
-                    return false;
+            if !has_real_block(&call) {
+                if let Some(dot_loc) = call.call_operator_loc() {
+                    if dot_loc.start_offset() == fc_offset {
+                        return false;
+                    }
                 }
             }
         }

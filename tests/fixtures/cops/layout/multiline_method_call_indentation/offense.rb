@@ -295,3 +295,19 @@ def branchy(key, value)
       .distinct
   end
 end
+
+# Hash pair value whose chain base receiver is NOT a hash: every continuation
+# line is measured against the left-hand side, with no block-chain escape.
+def rows(bid)
+  [
+    {
+      prev: @prev_rows
+        .select { |r| r.budget_id == bid }
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `@prev_rows` on line 250.
+        .collect { |r| r.amount }
+        ^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.collect` with `@prev_rows` on line 250.
+        .inject(0) { |sum, x| sum + x }
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.inject` with `@prev_rows` on line 250.
+    }
+  ]
+end

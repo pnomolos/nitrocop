@@ -261,3 +261,9 @@ def run_command_stdout(cmd)
 	  map { |l| l[1] }.
 	  join("\n")
 end
+
+# Hash pair value whose chain base receiver IS a hash literal: the base is the
+# chain's first dotted call (RuboCop's `find_hash_pair_alignment_base`).
+foo(bar: { a: 1 }.merge(b: 2)
+                 .transform_values(&:to_s)
+                 .to_a)
