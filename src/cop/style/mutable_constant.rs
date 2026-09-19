@@ -52,6 +52,28 @@ use crate::parse::source::SourceFile;
 /// - RuboCop quirk preserved: parenthesized ranges like `(1..99)` stay
 ///   offenses in strict mode because RuboCop does not unwrap the parentheses
 ///   before calling `immutable_literal?`.
+///
+/// ## `Recursive` (rubocop 1.91, vendor bump 2026-09)
+///
+/// `Recursive` (default `false`) changes what counts as "the offense" for an
+/// array/hash literal assigned to a constant, matching RuboCop's
+/// `mutable_nodes`:
+/// - `false` (default, pre-existing behavior): only the outermost value is
+///   checked; an explicitly frozen literal (`[...].freeze`) is never
+///   descended into, so nested mutable literals underneath are ignored.
+/// - `true`: when the outermost value is explicitly frozen, descend into it
+///   instead of skipping it — each nested mutable literal is its own
+///   offense (own diagnostic location), and an already-frozen nested
+///   literal is descended into in turn rather than re-flagged. This applies
+///   under both `EnforcedStyle: literals` and `EnforcedStyle: strict`, since
+///   `mutable_nodes` is independent of the style check it wraps.
+///
+/// This cop has no autocorrector in nitrocop, so RuboCop's
+/// `freeze_nested_literals` — which additionally appends `.freeze` to every
+/// nested literal in a single correction when fixing the *un*frozen case —
+/// has no nitrocop equivalent to port; only the detection-side behavior
+/// above (which nodes get flagged, under both frozen and unfrozen outer
+/// literals) is implemented.
 pub struct MutableConstant;
 
 impl MutableConstant {
@@ -450,6 +472,93 @@ impl MutableConstant {
         false
     }
 
+    /// Returns true if `value` should be flagged (ignoring `Recursive`
+    /// descent into already-frozen literals, which is handled by the caller).
+    fn is_offending_value(
+        source: &SourceFile,
+        value: &ruby_prism::Node<'_>,
+        frozen_strings: bool,
+        enforced_style: &str,
+        target_ruby_version: f64,
+    ) -> bool {
+        // Already frozen via .freeze call
+        if Self::is_frozen_value(value) {
+            return false;
+        }
+
+        // Check shareable_constant_value magic comment
+        if Self::has_shareable_constant_value(source, value.location().start_offset()) {
+            return false;
+        }
+
+        if enforced_style == "strict" {
+            // Strict mode: flag everything that isn't immutable
+            if Self::is_immutable_literal(value, target_ruby_version) {
+                return false;
+            }
+            if Self::operation_produces_immutable_object(value) {
+                return false;
+            }
+            if Self::is_struct_new_block(value) {
+                return false;
+            }
+            // In strict mode, frozen_string_literal: true makes plain strings immutable
+            if frozen_strings && Self::is_plain_string(source, value) {
+                return false;
+            }
+        } else {
+            // Literals mode: only flag mutable literals
+            if !Self::is_mutable_literal(source, value) {
+                return false;
+            }
+            // When frozen_string_literal: true is set, plain (non-interpolated) string
+            // constants are already frozen — don't flag them.
+            // But interpolated strings are NOT frozen in Ruby 3.0+.
+            if frozen_strings && Self::is_plain_string(source, value) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Returns the child literals of an array or hash node that may
+    /// themselves need freezing (both keys and values, for hashes).
+    /// Percent-literal arrays (e.g. `%w(a b)`) are skipped, matching
+    /// RuboCop's `literal_children` (`.freeze` cannot be appended to their
+    /// contents). Only consulted under `Recursive: true`.
+    fn literal_children<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+        if let Some(array) = node.as_array_node() {
+            let is_percent_literal = array
+                .opening_loc()
+                .is_some_and(|loc| loc.as_slice().starts_with(b"%"));
+            if is_percent_literal {
+                return Vec::new();
+            }
+            return array.elements().iter().collect();
+        }
+
+        if let Some(hash) = node.as_hash_node() {
+            let mut children = Vec::new();
+            for element in hash.elements().iter() {
+                if let Some(assoc) = element.as_assoc_node() {
+                    children.push(assoc.key());
+                    children.push(assoc.value());
+                }
+            }
+            return children;
+        }
+
+        Vec::new()
+    }
+
+    /// Collects a diagnostic for every node that should be flagged for
+    /// `value`, matching RuboCop's `mutable_nodes`. Under `Recursive: true`,
+    /// an explicitly frozen literal (`[...].freeze`) is not itself flagged
+    /// but is descended into: each nested mutable literal underneath becomes
+    /// its own offense, and already-frozen nested literals are descended
+    /// into in turn without being re-flagged. Without `Recursive`, this is
+    /// just the single `value` node when it's offending.
     fn check_value(
         &self,
         source: &SourceFile,
@@ -457,43 +566,34 @@ impl MutableConstant {
         frozen_strings: bool,
         enforced_style: &str,
         target_ruby_version: f64,
+        recursive: bool,
     ) -> Vec<Diagnostic> {
-        // Already frozen via .freeze call
-        if Self::is_frozen_value(value) {
-            return Vec::new();
+        if recursive && Self::is_frozen_value(value) {
+            if let Some(receiver) = value.as_call_node().and_then(|c| c.receiver()) {
+                return Self::literal_children(&receiver)
+                    .iter()
+                    .flat_map(|child| {
+                        self.check_value(
+                            source,
+                            child,
+                            frozen_strings,
+                            enforced_style,
+                            target_ruby_version,
+                            recursive,
+                        )
+                    })
+                    .collect();
+            }
         }
 
-        // Check shareable_constant_value magic comment
-        if Self::has_shareable_constant_value(source, value.location().start_offset()) {
+        if !Self::is_offending_value(
+            source,
+            value,
+            frozen_strings,
+            enforced_style,
+            target_ruby_version,
+        ) {
             return Vec::new();
-        }
-
-        if enforced_style == "strict" {
-            // Strict mode: flag everything that isn't immutable
-            if Self::is_immutable_literal(value, target_ruby_version) {
-                return Vec::new();
-            }
-            if Self::operation_produces_immutable_object(value) {
-                return Vec::new();
-            }
-            if Self::is_struct_new_block(value) {
-                return Vec::new();
-            }
-            // In strict mode, frozen_string_literal: true makes plain strings immutable
-            if frozen_strings && Self::is_plain_string(source, value) {
-                return Vec::new();
-            }
-        } else {
-            // Literals mode: only flag mutable literals
-            if !Self::is_mutable_literal(source, value) {
-                return Vec::new();
-            }
-            // When frozen_string_literal: true is set, plain (non-interpolated) string
-            // constants are already frozen — don't flag them.
-            // But interpolated strings are NOT frozen in Ruby 3.0+.
-            if frozen_strings && Self::is_plain_string(source, value) {
-                return Vec::new();
-            }
         }
 
         // Point at the mutable value (RHS), matching RuboCop behavior
@@ -533,6 +633,7 @@ impl Cop for MutableConstant {
         let enforced_style = config.get_str("EnforcedStyle", "literals");
         let frozen_strings = Self::has_frozen_string_literal_true(source);
         let target_ruby_version = target_ruby_version(config);
+        let recursive = config.get_bool("Recursive", false);
 
         // Check ConstantWriteNode (CONST = value)
         if let Some(cw) = node.as_constant_write_node() {
@@ -543,6 +644,7 @@ impl Cop for MutableConstant {
                 frozen_strings,
                 enforced_style,
                 target_ruby_version,
+                recursive,
             ));
             return;
         }
@@ -556,6 +658,7 @@ impl Cop for MutableConstant {
                 frozen_strings,
                 enforced_style,
                 target_ruby_version,
+                recursive,
             ));
             return;
         }
@@ -569,6 +672,7 @@ impl Cop for MutableConstant {
                 frozen_strings,
                 enforced_style,
                 target_ruby_version,
+                recursive,
             ));
             return;
         }
@@ -582,6 +686,7 @@ impl Cop for MutableConstant {
                 frozen_strings,
                 enforced_style,
                 target_ruby_version,
+                recursive,
             ));
         }
     }
@@ -764,5 +869,117 @@ mod tests {
             "__LINE__ should remain immutable, got {:?}",
             diags
         );
+    }
+
+    fn recursive_config(style: &str) -> CopConfig {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "EnforcedStyle".into(),
+            serde_yml::Value::String(style.to_string()),
+        );
+        options.insert("Recursive".into(), serde_yml::Value::Bool(true));
+        CopConfig {
+            options,
+            ..CopConfig::default()
+        }
+    }
+
+    #[test]
+    fn recursive_false_does_not_descend_into_frozen_outer_literal() {
+        let cop = MutableConstant;
+        let diags = crate::testutil::run_cop_full(&cop, b"CONST = [{ a: [] }].freeze\n");
+        assert!(
+            diags.is_empty(),
+            "Recursive:false (default) must not descend into an already-frozen literal"
+        );
+    }
+
+    #[test]
+    fn recursive_true_descends_into_frozen_outer_reports_nested_hash() {
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [{ a: [] }].freeze\n",
+            recursive_config("literals"),
+        );
+        assert_eq!(diags.len(), 1);
+        // Offense points at the nested hash `{ a: [] }`, not the outer array.
+        assert_eq!(diags[0].location.column, 9);
+    }
+
+    #[test]
+    fn recursive_true_descends_through_multiple_frozen_layers() {
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [{ a: [] }.freeze].freeze\n",
+            recursive_config("literals"),
+        );
+        assert_eq!(diags.len(), 1);
+        // Offense points at the innermost `[]`.
+        assert_eq!(diags[0].location.column, 14);
+    }
+
+    #[test]
+    fn recursive_true_reports_separate_offenses_at_same_level() {
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [[1, 2], { a: 1 }].freeze\n",
+            recursive_config("literals"),
+        );
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].location.column, 9);
+        assert_eq!(diags[1].location.column, 17);
+    }
+
+    #[test]
+    fn recursive_true_does_not_flag_unfrozen_top_level_twice() {
+        // Top-level value isn't itself frozen, so recursion never kicks in —
+        // this is just the ordinary single top-level offense.
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [{ a: [], b: 'foo' }]\n",
+            recursive_config("literals"),
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].location.column, 8);
+    }
+
+    #[test]
+    fn recursive_true_strict_style_descends_into_frozen_literal() {
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [Something.new].freeze\n",
+            recursive_config("strict"),
+        );
+        assert_eq!(diags.len(), 1);
+        // Offense points at `Something.new`, not the outer array.
+        assert_eq!(diags[0].location.column, 9);
+    }
+
+    #[test]
+    fn recursive_true_does_not_descend_into_percent_literal_array_elements() {
+        // The percent-literal array itself can still be a nested offense,
+        // but once it is (already) frozen its own elements are never
+        // recursed into (matches RuboCop's `literal_children` `return []
+        // if node.percent_literal?`).
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"CONST = [%w(a b c).freeze].freeze\n",
+            recursive_config("literals"),
+        );
+        assert!(
+            diags.is_empty(),
+            "must not recurse into a frozen percent-literal array's elements, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn recursive_true_respects_shareable_constant_value() {
+        let diags = crate::testutil::run_cop_full_with_config(
+            &MutableConstant,
+            b"# shareable_constant_value: literal\nCONST = [{ a: [], b: 'foo' }]\n",
+            recursive_config("literals"),
+        );
+        assert!(diags.is_empty());
     }
 }
