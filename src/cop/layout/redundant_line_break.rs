@@ -426,6 +426,27 @@ use crate::parse::source::SourceFile;
 ///   newline (xcatliu/jekyllcn `features/support/helpers.rb`).
 ///
 ///   Sampled corpus effect: FP 10 → 5, FN unchanged at 4.
+/// - **Send-only range for non-convertible blocks**: the bound is now the end of
+///   the call's arguments, not the block's start offset. Parser's send
+///   expression ends at its last argument, so `Then 'x' \` newline
+///   `do |y| ... end` is a single-line send with a multiline block parent
+///   (cucumber/aruba `lib/aruba/cucumber/command.rb`).
+/// - **`::` counts as a dot for block-chain precedence**:
+///   `other_cop_takes_precedence?` tests `block_node.parent.loc.dot`, which
+///   Parser sets for `::` too. `&.` is excluded by the `send_type?` half of the
+///   same condition (a safe-navigation call is `csend`, not `send`), which is
+///   what the 2026-04-12 safe-navigation note already encoded
+///   (LubyRuffy/fofa `ziptest.rb`: `AssertEntry::assert_contents(a,
+///   zf.get_input_stream(x) { |is| is.read })`).
+///
+///   Sampled corpus effect: FP 5 → 0, FN unchanged at 4.
+///
+/// ## Remaining sampled divergence (2026-09-18)
+/// Four FNs over the 66-repo sample, all in files that are not valid Ruby
+/// (dependabot-core `bundler/spec/fixtures/projects/bundler2/invalid_ruby/Gemfile`,
+/// octocatalog-diff `spec/octocatalog-diff/fixtures/cli-configs/not-ruby.rb`).
+/// The parser gem error-recovers and still yields nodes for RuboCop to report
+/// on; Prism does not. This is a parse/file-discovery divergence, not cop logic.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -850,9 +871,13 @@ impl<'pr> Visit<'pr> for SingleLineBlockCollector<'_, 'pr> {
 }
 
 impl SingleLineBlockCollector<'_, '_> {
+    /// `other_cop_takes_precedence?` tests `block_node.parent.loc.dot`, which is
+    /// set for `::` as well as `.` (`AssertEntry::assert_contents(a, b { .. })`).
+    /// `&.` is excluded by the `send_type?` half of the same condition: a
+    /// safe-navigation call is a `csend` node, not a `send`.
     fn call_has_dot(call: &ruby_prism::CallNode<'_>) -> bool {
         call.call_operator_loc()
-            .is_some_and(|loc| loc.as_slice() == b".")
+            .is_some_and(|loc| matches!(loc.as_slice(), b"." | b"::"))
     }
 
     /// Check if the block's "parent" in Parser AST terms is a CallNode with a dot.
@@ -1375,9 +1400,19 @@ impl<'pr> Visit<'pr> for RedundantLineBreakVisitor<'_, 'pr> {
                     node.arguments().is_some() && node.opening_loc().is_none()
                 });
         let check_end = if has_non_convertible_block {
-            node.block()
-                .and_then(|b| b.as_block_node())
-                .map_or(end_offset, |block| block.location().start_offset())
+            // Parser's send expression ends at its last argument, not at the
+            // block keyword. With a backslash continuation between the two
+            // (`Then 'x' \` newline `do |y|`) the block-start bound would make
+            // a single-line send look multiline. `has_non_convertible_block`
+            // implies the call has arguments.
+            node.arguments()
+                .map(|args| args.location().end_offset())
+                .or_else(|| {
+                    node.block()
+                        .and_then(|b| b.as_block_node())
+                        .map(|block| block.location().start_offset())
+                })
+                .unwrap_or(end_offset)
         } else {
             end_offset
         };

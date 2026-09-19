@@ -584,3 +584,20 @@ def front_matter(matter, content)
     #{content}
   EOF
 end
+
+# Parser's send expression ends at the last argument, not at the `do` keyword,
+# so this command call is single-line even though a backslash continuation puts
+# its non-convertible block on the next line.
+Then '(the ){channel} from {string} should contain exactly {string}' \
+  do |channel, cmd, expected|
+  matcher = channel
+  expect(cmd).to matcher(expected)
+end
+
+# `other_cop_takes_precedence?` tests `block_node.parent.loc.dot`, which is set
+# for `::` as well as `.`. The single-line block's parent here is the
+# `AssertEntry::assert_contents` send, so Layout/SingleLineBlockChain owns this.
+def test_extract
+  AssertEntry::assert_contents(EXTRACTED_FILENAME,
+      zf.get_input_stream(ENTRY_TO_EXTRACT) { |is| is.read })
+end
