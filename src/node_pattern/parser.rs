@@ -13,10 +13,25 @@ pub enum PatternNode {
     },
     /// {a | b | c}
     Alternatives(Vec<PatternNode>),
+    /// A multi-term `{}` branch: the `a b` of `{a b | c}`.
+    ///
+    /// RuboCop's builder groups each `|`-separated run of terms into a
+    /// subsequence (`builder.rb:57-68`); it matches that run of children in
+    /// order and can therefore consume more (or fewer) than one child.
+    Subsequence(Vec<PatternNode>),
     /// [a b c]
     Conjunction(Vec<PatternNode>),
-    /// $pattern
-    Capture(Box<PatternNode>),
+    /// `$pattern` — binds the matched value to a numbered capture slot.
+    ///
+    /// Slots are allocated by the parser in `$`-occurrence order (pre-order,
+    /// left to right), mirroring RuboCop's compiler
+    /// (`vendor/rubocop-ast/lib/rubocop/ast/node_pattern/compiler.rb:71-100`).
+    Capture {
+        /// Zero-based capture slot index.
+        slot: usize,
+        /// The pattern whose matched value is captured.
+        inner: Box<PatternNode>,
+    },
     /// _
     Wildcard,
     /// ...
@@ -53,14 +68,68 @@ pub enum PatternNode {
     Ident(String),
 }
 
+/// Why a pattern was rejected.
+///
+/// Mirrors the `NodePattern::Invalid` cases RuboCop raises at compile time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternError {
+    /// `{}` branches declared different numbers of captures.
+    ///
+    /// RuboCop: `Invalid: each branch must have same number of captures`
+    /// (`compiler.rb:82-95`).
+    UnbalancedUnionCaptures {
+        /// Captures declared by the first branch.
+        expected: usize,
+        /// Captures declared by the offending branch.
+        found: usize,
+    },
+}
+
+impl std::fmt::Display for PatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatternError::UnbalancedUnionCaptures { expected, found } => write!(
+                f,
+                "each branch of {{}} must have the same number of captures (expected {expected}, found {found})"
+            ),
+        }
+    }
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Number of capture slots allocated so far (RuboCop's `Compiler#captures`).
+    captures: usize,
+    /// First error encountered; a pattern with an error never yields an AST.
+    error: Option<PatternError>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            captures: 0,
+            error: None,
+        }
+    }
+
+    /// Number of capture slots the last parse allocated.
+    pub fn capture_count(&self) -> usize {
+        self.captures
+    }
+
+    /// The error that rejected the pattern, if any.
+    pub fn error(&self) -> Option<&PatternError> {
+        self.error.as_ref()
+    }
+
+    /// Allocate the next capture slot (RuboCop's `Compiler#new_capture`).
+    fn new_capture(&mut self) -> usize {
+        let slot = self.captures;
+        self.captures += 1;
+        slot
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -83,7 +152,13 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Option<PatternNode> {
-        self.parse_node()
+        let node = self.parse_node();
+        // Inner errors are not threaded through every `Option` return, so a
+        // recorded error vetoes the whole pattern here.
+        if self.error.is_some() {
+            return None;
+        }
+        node
     }
 
     fn parse_node(&mut self) -> Option<PatternNode> {
@@ -95,8 +170,14 @@ impl Parser {
             Token::LBracket => self.parse_conjunction(),
             Token::Capture => {
                 self.advance();
+                // RuboCop allocates the slot before compiling the captured
+                // term, so nested captures are numbered outside-in.
+                let slot = self.new_capture();
                 let inner = self.parse_node()?;
-                Some(PatternNode::Capture(Box::new(inner)))
+                Some(PatternNode::Capture {
+                    slot,
+                    inner: Box::new(inner),
+                })
             }
             Token::Negation => {
                 self.advance();
@@ -222,24 +303,91 @@ impl Parser {
         }
     }
 
+    /// Parse `{a b c}` / `{a b | c}`.
+    ///
+    /// Branch shape follows RuboCop's builder (`builder.rb:57-68`): without `|`
+    /// every term is its own branch, with `|` each separated run becomes one
+    /// branch (a [`PatternNode::Subsequence`] when it holds several terms).
+    ///
+    /// Capture slots are shared across branches: every branch restarts from the
+    /// slot base the union entered with, and all branches must allocate the same
+    /// number of slots — RuboCop's `Compiler#enforce_same_captures`
+    /// (`compiler.rb:82-95`).
     fn parse_alternatives(&mut self) -> Option<PatternNode> {
         self.expect(&Token::LBrace);
-        let mut alts = Vec::new();
+
+        let base = self.captures;
+        // Terms are parsed with the slot counter running continuously; the
+        // per-branch re-basing happens below, once `|` has told us how the
+        // terms group into branches.
+        let mut groups: Vec<Vec<(PatternNode, usize, usize)>> = vec![Vec::new()];
+        let mut saw_pipe = false;
 
         while self.peek().is_some() && self.peek() != Some(&Token::RBrace) {
-            // Skip pipe separators
             if self.peek() == Some(&Token::Pipe) {
                 self.advance();
+                saw_pipe = true;
+                groups.push(Vec::new());
                 continue;
             }
-            if let Some(node) = self.parse_node() {
-                alts.push(node);
-            } else {
-                break;
-            }
+            let start = self.captures;
+            let Some(node) = self.parse_node() else { break };
+            let allocated = self.captures - start;
+            groups
+                .last_mut()
+                .expect("groups is never empty")
+                .push((node, start, allocated));
         }
 
         self.expect(&Token::RBrace);
+
+        if !saw_pipe {
+            // `{a b c}` — each term is a branch of its own.
+            groups = groups
+                .pop()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|term| vec![term])
+                .collect();
+        }
+
+        let mut alts = Vec::with_capacity(groups.len());
+        let mut branch_captures: Option<usize> = None;
+
+        for group in groups {
+            let mut terms = Vec::with_capacity(group.len());
+            let mut allocated = 0;
+            for (mut term, start, count) in group {
+                // Re-base this term's slots onto the branch's own range.
+                let shift = start - (base + allocated);
+                if shift > 0 {
+                    shift_capture_slots(&mut term, shift);
+                }
+                allocated += count;
+                terms.push(term);
+            }
+
+            match branch_captures {
+                None => branch_captures = Some(allocated),
+                Some(expected) if expected != allocated => {
+                    self.error
+                        .get_or_insert(PatternError::UnbalancedUnionCaptures {
+                            expected,
+                            found: allocated,
+                        });
+                    return None;
+                }
+                Some(_) => {}
+            }
+
+            alts.push(if terms.len() == 1 {
+                terms.pop().expect("single-term branch")
+            } else {
+                PatternNode::Subsequence(terms)
+            });
+        }
+
+        self.captures = base + branch_captures.unwrap_or(0);
         Some(PatternNode::Alternatives(alts))
     }
 
@@ -257,6 +405,34 @@ impl Parser {
 
         self.expect(&Token::RBracket);
         Some(PatternNode::Conjunction(items))
+    }
+}
+
+/// Subtract `delta` from every capture slot in `node`.
+///
+/// Used when a `{}` branch is re-based onto the union's shared slot range.
+fn shift_capture_slots(node: &mut PatternNode, delta: usize) {
+    match node {
+        PatternNode::Capture { slot, inner } => {
+            *slot -= delta;
+            shift_capture_slots(inner, delta);
+        }
+        PatternNode::NodeMatch { children, .. } => {
+            for child in children {
+                shift_capture_slots(child, delta);
+            }
+        }
+        PatternNode::Alternatives(items)
+        | PatternNode::Conjunction(items)
+        | PatternNode::Subsequence(items) => {
+            for item in items {
+                shift_capture_slots(item, delta);
+            }
+        }
+        PatternNode::Negation(inner)
+        | PatternNode::ParentRef(inner)
+        | PatternNode::DescendRef(inner) => shift_capture_slots(inner, delta),
+        _ => {}
     }
 }
 
@@ -280,7 +456,7 @@ pub fn pattern_summary(node: &PatternNode) -> String {
         PatternNode::IntLiteral(n) => n.to_string(),
         PatternNode::FloatLiteral(s) => s.clone(),
         PatternNode::StringLiteral(s) => format!("\"{s}\""),
-        PatternNode::Capture(inner) => format!("${}", pattern_summary(inner)),
+        PatternNode::Capture { inner, .. } => format!("${}", pattern_summary(inner)),
         PatternNode::Alternatives(alts) => {
             let inner: Vec<String> = alts.iter().map(pattern_summary).collect();
             format!("{{{}}}", inner.join(" | "))
@@ -288,6 +464,10 @@ pub fn pattern_summary(node: &PatternNode) -> String {
         PatternNode::Conjunction(items) => {
             let inner: Vec<String> = items.iter().map(pattern_summary).collect();
             format!("[{}]", inner.join(" "))
+        }
+        PatternNode::Subsequence(items) => {
+            let inner: Vec<String> = items.iter().map(pattern_summary).collect();
+            inner.join(" ")
         }
         PatternNode::Negation(inner) => format!("!{}", pattern_summary(inner)),
         PatternNode::HelperCall(name) => format!("#{name}"),
@@ -393,14 +573,17 @@ mod tests {
         let ast = parser.parse().unwrap();
 
         match ast {
-            PatternNode::Capture(inner) => match *inner {
-                PatternNode::Alternatives(alts) => {
-                    assert_eq!(alts.len(), 2);
-                    assert!(matches!(&alts[0], PatternNode::SymbolLiteral(s) if s == "first"));
-                    assert!(matches!(&alts[1], PatternNode::SymbolLiteral(s) if s == "take"));
+            PatternNode::Capture { slot, inner } => {
+                assert_eq!(slot, 0);
+                match *inner {
+                    PatternNode::Alternatives(alts) => {
+                        assert_eq!(alts.len(), 2);
+                        assert!(matches!(&alts[0], PatternNode::SymbolLiteral(s) if s == "first"));
+                        assert!(matches!(&alts[1], PatternNode::SymbolLiteral(s) if s == "take"));
+                    }
+                    _ => panic!("Expected Alternatives inside Capture"),
                 }
-                _ => panic!("Expected Alternatives inside Capture"),
-            },
+            }
             _ => panic!("Expected Capture"),
         }
     }
@@ -503,7 +686,10 @@ mod tests {
 
     #[test]
     fn test_pattern_summary_capture() {
-        let node = PatternNode::Capture(Box::new(PatternNode::Wildcard));
+        let node = PatternNode::Capture {
+            slot: 0,
+            inner: Box::new(PatternNode::Wildcard),
+        };
         assert_eq!(pattern_summary(&node), "$_");
     }
 
@@ -511,5 +697,173 @@ mod tests {
     fn test_pattern_summary_negation() {
         let node = PatternNode::Negation(Box::new(PatternNode::NilPredicate));
         assert_eq!(pattern_summary(&node), "!nil?");
+    }
+
+    /// Collect `(slot, summary)` for every capture in the tree, pre-order.
+    fn capture_slots(node: &PatternNode) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        fn walk(node: &PatternNode, out: &mut Vec<(usize, String)>) {
+            match node {
+                PatternNode::Capture { slot, inner } => {
+                    out.push((*slot, pattern_summary(inner)));
+                    walk(inner, out);
+                }
+                PatternNode::NodeMatch { children, .. } => {
+                    for child in children {
+                        walk(child, out);
+                    }
+                }
+                PatternNode::Alternatives(items)
+                | PatternNode::Conjunction(items)
+                | PatternNode::Subsequence(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                PatternNode::Negation(inner)
+                | PatternNode::ParentRef(inner)
+                | PatternNode::DescendRef(inner) => walk(inner, out),
+                _ => {}
+            }
+        }
+        walk(node, &mut out);
+        out
+    }
+
+    fn parse_pattern(src: &str) -> (Option<PatternNode>, usize, Option<PatternError>) {
+        let mut lexer = Lexer::new(src);
+        let mut parser = Parser::new(lexer.tokenize());
+        let ast = parser.parse();
+        (ast, parser.capture_count(), parser.error().cloned())
+    }
+
+    #[test]
+    fn test_capture_slots_are_numbered_in_source_order() {
+        let (ast, count, err) = parse_pattern("(send $(send $_ :% (int 2)) ${:== :!=} (int $0))");
+        assert!(err.is_none());
+        assert_eq!(count, 4);
+        let slots = capture_slots(&ast.unwrap());
+        assert_eq!(
+            slots.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(slots[0].1, "(send $_ :% (int 2))");
+        assert_eq!(slots[1].1, "_");
+        assert_eq!(slots[2].1, "{:== | :!=}");
+        assert_eq!(slots[3].1, "0");
+    }
+
+    #[test]
+    fn test_union_branches_share_capture_slots() {
+        // RuboCop resets the slot counter for each branch: only one branch
+        // ever runs, so both `$_` occupy slot 0 and the union declares 1.
+        let (ast, count, err) = parse_pattern("{(send $_ :a) (send $_ :b)}");
+        assert!(err.is_none());
+        assert_eq!(count, 1);
+        let slots = capture_slots(&ast.unwrap());
+        assert_eq!(
+            slots.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+    }
+
+    #[test]
+    fn test_captures_after_union_continue_from_branch_width() {
+        let (ast, count, err) = parse_pattern("(send {(send $_ $_) (send $_ $_)} $_)");
+        assert!(err.is_none());
+        assert_eq!(count, 3);
+        let slots = capture_slots(&ast.unwrap());
+        assert_eq!(
+            slots.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 1, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn test_unbalanced_union_captures_is_rejected() {
+        let (ast, _, err) = parse_pattern("{(send $_ :a) (send _ :b)}");
+        assert!(ast.is_none());
+        assert_eq!(
+            err,
+            Some(PatternError::UnbalancedUnionCaptures {
+                expected: 1,
+                found: 0
+            })
+        );
+    }
+
+    #[test]
+    fn test_capture_rest_gets_its_own_slot() {
+        let (ast, count, err) = parse_pattern("(send _ :foo $...)");
+        assert!(err.is_none());
+        assert_eq!(count, 1);
+        let slots = capture_slots(&ast.unwrap());
+        assert_eq!(slots, vec![(0, "...".to_string())]);
+    }
+
+    #[test]
+    fn test_patterns_without_captures_have_zero_count() {
+        let (_, count, err) = parse_pattern("(send nil? :require ...)");
+        assert!(err.is_none());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_pipe_groups_terms_into_a_subsequence_branch() {
+        let (ast, count, err) = parse_pattern("{(int 1) | (int 2) (int 3)}");
+        assert!(err.is_none());
+        assert_eq!(count, 0);
+        match ast.unwrap() {
+            PatternNode::Alternatives(alts) => {
+                assert_eq!(alts.len(), 2);
+                assert!(matches!(alts[0], PatternNode::NodeMatch { .. }));
+                match &alts[1] {
+                    PatternNode::Subsequence(items) => assert_eq!(items.len(), 2),
+                    other => panic!("expected subsequence, got {}", pattern_summary(other)),
+                }
+            }
+            other => panic!("expected alternatives, got {}", pattern_summary(&other)),
+        }
+    }
+
+    #[test]
+    fn test_without_pipes_each_term_is_its_own_branch() {
+        let (ast, _, _) = parse_pattern("{(int 1) (int 2) (int 3)}");
+        match ast.unwrap() {
+            PatternNode::Alternatives(alts) => {
+                assert_eq!(alts.len(), 3);
+                assert!(
+                    alts.iter()
+                        .all(|a| !matches!(a, PatternNode::Subsequence(_)))
+                );
+            }
+            other => panic!("expected alternatives, got {}", pattern_summary(&other)),
+        }
+    }
+
+    #[test]
+    fn test_captures_in_a_subsequence_branch_are_numbered_within_the_branch() {
+        // Style/ComparableBetween shape: both branches bind two values.
+        let (ast, count, err) = parse_pattern("(send {$_ :>= $_ | $_ :<= $_})");
+        assert!(err.is_none(), "unexpected error: {err:?}");
+        assert_eq!(count, 2);
+        let slots = capture_slots(&ast.unwrap());
+        assert_eq!(
+            slots.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn test_unbalanced_subsequence_branches_are_rejected() {
+        let (ast, _, err) = parse_pattern("{$_ :>= $_ | $_ :<= _}");
+        assert!(ast.is_none());
+        assert_eq!(
+            err,
+            Some(PatternError::UnbalancedUnionCaptures {
+                expected: 2,
+                found: 1
+            })
+        );
     }
 }
