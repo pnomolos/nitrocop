@@ -25,7 +25,7 @@ Planning branch, not for upstream. Read this first when resuming.
 | W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Layout/MultilineMethodCallIndentation and Layout/RedundantLineBreak in progress (branches fix/layout-multiline-method-call-indentation, fix/layout-redundant-line-break). Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
-| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); IrCop + registry + Style/TimeNow in progress (branches ir/ir-cop, ir/first-cop-time-now) | in progress |
+| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch) | in progress |
 | W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; synth (ir_synth.py) + verify (ir_verify.py) after IrCop lands | in progress |
 
 ## Open PRs
@@ -38,6 +38,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - #11 np: walker ancestor stack, `^`/`` ` ``/`%0`, ancestor predicates (base #7)
 - #13 np: `?`/`*`/`+` repetition operators (base #11). np stack complete: #3→#4→#5→#7→#11→#13. Known mapping gap worth its own PR: Prism `StatementsNode` wrapper where Parser has a bare body statement (breaks `(def _ (args) $(...))`-shaped patterns); parameterless `def` has no `ParametersNode` so `(args)` cannot match
 - #12 ir: Expr compiler + evaluator (base #9, includes merge of np/predicate-resolution)
+- #14 ir: IrCopRunner + registry + `ir_cop_fixture_tests!` (base #12, includes merge of np/repetition); ~13 µs/file upper-bound overhead
+- #16 ir: first translated cop Style/TimeNow (base #14); engine fix: exact child arity for every sequence
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #10 fix: Layout/HashAlignment separator variant (base main) — two structural causes; note it still replicates the 1.84.2 clobber-abort quirk that 1.91.0 removes, revisit after the bump
@@ -47,6 +49,9 @@ Planning branch, not for upstream. Read this first when resuming.
 ## Owner decisions needed
 - **Config-relative Include/Exclude (PR #8 cluster 4, 110 FN + 2 FP):** RuboCop absolutizes cop-level Include/Exclude against the config file's directory; the oracle passes a temp-dir config so RuboCop never runs include-gated cops there. Options: (a) match RuboCop in `CopFilterSet` (see docs/investigations/investigation-target-dir-relativization.md), or (b) teach the oracle's include-gated pass to re-derive Lint/RedundantCopDisableDirective. Do NOT ignore include-gated cops when marking directives used.
 - **ProjectIndexHelp** (5 new cops need a cross-file symbol index): build the index infra, or leave those 5 unimplemented.
+
+## Merge order for the IR stream
+main ← #3 ← #4 ← #5 ← #7 ← #11 ← #13 (np) ; main ← #9 ← #12 (merges #7) ← #14 (merges #13) ← #16 ← pilot ; #15 (Python) on #12. Merging the np stack first flattens the merge commits in #12/#14.
 
 ## Sequencing notes
 - After #2 merges: dispatch corpus oracle on main, then triage drift (W2). Three cops replicate RuboCop 1.84 crashes that upstream fixed: Layout/HashAlignment, Layout/IndentationWidth, Lint/LiteralAsCondition.
