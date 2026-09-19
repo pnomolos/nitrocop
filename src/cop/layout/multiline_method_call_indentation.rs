@@ -1,7 +1,6 @@
 use ruby_prism::Visit;
 
 use crate::cop::shared::method_identifier_predicates;
-use crate::cop::shared::util::indentation_of;
 use crate::cop::{Cop, CopConfig};
 use crate::diagnostic::Diagnostic;
 use crate::parse::source::SourceFile;
@@ -483,7 +482,7 @@ impl ChainVisitor<'_> {
     ) -> usize {
         let base_line = self.indented_base_line(call_node);
         let base_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
-        let base_indent = indentation_of(base_line_bytes);
+        let base_indent = line_indentation(base_line_bytes);
         let kw_extra = keyword_extra_indent(self.source, call_node, self.width);
         base_indent + self.width + kw_extra
     }
@@ -748,7 +747,7 @@ impl ChainVisitor<'_> {
     ) -> String {
         let base_line = self.indented_base_line(call_node);
         let chain_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
-        let chain_indent = indentation_of(chain_line_bytes);
+        let chain_indent = line_indentation(chain_line_bytes);
         let _ = call_node;
         format!(
             "Use {} (not {}) spaces for indentation of a chained method call.",
@@ -1368,6 +1367,19 @@ fn assignment_rhs_node<'a>(node: &ruby_prism::Node<'a>) -> Option<ruby_prism::No
     }
 
     None
+}
+
+/// Leading-whitespace width of a line, counting tabs as one column each.
+///
+/// RuboCop's `MultilineExpressionIndentation#indentation` is
+/// `node.source_range.source_line =~ /\S/`, which counts every leading
+/// whitespace character. `shared::util::indentation_of` counts spaces only and
+/// therefore returns 0 on tab-indented files, which made every continuation
+/// line in such files look over-indented by its whole leading-tab run.
+fn line_indentation(line: &[u8]) -> usize {
+    line.iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count()
 }
 
 /// Mirrors RuboCop's `MultilineExpressionIndentation::UNALIGNED_RHS_TYPES`

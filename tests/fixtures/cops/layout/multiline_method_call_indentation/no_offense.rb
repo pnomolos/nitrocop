@@ -252,3 +252,12 @@ def visible_variants_for_outgoing_exchanges
     visible[enterprise.id] = variants if variants.any?
   end
 end
+
+# Tab-indented continuation lines: leading tabs count as one column each,
+# so the chain below is correctly indented by two spaces past the receiver.
+def run_command_stdout(cmd)
+	run_command(cmd).
+	  select { |l| l[0] == :stdout }.
+	  map { |l| l[1] }.
+	  join("\n")
+end
