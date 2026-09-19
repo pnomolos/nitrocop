@@ -346,3 +346,10 @@ def links(item)
     &.organisation
     ^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `&.organisation` with `.edition_organisations` on line 282.
 end
+
+# Attribute-assignment call: the parser gem's `loc.selector` covers the method
+# name only, so `right_hand_side` is `dot.join(selector)` and the reported
+# source is `.nonce_name`, not `.nonce_name=`.
+described_class.new(url: url)
+    .nonce_name = 'stuff'
+    ^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.nonce_name` with `.new` on line 290.

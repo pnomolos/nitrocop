@@ -747,8 +747,7 @@ impl ChainVisitor<'_> {
         receiver: &ruby_prism::Node<'_>,
         is_trailing_dot: bool,
     ) -> String {
-        let selector = call_node.name().as_slice();
-        let selector_str = std::str::from_utf8(selector).unwrap_or("?");
+        let selector_str = selector_text(call_node);
 
         let (base_name, base_line) = if self.in_hash_value {
             // In hash pair context, RuboCop uses left_hand_side(node.receiver),
@@ -805,12 +804,10 @@ impl ChainVisitor<'_> {
     ) -> String {
         let selector_str = if is_trailing_dot {
             // For trailing dot, the selector (method name) is the RHS
-            let name = call_node.name().as_slice();
-            std::str::from_utf8(name).unwrap_or("?").to_string()
+            selector_text(call_node)
         } else if call_node.message_loc().is_some() {
-            let name = call_node.name().as_slice();
             let operator = call_operator_text(self.source, call_node);
-            format!("{operator}{}", std::str::from_utf8(name).unwrap_or("?"))
+            format!("{operator}{}", selector_text(call_node))
         } else {
             // Implicit call (proc call) — `a\n  .(args)`
             ".(".to_string()
@@ -831,6 +828,33 @@ impl ChainVisitor<'_> {
             "Indent `{selector_str}` {} spaces more than `{base_name}` on line {base_line}.",
             self.width
         )
+    }
+}
+
+/// RuboCop's `node.loc.selector` source, i.e. the method-name token alone.
+///
+/// `right_hand_side` reports `dot.join(selector)`, and the parser gem's
+/// `selector` range for an attribute writer (`obj.foo = 1`) covers `foo` only —
+/// the `=` is a separate `loc.operator` token. Prism has no separate operator
+/// location on `CallNode`; `name()` is the full `foo=`, so the trailing `=` has
+/// to come back off or the message reads ``Align `.foo=` `` where RuboCop says
+/// ``Align `.foo` ``. Operator methods that legitimately end in `=` (`==`,
+/// `<=`, `>=`, `!=`, `===`, `[]=`) keep their name: for those the parser's
+/// selector range is the whole operator, and `[]=` cannot reach this message
+/// anyway because `relevant_node?` requires `loc.dot`.
+fn selector_text(call: &ruby_prism::CallNode<'_>) -> String {
+    let name = std::str::from_utf8(call.name().as_slice()).unwrap_or("?");
+    let Some(stem) = name.strip_suffix('=') else {
+        return name.to_string();
+    };
+    if !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || !c.is_ascii())
+    {
+        stem.to_string()
+    } else {
+        name.to_string()
     }
 }
 
