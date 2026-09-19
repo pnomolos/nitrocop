@@ -22,11 +22,45 @@ use super::cop::IrCopRunner;
 use super::load::{LoadMode, load_str_with};
 
 /// `(path relative to the repo root, contents)` for every embedded IR cop.
-pub static FILES: &[(&str, &str)] = &[(
-    "src/resources/ir/style/time_now.cop.yml",
-    include_str!("../../resources/ir/style/time_now.cop.yml"),
-)];
+pub static FILES: &[(&str, &str)] = &[
+    (
+        "src/resources/ir/lint/data_define_override.cop.yml",
+        include_str!("../../resources/ir/lint/data_define_override.cop.yml"),
+    ),
+    (
+        "src/resources/ir/style/file_open.cop.yml",
+        include_str!("../../resources/ir/style/file_open.cop.yml"),
+    ),
+    (
+        "src/resources/ir/style/predicate_with_kind.cop.yml",
+        include_str!("../../resources/ir/style/predicate_with_kind.cop.yml"),
+    ),
+    (
+        "src/resources/ir/style/redundant_min_max_by.cop.yml",
+        include_str!("../../resources/ir/style/redundant_min_max_by.cop.yml"),
+    ),
+    (
+        "src/resources/ir/style/time_now.cop.yml",
+        include_str!("../../resources/ir/style/time_now.cop.yml"),
+    ),
+];
 
+crate::ir_cop_fixture_tests!(
+    lint_data_define_override,
+    "Lint/DataDefineOverride",
+    "cops/lint/data_define_override"
+);
+crate::ir_cop_fixture_tests!(style_file_open, "Style/FileOpen", "cops/style/file_open");
+crate::ir_cop_fixture_tests!(
+    style_predicate_with_kind,
+    "Style/PredicateWithKind",
+    "cops/style/predicate_with_kind"
+);
+crate::ir_cop_fixture_tests!(
+    style_redundant_min_max_by,
+    "Style/RedundantMinMaxBy",
+    "cops/style/redundant_min_max_by"
+);
 crate::ir_cop_fixture_tests!(style_time_now, "Style/TimeNow", "cops/style/time_now");
 
 /// Load and compile every embedded document.

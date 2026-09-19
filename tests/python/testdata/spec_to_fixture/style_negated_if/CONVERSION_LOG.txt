@@ -1,0 +1,14 @@
+Style/NegatedIf: 0 example(s) converted, 12 skipped
+Skipped:
+  spec line 16: custom subject(:cop) override (not the :config idiom)
+  spec line 34: custom subject(:cop) override (not the :config idiom)
+  spec line 52: custom subject(:cop) override (not the :config idiom)
+  spec line 67: custom subject(:cop) override (not the :config idiom)
+  spec line 79: custom subject(:cop) override (not the :config idiom)
+  spec line 88: custom subject(:cop) override (not the :config idiom)
+  spec line 100: custom subject(:cop) override (not the :config idiom)
+  spec line 124: custom subject(:cop) override (not the :config idiom)
+  spec line 154: custom subject(:cop) override (not the :config idiom)
+  spec line 165: custom subject(:cop) override (not the :config idiom)
+  spec line 181: custom subject(:cop) override (not the :config idiom)
+  spec line 188: custom subject(:cop) override (not the :config idiom)
