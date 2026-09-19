@@ -13,6 +13,30 @@ use crate::diagnostic::Severity;
 /// here. This struct exists so the cop name is registered and can be
 /// referenced in configuration (enabled/disabled/excluded).
 ///
+/// ## Fixed (2026-09-18): Layout/LineLength self-suppression — 740 corpus FPs
+///
+/// `Layout/LineLength` parsed `rubocop:disable` directives itself (a private
+/// `parse_line_length_directive` in `src/cop/layout/line_length.rs`) and
+/// `continue`d past disabled lines. Because no diagnostic was ever produced,
+/// `DisabledRanges::check_and_mark_used` never ran for those lines, the
+/// directive stayed unused, and this cop reported it as redundant. That was
+/// ~99% of the corpus FPs for this cop (CultivateLabs/raif alone: 121).
+///
+/// RuboCop's runner does the opposite: `Runner#file_offenses` passes the full
+/// offense list — *including* offenses whose status is `:disabled` — to
+/// `RedundantCopDisableDirective#offenses_to_check`, and only then does
+/// `offenses.sort.reject(&:disabled?)`. So a suppressed offense still marks
+/// its directive as needed.
+///
+/// The fix deletes the cop-local directive parser so `Layout/LineLength`
+/// always reports, and `lint_source_inner` suppresses the diagnostic through
+/// the shared `DisabledRanges` bookkeeping (which also handles department
+/// disables, `all`, and legacy names like `Metrics/LineLength`). Unlike the
+/// two reverted attempts below this removes work instead of adding it: forem
+/// (3257 files) runs in 2.5s. No other cop suppresses its own diagnostics on
+/// directive lines — `grep -rn 'rubocop:disable' src/cop/` to confirm before
+/// assuming a new FP cluster has the same cause.
+///
 /// ## Reverted (twice): Layout/LineLength self-suppression compensation
 ///
 /// `compensate_line_length_self_suppression` re-checks unused Layout/LineLength

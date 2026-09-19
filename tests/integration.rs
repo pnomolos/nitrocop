@@ -12,6 +12,7 @@ use nitrocop::config::load_config;
 use nitrocop::cop::autocorrect_allowlist::AutocorrectAllowlist;
 use nitrocop::cop::registry::CopRegistry;
 use nitrocop::cop::tiers::TierMap;
+use nitrocop::diagnostic::Diagnostic;
 use nitrocop::fs::DiscoveredFiles;
 use nitrocop::linter::run_linter;
 
@@ -7446,4 +7447,123 @@ fn shared_module_usage_lint() {
         }
         panic!("{msg}");
     }
+}
+
+// ---------- Layout/LineLength directive round-trip ----------
+//
+// `Layout/LineLength` used to parse `rubocop:disable` directives itself and
+// skip the disabled lines. Because no diagnostic was produced, the central
+// directive bookkeeping never marked the directive used and
+// Lint/RedundantCopDisableDirective flagged every LineLength disable as
+// redundant (740 corpus FPs). The cop now always reports, and
+// `lint_source_inner` suppresses the diagnostic while marking the directive
+// used — which mirrors RuboCop, where disabled offenses are still handed to
+// Lint/RedundantCopDisableDirective.
+
+fn line_length_directive_case(name: &str, body: String) -> (PathBuf, Vec<Diagnostic>) {
+    let dir = temp_dir(name);
+    let file = write_file(&dir, "test.rb", body.as_bytes());
+    let config = load_config(None, Some(&dir), None).unwrap();
+    let registry = CopRegistry::default_registry();
+    let args = default_args();
+    let result = run_linter(
+        &discovered(&[file]),
+        &config,
+        &registry,
+        &args,
+        &TierMap::load(),
+        &AutocorrectAllowlist::load(),
+    );
+    (dir, result.diagnostics)
+}
+
+#[test]
+fn line_length_inline_disable_is_not_redundant() {
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\ny = \"{long}\" # rubocop:disable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_inline_disable", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(
+        redundant.len(),
+        0,
+        "Directive suppressed a real long line, got: {redundant:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.cop_name == "Layout/LineLength"),
+        "Disabled LineLength offense must not be reported: {diagnostics:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_block_disable_legacy_colon_name_is_not_redundant() {
+    // `Layout:LineLength` parses as a department-level `Layout` disable in
+    // RuboCop (`:` is not a word character), so the enclosed long line is
+    // suppressed and the directive is not redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\n# rubocop:disable Layout:LineLength\ny = \"{long}\"\n# rubocop:enable Layout:LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_block_disable_legacy", body);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.cop_name == "Layout/LineLength"),
+        "Block-disabled LineLength offense must not be reported: {diagnostics:?}"
+    );
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 0, "got: {redundant:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_legacy_metrics_name_disable_is_not_redundant() {
+    // `Metrics/LineLength` is the pre-0.78 name; RuboCop still resolves it to
+    // `Layout/LineLength` by short name, so the directive suppresses the
+    // offense and is not redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\ny = \"{long}\" # rubocop:disable Metrics/LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_legacy_metrics_name", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 0, "got: {redundant:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_unused_disable_is_still_redundant() {
+    // Control case: a LineLength disable on a short line has nothing to
+    // suppress and must still be flagged.
+    let body =
+        "# frozen_string_literal: true\n\ny = 1 # rubocop:disable Layout/LineLength\n".to_string();
+    let (dir, diagnostics) = line_length_directive_case("line_length_unused_disable", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 1, "got: {redundant:?}");
+    assert!(redundant[0].message.contains("Layout/LineLength"));
+
+    fs::remove_dir_all(&dir).ok();
 }
