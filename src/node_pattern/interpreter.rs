@@ -285,6 +285,36 @@ fn descend_children<'pr>(
     matched
 }
 
+/// The match child for a `body` slot, with Prism's `StatementsNode` wrapper
+/// peeled off a one-statement body.
+///
+/// Parser builds a `begin` only for a statement *list*: `def m; x; end` is
+/// `(def :m (args) (send nil :x))`, not `(def :m (args) (begin (send nil :x)))`
+/// — the same rule [`super::ancestors`] applies to the enclosing-node chain.
+/// Prism always wraps a body in a `StatementsNode`, so without this every
+/// upstream pattern that spells a single-statement body — `(block $(call _
+/// {:max_by :min_by}) (args (arg $_x)) (lvar _x))`, say — silently fails to
+/// match. A list of two or more statements *is* a Parser `begin` and is left
+/// alone.
+fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
+    let Some(node) = body else {
+        return MatchChild::Absent;
+    };
+    if let Some(statements) = node.as_statements_node() {
+        let mut only: Option<ruby_prism::Node<'pr>> = None;
+        for (index, statement) in statements.body().iter().enumerate() {
+            if index > 0 {
+                return MatchChild::Node(node);
+            }
+            only = Some(statement);
+        }
+        if let Some(statement) = only {
+            return MatchChild::Node(statement);
+        }
+    }
+    MatchChild::Node(node)
+}
+
 /// Everything `descend` should walk into below `node`.
 ///
 /// Parser's `children` for a block is `[send, args, body]`, and Prism's
@@ -857,6 +887,8 @@ pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'stat
 
     // Use matches! for everything else
     match node {
+        // Parser spells the implicit `it` of a `{ it }` block `(lvar :it)`.
+        ruby_prism::Node::ItLocalVariableReadNode { .. } => Some("lvar"),
         ruby_prism::Node::BlockNode { .. } => node.as_block_node().as_ref().map(block_node_type),
         ruby_prism::Node::DefNode { .. } => {
             // def vs defs: defs has a receiver
@@ -1143,22 +1175,22 @@ pub(crate) fn get_children<'pr>(
                     None => children.push(MatchChild::Absent),
                 },
             }
-            match body {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(body));
         }
         "def" => {
             let def = node.as_def_node()?;
             children.push(MatchChild::Name(def.name().as_slice()));
+            // Parser always builds an `(args)` node, empty or not, so
+            // `(def :m (args) …)` is how upstream spells a parameterless
+            // definition; Prism has no node there at all.
             match def.parameters() {
                 Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Absent),
+                None => children.push(MatchChild::Synthetic {
+                    parser_type: "args",
+                    value: b"",
+                }),
             }
-            match def.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(def.body()));
         }
         "defs" => {
             let def = node.as_def_node()?;
@@ -1167,14 +1199,17 @@ pub(crate) fn get_children<'pr>(
                 None => children.push(MatchChild::Absent),
             }
             children.push(MatchChild::Name(def.name().as_slice()));
+            // Parser always builds an `(args)` node, empty or not, so
+            // `(def :m (args) …)` is how upstream spells a parameterless
+            // definition; Prism has no node there at all.
             match def.parameters() {
                 Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Absent),
+                None => children.push(MatchChild::Synthetic {
+                    parser_type: "args",
+                    value: b"",
+                }),
             }
-            match def.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(def.body()));
         }
         "const" => {
             // Parser gem: (const parent :Name) — parent is nil for bare constants.
@@ -1243,8 +1278,16 @@ pub(crate) fn get_children<'pr>(
             }
         }
         "lvar" => {
-            let lv = node.as_local_variable_read_node()?;
-            children.push(MatchChild::Name(lv.name().as_slice()));
+            // Parser has no node for the implicit `it` of a `{ it }` block: it
+            // is `(lvar :it)`, which is what `(itblock … (lvar :it))` and
+            // `Style/RedundantMinMaxBy`'s `itblock` matcher expect. Prism gives
+            // it its own type with no name accessor, so the name is literal.
+            if node.as_it_local_variable_read_node().is_some() {
+                children.push(MatchChild::Name(b"it"));
+            } else {
+                let lv = node.as_local_variable_read_node()?;
+                children.push(MatchChild::Name(lv.name().as_slice()));
+            }
         }
         "ivar" => {
             let iv = node.as_instance_variable_read_node()?;
@@ -1466,10 +1509,7 @@ pub(crate) fn get_children<'pr>(
             // Parser: `(sclass expr body)`.
             let sclass = node.as_singleton_class_node()?;
             children.push(MatchChild::Node(sclass.expression()));
-            match sclass.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(sclass.body()));
         }
         "masgn" => {
             // Parser: `(masgn (mlhs target…) value)`. Prism's `MultiWriteNode`
@@ -1553,18 +1593,12 @@ pub(crate) fn get_children<'pr>(
                 Some(s) => children.push(MatchChild::Node(s)),
                 None => children.push(MatchChild::Absent),
             }
-            match c.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(c.body()));
         }
         "module" => {
             let m = node.as_module_node()?;
             children.push(MatchChild::Node(m.constant_path()));
-            match m.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(m.body()));
         }
         "lvasgn" => {
             let lv = node.as_local_variable_write_node()?;
@@ -1799,6 +1833,7 @@ fn matches_synthetic<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Unify(name) => env.unify(name, value),
         PatternNode::Ident(name) | PatternNode::TypePredicate(name) => {
             type_answers(parser_type, name)
         }
@@ -1935,6 +1970,7 @@ fn matches_seq_head<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Unify(name) => env.unify(name, node.location().as_slice()),
         // A type name, which is what a head term usually is.
         PatternNode::Ident(name) | PatternNode::TypePredicate(name) => node_has_type(node, name),
         // `access_node` ignores `seq_head`, so these see the node.
@@ -2057,6 +2093,10 @@ fn matches_node<'pr>(
 
         PatternNode::Ident(name) => node_has_type(node, name),
 
+        // A node in a `_name` position unifies on its verbatim source; see
+        // `MatchEnv::unify`.
+        PatternNode::Unify(name) => env.unify(name, node.location().as_slice()),
+
         PatternNode::NodeMatch {
             node_type,
             children: pattern_children,
@@ -2178,6 +2218,9 @@ fn matches_node<'pr>(
 fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr, '_>) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
+        // No byte string a real node or name can produce, so `_x` bound to an
+        // absent child only ever unifies with another absent child.
+        PatternNode::Unify(name) => env.unify(name, b"\0<absent>"),
         PatternNode::NilPredicate => true,
         PatternNode::Alternatives(alts) => {
             for alt in alts {
@@ -2231,6 +2274,9 @@ fn matches_name<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
+        // The position upstream's own patterns actually unify in: a block
+        // parameter's name against the `lvar` that uses it.
+        PatternNode::Unify(name) => env.unify(name, bytes),
         PatternNode::SymbolLiteral(name) => bytes == name.as_bytes(),
         PatternNode::StringLiteral(s) => bytes == s.as_bytes(),
         PatternNode::Alternatives(alts) => {
@@ -3679,6 +3725,92 @@ mod tests {
         assert!(!interpret_pattern("(sym :bar)", &node));
     }
 
+    /// Prism wraps every body in a `StatementsNode`; Parser only builds a
+    /// `begin` for a list of two or more, so a one-statement body is peeled.
+    #[test]
+    fn single_statement_body_is_not_a_begin() {
+        let one = ruby_prism::parse(b"items.each { |x| x }");
+        let node = first_stmt(&one);
+        assert!(interpret_pattern("(block _ _ (lvar :x))", &node));
+        assert!(!interpret_pattern("(block _ _ (begin (lvar :x)))", &node));
+
+        let two = ruby_prism::parse(b"items.each { |x| x; x }");
+        let node = first_stmt(&two);
+        assert!(interpret_pattern(
+            "(block _ _ (begin (lvar :x) (lvar :x)))",
+            &node
+        ));
+        assert!(!interpret_pattern("(block _ _ (lvar :x))", &node));
+
+        let def_one = ruby_prism::parse(b"def m; a; end");
+        let node = first_stmt(&def_one);
+        assert!(interpret_pattern("(def :m (args) (send nil? :a))", &node));
+        assert!(!interpret_pattern(
+            "(def :m (args) (begin (send nil? :a)))",
+            &node
+        ));
+
+        let klass = ruby_prism::parse(b"class C; a; end");
+        let node = first_stmt(&klass);
+        assert!(interpret_pattern(
+            "(class (const nil? :C) nil? (send nil? :a))",
+            &node
+        ));
+    }
+
+    /// `lexer.rex`'s `tUNIFY`: the first `_name` binds, later ones compare.
+    #[test]
+    fn unify_variables_bind_then_compare() {
+        let same = ruby_prism::parse(b"array.max_by { |x| x }");
+        let node = first_stmt(&same);
+        assert!(interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _x))",
+            &node
+        ));
+        assert!(interpret_pattern(
+            "(block $(call _ {:max_by :min_by :minmax_by}) (args (arg $_x)) (lvar _x))",
+            &node,
+        ));
+        // A different name is a *first* occurrence, so it binds and matches.
+        assert!(interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _y))",
+            &node
+        ));
+
+        let other = ruby_prism::parse(b"array.max_by { |x| y }");
+        let node = first_stmt(&other);
+        assert!(!interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _x))",
+            &node
+        ));
+
+        // A binding made by a `...` placement that then fails must not leak
+        // into the next placement the interpreter tries.
+        let rest = ruby_prism::parse(b"z = 1; b = 2; a = 3; f(z, b, a, a)");
+        let node = {
+            let program = rest.node();
+            let statements = program.as_program_node().unwrap().statements();
+            statements.body().iter().last().unwrap()
+        };
+        assert!(interpret_pattern(
+            "(send nil? :f ... (lvar _x) (lvar _x))",
+            &node
+        ));
+        assert!(!interpret_pattern(
+            "(send nil? :f ... (lvar _x) (lvar _x) (lvar _x))",
+            &node
+        ));
+    }
+
+    /// Parser spells the implicit `it` of a `{ it }` block `(lvar :it)`.
+    #[test]
+    fn implicit_it_is_an_lvar() {
+        let source = ruby_prism::parse(b"array.max_by { it }");
+        let node = first_stmt(&source);
+        assert!(interpret_pattern("(itblock _ _ (lvar :it))", &node));
+        assert!(!interpret_pattern("(itblock _ _ (lvar :other))", &node));
+    }
+
     #[test]
     fn test_block_pattern() {
         let source = b"items.each { |x| x }";
@@ -4361,7 +4493,8 @@ mod tests {
         ("class << self; end", "(sclass (self) nil?)", "(class ...)"),
         (
             "def self.m; end",
-            "(defs (self) :m nil? nil?)",
+            // Parser always builds an `(args)` node, empty or not.
+            "(defs (self) :m (args) nil?)",
             "(def :m nil? nil?)",
         ),
         ("def m; end", "any_def", "(defs ...)"),

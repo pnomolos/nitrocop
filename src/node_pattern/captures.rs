@@ -177,7 +177,7 @@ impl<'pr> Index<usize> for Captures<'pr> {
 
 /// A point in the capture journal that a failed attempt can rewind to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Mark(usize);
+pub struct Mark(usize, usize);
 
 /// Mutable capture state threaded through a match attempt, plus the two
 /// read-only inputs a term may need to resolve itself: the `%param` bindings
@@ -186,6 +186,12 @@ pub struct MatchEnv<'pr, 'r> {
     slots: Vec<Option<CaptureValue<'pr>>>,
     /// Journal of `(slot, previous value)` pairs, newest last.
     trail: Vec<(usize, Option<CaptureValue<'pr>>)>,
+    /// `_name` unification bindings, in first-occurrence order.
+    ///
+    /// Append-only within one match attempt: a name binds once and every later
+    /// occurrence is a comparison, never a rewrite, so rolling back is a
+    /// truncation and needs no journal of its own.
+    unify: Vec<(String, Vec<u8>)>,
     params: &'r Params,
     resolver: &'r dyn Resolver,
     /// Enclosing nodes of whatever the matcher is currently looking at,
@@ -204,6 +210,7 @@ impl std::fmt::Debug for MatchEnv<'_, '_> {
         f.debug_struct("MatchEnv")
             .field("slots", &self.slots)
             .field("trail", &self.trail)
+            .field("unify", &self.unify)
             .field("params", &self.params)
             .field("chain_depth", &self.chain.len())
             .field("root", &self.root)
@@ -240,6 +247,7 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
         Self {
             slots,
             trail: Vec::new(),
+            unify: Vec::new(),
             params,
             resolver,
             chain: ancestors.iter().map(dup_node).collect(),
@@ -325,15 +333,34 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
     /// Record the current journal position, to be passed to [`Self::rollback`].
     #[must_use]
     pub fn mark(&self) -> Mark {
-        Mark(self.trail.len())
+        Mark(self.trail.len(), self.unify.len())
     }
 
-    /// Undo every capture written since `mark`.
+    /// Undo every capture and every `_name` binding written since `mark`.
     pub fn rollback(&mut self, mark: Mark) {
         while self.trail.len() > mark.0 {
             let (slot, previous) = self.trail.pop().expect("trail is non-empty above the mark");
             self.slots[slot] = previous;
         }
+        self.unify.truncate(mark.1);
+    }
+
+    /// Match a `_name` unification variable against `bytes`.
+    ///
+    /// `lexer.rex`'s `tUNIFY`: the first occurrence of `_name` in a pattern
+    /// binds and matches anything, and every later occurrence is an equality
+    /// test against what it bound (`sequence_subcompiler.rb`'s
+    /// `compile_child_nb_guard` unification, `node_pattern.rb`'s `unify`).
+    /// Upstream compares with `==`, which on a Parser node is structural
+    /// equality; the byte form used here is a node's verbatim source, an atom's
+    /// name, so `(args (arg $_x)) … (lvar _x)` — the only shape upstream's own
+    /// patterns use it in — is exact.
+    pub fn unify(&mut self, name: &str, bytes: &[u8]) -> bool {
+        if let Some((_, bound)) = self.unify.iter().find(|(n, _)| n == name) {
+            return bound.as_slice() == bytes;
+        }
+        self.unify.push((name.to_string(), bytes.to_vec()));
+        true
     }
 
     /// The value currently bound to `slot`, if any.
@@ -364,6 +391,27 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unify_binds_once_then_compares() {
+        let mut env: MatchEnv<'_, '_> = MatchEnv::new(0);
+        assert!(env.unify("_x", b"a"));
+        assert!(env.unify("_x", b"a"));
+        assert!(!env.unify("_x", b"b"));
+        // A second name is its own first occurrence.
+        assert!(env.unify("_y", b"b"));
+    }
+
+    #[test]
+    fn rollback_undoes_unify_bindings() {
+        let mut env: MatchEnv<'_, '_> = MatchEnv::new(0);
+        let mark = env.mark();
+        assert!(env.unify("_x", b"a"));
+        env.rollback(mark);
+        // The failed attempt left nothing behind, so this is a first
+        // occurrence again and binds a different value.
+        assert!(env.unify("_x", b"b"));
+    }
 
     #[test]
     fn test_rollback_restores_previous_value() {
