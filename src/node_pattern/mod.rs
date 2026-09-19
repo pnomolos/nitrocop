@@ -3,6 +3,7 @@
 //! This module extracts the shared infrastructure from the `node_pattern_codegen`
 //! binary into reusable library code. The codegen binary imports from here.
 
+pub mod ancestors;
 pub mod captures;
 pub mod extract;
 pub mod interpreter;

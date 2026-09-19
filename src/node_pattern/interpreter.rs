@@ -47,10 +47,11 @@
 //! ParentRef (^) and DescendRef (`) still return true. Captures nested under
 //! those stubs are bound optimistically too.
 
+use super::ancestors;
 use super::captures::{CaptureValue, Captures, MatchEnv, dup_node};
 use super::lexer::Lexer;
-use super::parser::{Parser, PatternError, PatternNode};
-use super::predicates::{self, Arg, Arity, PredCtx, PredTarget};
+use super::parser::{COMPLEX_SEQ_HEAD, Parser, PatternError, PatternNode};
+use super::predicates::{self, Arg, Arity, NodeId, PredCtx, PredTarget};
 use super::resolve::{NoResolver, Params, Resolver};
 
 /// A child slot in the NodePattern positional matching.
@@ -127,7 +128,7 @@ fn eval_deferred<'pr>(
                 return false;
             };
             let args = eval_args(args, env);
-            (builtin.eval)(&PredCtx::empty(), target, &args)
+            (builtin.eval)(&PredCtx::new(env.chain()), target, &args)
         }
         PatternNode::HelperCall { name, args } => {
             let resolver = env.resolver();
@@ -137,12 +138,17 @@ fn eval_deferred<'pr>(
                 // first argument, and its captures are its own. It is applied
                 // to the child slot, which may be a name rather than a node —
                 // rubocop-rspec's `#Examples.all` takes the method symbol.
-                return matcher.matches_target(target, &Params::positional(args), resolver);
+                return matcher.matches_target(
+                    target,
+                    env.chain(),
+                    &Params::positional(args),
+                    resolver,
+                );
             }
             let Some(builtin) = predicates::lookup(name) else {
                 return false;
             };
-            (builtin.eval)(&PredCtx::empty(), target, &args)
+            (builtin.eval)(&PredCtx::new(env.chain()), target, &args)
         }
         PatternNode::ParamNumber(number) => {
             let arg = env.positional_param(*number);
@@ -167,9 +173,140 @@ fn eval_deferred<'pr>(
             },
             target,
         ),
-        PatternNode::ParentRef(_) | PatternNode::DescendRef(_) => true,
+        PatternNode::ParentRef(inner) => matches_ascend(inner, target, env),
+        PatternNode::DescendRef(inner) => matches_descend(inner, target, env),
         _ => false,
     }
+}
+
+/// `^pattern` — match `pattern` against the target's parent.
+///
+/// Upstream is `(a = access_node) && (a = a.parent) && <pattern on a>`
+/// (`node_pattern_subcompiler.rb:30-35`): a target with no parent fails, and
+/// the parent is then an ordinary node position, so `^^x` is `^` applied
+/// again to the parent.
+///
+/// Making `^^` work means the ascended term has to see the *parent's* chain,
+/// not the child's. The chain is therefore truncated to the parent's ancestors
+/// for the duration of the inner match and restored afterwards; the tail it
+/// gives up is the Prism nodes between parent and target, which the Parser gem
+/// does not have (`ancestors.rs`).
+fn matches_ascend<'pr>(
+    inner: &PatternNode,
+    target: &PredTarget<'_, 'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    // A non-node target is a name or an absent child; neither has a parent
+    // pointer upstream (`nil.parent` raises, and the guard clause rejects it).
+    if target.node().is_none() {
+        return false;
+    }
+    let Some(index) = ancestors::visible_index(env.chain(), 0) else {
+        return false;
+    };
+    let parent = dup_node(&env.chain()[index]);
+    let outer: Vec<ruby_prism::Node<'pr>> = env.chain()[..index].iter().map(dup_node).collect();
+    let saved = env.replace_chain(outer);
+    let matched = matches_node(inner, &parent, env);
+    env.replace_chain(saved);
+    matched
+}
+
+/// The depth `` ` `` is allowed to search.
+///
+/// Upstream's `NodePattern.descend` is unbounded (`node_pattern.rb:60-73`).
+/// The interpreter caps it for the same reason the parser caps `<>` arity:
+/// a pattern is data, and a pathological one must not turn into a quadratic
+/// walk of a whole file. Nothing in the vendored corpus looks deeper than a
+/// handful of levels.
+const DESCEND_MAX_DEPTH: usize = 32;
+
+/// `` `pattern `` — match `pattern` against the target or any of its
+/// descendants.
+///
+/// `NodePattern.descend` yields the element itself first and then recurses
+/// into `children` (`node_pattern.rb:60-73`), so a bare `` `x `` also matches
+/// when the target *is* an `x`. A non-node element is yielded but not
+/// descended into, which is why the walk enumerates [`MatchChild`]s: those are
+/// exactly Parser's `children`.
+fn matches_descend<'pr>(
+    inner: &PatternNode,
+    target: &PredTarget<'_, 'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    // Upstream yields the element itself first.
+    let here = match target {
+        PredTarget::Node(node) => matches_node(inner, node, env),
+        PredTarget::Absent => matches_absent(inner, env),
+        // A `$` under `` ` `` on a name slot binds nothing: the empty slice is
+        // the only `'pr`-lived bytes available here, and the case cannot
+        // arise from a vendored pattern (`` ` `` is always written against a
+        // node position).
+        PredTarget::Name(bytes) => matches_name(inner, bytes, b"", env),
+        PredTarget::Synthetic { parser_type, value } => {
+            matches_synthetic(inner, parser_type, value, env)
+        }
+    };
+    if here {
+        return true;
+    }
+    let Some(node) = target.node() else {
+        return false;
+    };
+    descend_children(inner, node, 0, env)
+}
+
+/// The recursive half of [`matches_descend`]: every child of `node`, then
+/// their children.
+fn descend_children<'pr>(
+    inner: &PatternNode,
+    node: &ruby_prism::Node<'pr>,
+    depth: usize,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    if depth >= DESCEND_MAX_DEPTH {
+        return false;
+    }
+    let children = descend_child_slots(node);
+    if children.is_empty() {
+        return false;
+    }
+    env.enter(node);
+    let matched = children.iter().any(|child| {
+        let mark = env.mark();
+        if matches_child(inner, child, env) {
+            return true;
+        }
+        env.rollback(mark);
+        match child {
+            MatchChild::Node(child_node) => descend_children(inner, child_node, depth + 1, env),
+            _ => false,
+        }
+    });
+    env.leave();
+    matched
+}
+
+/// Everything `descend` should walk into below `node`.
+///
+/// Parser's `children` for a block is `[send, args, body]`, and Prism's
+/// `CallNode` *is* both that block node and its `send` child. Taking the
+/// `block` view alone would re-enter the node through its own first child;
+/// taking the `send` view alone would miss the block's parameters and body.
+/// So both views are enumerated, minus the self-referential sequence head.
+fn descend_child_slots<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<MatchChild<'pr>> {
+    let mut slots = Vec::new();
+    if let Some(parser_type) = parser_type_for_node(node)
+        && let Some(children) = get_children(parser_type, node)
+    {
+        slots.extend(children);
+    }
+    if let Some(block_type) = block_type_of(node)
+        && let Some(children) = get_children(block_type, node)
+    {
+        slots.extend(children.into_iter().skip(1));
+    }
+    slots
 }
 
 /// Reduce a `#call` / `pred?` argument to an atom.
@@ -235,6 +372,11 @@ fn arg_matches_target(arg: &Arg, target: &PredTarget<'_, '_>) -> bool {
         Arg::Symbol(_) | Arg::Str(_) | Arg::Regexp { .. } => {
             literal_bytes(node).is_some_and(|bytes| arg.accepts_value(bytes))
         }
+        // `node === other` is `==` upstream, i.e. structural equality; no
+        // vendored pattern uses a node-valued atom that way (the only
+        // node-valued arguments go to `equal?`), so identity is the
+        // conservative reading.
+        Arg::Node(id) => *id == NodeId::of(node),
         Arg::Unresolved => false,
     }
 }
@@ -466,8 +608,7 @@ impl CompiledPattern {
     /// Whether the pattern matches `node`, discarding captures.
     #[must_use]
     pub fn matches(&self, node: &ruby_prism::Node<'_>) -> bool {
-        let mut env = MatchEnv::new(self.capture_count);
-        matches_node(&self.ast, node, &mut env)
+        self.matches_in(node, &Params::new(), &NoResolver)
     }
 
     /// Whether the pattern matches `node`, with `params` bound to its
@@ -479,7 +620,24 @@ impl CompiledPattern {
         params: &Params,
         resolver: &dyn Resolver,
     ) -> bool {
-        let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+        self.matches_with_ancestors(node, &[], params, resolver)
+    }
+
+    /// [`CompiledPattern::matches_in`] with the node's ancestor chain,
+    /// outermost first — what `^`, `root?` and `value_used?` need.
+    ///
+    /// This is the entry point an ancestor-aware cop uses: hand it the slice
+    /// `Cop::check_node_with_ancestors` was given.
+    #[must_use]
+    pub fn matches_with_ancestors<'pr>(
+        &self,
+        node: &ruby_prism::Node<'pr>,
+        ancestors: &[ruby_prism::Node<'pr>],
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> bool {
+        let mut env =
+            MatchEnv::with_inputs(self.capture_count, params, resolver, ancestors).with_root(node);
         matches_node(&self.ast, node, &mut env)
     }
 
@@ -490,24 +648,24 @@ impl CompiledPattern {
     /// and `#rspec?` in receiver position can be handed an absent child. The
     /// callee's captures are its own and are discarded, as upstream's are: a
     /// function call compiles to a boolean, not to a binding.
-    pub(crate) fn matches_target(
+    pub(crate) fn matches_target<'pr>(
         &self,
-        target: &PredTarget<'_, '_>,
+        target: &PredTarget<'_, 'pr>,
+        ancestors: &[ruby_prism::Node<'pr>],
         params: &Params,
         resolver: &dyn Resolver,
     ) -> bool {
+        let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver, ancestors);
+        if let Some(node) = target.node() {
+            // `%0` inside the callee is *its* `param0`, i.e. the value the
+            // matcher was applied to (`method_definer.rb:10-17`).
+            env = env.with_root(node);
+        }
         match target {
-            PredTarget::Node(node) => self.matches_in(node, params, resolver),
-            PredTarget::Absent => {
-                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
-                matches_absent(&self.ast, &mut env)
-            }
-            PredTarget::Name(bytes) => {
-                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
-                matches_name(&self.ast, bytes, bytes, &mut env)
-            }
+            PredTarget::Node(node) => matches_node(&self.ast, node, &mut env),
+            PredTarget::Absent => matches_absent(&self.ast, &mut env),
+            PredTarget::Name(bytes) => matches_name(&self.ast, bytes, b"", &mut env),
             PredTarget::Synthetic { parser_type, value } => {
-                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
                 matches_synthetic(&self.ast, parser_type, value, &mut env)
             }
         }
@@ -522,7 +680,20 @@ impl CompiledPattern {
         params: &Params,
         resolver: &dyn Resolver,
     ) -> Option<Captures<'pr>> {
-        let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+        self.match_captures_with_ancestors(node, &[], params, resolver)
+    }
+
+    /// [`CompiledPattern::match_captures_in`] with the node's ancestor chain.
+    #[must_use]
+    pub fn match_captures_with_ancestors<'pr>(
+        &self,
+        node: &ruby_prism::Node<'pr>,
+        ancestors: &[ruby_prism::Node<'pr>],
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> Option<Captures<'pr>> {
+        let mut env =
+            MatchEnv::with_inputs(self.capture_count, params, resolver, ancestors).with_root(node);
         if matches_node(&self.ast, node, &mut env) {
             Some(env.into_captures())
         } else {
@@ -537,12 +708,7 @@ impl CompiledPattern {
     /// term (`#pred`, `%param`, `^`, `` ` ``).
     #[must_use]
     pub fn match_captures<'pr>(&self, node: &ruby_prism::Node<'pr>) -> Option<Captures<'pr>> {
-        let mut env = MatchEnv::new(self.capture_count);
-        if matches_node(&self.ast, node, &mut env) {
-            Some(env.into_captures())
-        } else {
-            None
-        }
+        self.match_captures_in(node, &Params::new(), &NoResolver)
     }
 }
 
@@ -627,7 +793,7 @@ fn type_answers(actual: &str, pattern_type: &str) -> bool {
 /// send node, which is also what `on_send` visits) and `block` — which is a
 /// deliberate over-match: `(send …)` matched directly against a Parser `block`
 /// node is false upstream and true here.
-fn block_type_of(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+pub(crate) fn block_type_of(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
     if let Some(call) = node.as_call_node() {
         let block = call.block()?;
         return Some(block_node_type(&block.as_block_node()?));
@@ -668,7 +834,7 @@ fn concrete_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> Option<&'st
 }
 
 /// Whether `node` answers to the Parser type `pattern_type`.
-fn node_has_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> bool {
+pub(crate) fn node_has_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> bool {
     concrete_type(node, pattern_type).is_some()
 }
 
@@ -676,7 +842,7 @@ fn node_has_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> bool {
 ///
 /// Returns the Parser gem type name (e.g. "send", "block", "if") that
 /// corresponds to this Prism node, or `None` if unmapped.
-fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
     // send vs csend: both are CallNode, distinguished by &. operator
     if let Some(call) = node.as_call_node() {
         return if call
@@ -907,7 +1073,7 @@ fn operator_write_parts<'pr>(
 ///
 /// The returned `Vec<MatchChild>` matches NodePattern positional semantics.
 /// For `send`: `[receiver_or_Absent, Name(method_name), arg1, arg2, ...]`
-fn get_children<'pr>(
+pub(crate) fn get_children<'pr>(
     parser_type: &str,
     node: &ruby_prism::Node<'pr>,
 ) -> Option<Vec<MatchChild<'pr>>> {
@@ -1527,6 +1693,80 @@ fn get_children<'pr>(
     Some(children)
 }
 
+/// Helpers shared by the unit tests in this module and in
+/// [`super::ancestors`] / [`super::predicates`].
+#[cfg(test)]
+pub mod test_support {
+    use super::dup_node;
+    use ruby_prism::{Node, Visit};
+
+    /// Parse `source`, find the first node whose source text is exactly
+    /// `needle`, and hand it plus its raw Prism ancestor chain (outermost
+    /// first) to `f`.
+    ///
+    /// This is the shape [`crate::cop::walker::BatchedCopWalker`] hands a cop
+    /// that opted into ancestors, so tests exercise the same chain the runtime
+    /// produces.
+    pub fn with_node_and_chain<R>(
+        source: &str,
+        needle: &str,
+        f: impl FnOnce(&Node<'_>, &[Node<'_>]) -> R,
+    ) -> R {
+        struct Finder<'pr> {
+            needle: &'pr [u8],
+            chain: Vec<Node<'pr>>,
+            found: Option<(Node<'pr>, Vec<Node<'pr>>)>,
+        }
+
+        impl<'pr> Finder<'pr> {
+            fn check(&mut self, node: &Node<'pr>) {
+                // `ProgramNode` and `StatementsNode` share their source range
+                // with the expression they wrap, so a search by source text
+                // would find the wrapper. Neither is a Parser node when it
+                // wraps a single statement anyway.
+                if node.as_program_node().is_some() || node.as_statements_node().is_some() {
+                    return;
+                }
+                if self.found.is_none() && node.location().as_slice() == self.needle {
+                    self.found = Some((dup_node(node), self.chain.iter().map(dup_node).collect()));
+                }
+            }
+        }
+
+        impl<'pr> Visit<'pr> for Finder<'pr> {
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                self.check(&node);
+                self.chain.push(node);
+            }
+
+            fn visit_branch_node_leave(&mut self) {
+                self.chain.pop();
+            }
+
+            fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+                self.check(&node);
+            }
+        }
+
+        let result = ruby_prism::parse(source.as_bytes());
+        let mut finder = Finder {
+            needle: needle.as_bytes(),
+            chain: Vec::new(),
+            found: None,
+        };
+        finder.visit(&result.node());
+        let (node, chain) = finder
+            .found
+            .unwrap_or_else(|| panic!("no node with source text {needle:?} in {source:?}"));
+        f(&node, &chain)
+    }
+
+    /// [`with_node_and_chain`], ancestors only.
+    pub fn chain_at<R>(source: &str, needle: &str, f: impl FnOnce(&[Node<'_>]) -> R) -> R {
+        with_node_and_chain(source, needle, |_, chain| f(chain))
+    }
+}
+
 /// Match a PatternNode against a MatchChild (dispatcher).
 fn matches_child<'pr>(
     pattern: &PatternNode,
@@ -1634,6 +1874,93 @@ fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
     }
 }
 
+/// `(<head> <rest>…)` where `head` is not a plain type name.
+///
+/// Upstream compiles the head term with `seq_head: true`, which changes two
+/// things (`node_pattern_subcompiler.rb:112-120`): `access_element` becomes
+/// `node.type` — so an atom at the head compares against the *type symbol*,
+/// not against the node — while `access_node` stays the node itself, so `^`
+/// and a nested sequence still see a node. Everything else is the ordinary
+/// child list.
+fn matches_complex_sequence<'pr>(
+    head: &PatternNode,
+    rest: &[PatternNode],
+    node: &ruby_prism::Node<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    let mark = env.mark();
+    if !matches_seq_head(head, node, env) {
+        env.rollback(mark);
+        return false;
+    }
+    // The head consumed no child, so the remaining terms are the whole child
+    // list. Which children those are depends on the node's own Parser type.
+    let Some(parser_type) = parser_type_for_node(node) else {
+        env.rollback(mark);
+        return false;
+    };
+    let Some(children) = get_children(parser_type, node) else {
+        env.rollback(mark);
+        return rest.is_empty();
+    };
+    env.enter(node);
+    let matched = matches_children_list(rest, &children, env);
+    env.leave();
+    if matched {
+        return true;
+    }
+    env.rollback(mark);
+    false
+}
+
+/// One term in sequence-head position.
+fn matches_seq_head<'pr>(
+    pattern: &PatternNode,
+    node: &ruby_prism::Node<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    match pattern {
+        PatternNode::Wildcard | PatternNode::Rest => true,
+        // A type name, which is what a head term usually is.
+        PatternNode::Ident(name) | PatternNode::TypePredicate(name) => node_has_type(node, name),
+        // `access_node` ignores `seq_head`, so these see the node.
+        PatternNode::ParentRef(_) | PatternNode::DescendRef(_) => {
+            matches_deferred(pattern, &PredTarget::Node(node), env)
+        }
+        PatternNode::NodeMatch { .. } => matches_node(pattern, node, env),
+        PatternNode::Alternatives(alts) => alts.iter().any(|alt| {
+            let mark = env.mark();
+            if matches_seq_head(alt, node, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }),
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items.iter().all(|item| matches_seq_head(item, node, env)) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_seq_head(inner, node, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        // `access_element` is `node.type`, so a capture at the head binds the
+        // type symbol and an atom compares against it.
+        _ => {
+            let type_name = parser_type_for_node(node)
+                .or_else(|| block_type_of(node))
+                .unwrap_or("");
+            matches_name(pattern, type_name.as_bytes(), type_name.as_bytes(), env)
+        }
+    }
+}
+
 /// Match a pattern against a Prism AST node.
 fn matches_node<'pr>(
     pattern: &PatternNode,
@@ -1684,6 +2011,16 @@ fn matches_node<'pr>(
             node_type,
             children: pattern_children,
         } => {
+            // A sequence head that is not a bare type name (`(^send …)`,
+            // `({^any_block […]} …)`) is parked under the `_complex` sentinel
+            // by the parser, with the real head term as the first child.
+            if node_type == COMPLEX_SEQ_HEAD {
+                let Some((head, rest)) = pattern_children.split_first() else {
+                    return false;
+                };
+                return matches_complex_sequence(head, rest, node, env);
+            }
+
             // The pattern type can be a group (`call`, `any_block`, …) or a
             // type Prism spells differently, so resolve it to the concrete type
             // whose children we read.
@@ -1740,7 +2077,12 @@ fn matches_node<'pr>(
                 return pattern_children.is_empty();
             };
 
-            if matches_children_list(pattern_children, &actual_children, env) {
+            // Everything below is one level deeper, so `^` and `value_used?`
+            // inside a child slot see this node as their parent.
+            env.enter(node);
+            let matched = matches_children_list(pattern_children, &actual_children, env);
+            env.leave();
+            if matched {
                 return true;
             }
             env.rollback(mark);
@@ -2171,6 +2513,225 @@ fn match_sequence<'pr>(
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // `^` / `` ` `` / `%0` / sequence heads
+    // ---------------------------------------------------------------------
+
+    /// Match `pattern` against the first node whose source text is `needle`,
+    /// with the ancestor chain the walker would have handed a cop.
+    fn matches_at(pattern: &str, source: &str, needle: &str) -> bool {
+        matches_at_with(pattern, source, needle, &Params::new(), &NoResolver)
+    }
+
+    fn matches_at_with(
+        pattern: &str,
+        source: &str,
+        needle: &str,
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> bool {
+        let compiled = CompiledPattern::compile_with(pattern, resolver)
+            .unwrap_or_else(|error| panic!("{pattern:?} should compile: {error:?}"));
+        test_support::with_node_and_chain(source, needle, |node, chain| {
+            compiled.matches_with_ancestors(node, chain, params, resolver)
+        })
+    }
+
+    #[test]
+    fn ascend_matches_the_parent() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // pattern, source, node, expected
+            ("^send", "foo(bar)\n", "bar", true),
+            ("^def", "foo(bar)\n", "bar", false),
+            ("^(send nil? :foo ...)", "foo(bar)\n", "bar", true),
+            ("^(send nil? :baz ...)", "foo(bar)\n", "bar", false),
+            // No parent at all.
+            ("^_", "bar\n", "bar", false),
+            // `^^` climbs twice; the intervening `StatementsNode` is not a
+            // Parser node, so `def` is two levels up, not three.
+            ("^^def", "def m; foo(bar); end\n", "bar", true),
+            ("^^send", "def m; foo(bar); end\n", "bar", false),
+            // `^` inside a sequence: the child's parent is the sequence node.
+            ("(send nil? :foo ^send)", "foo(bar)\n", "foo(bar)", true),
+        ];
+        for &(pattern, source, needle, expected) in cases {
+            assert_eq!(
+                matches_at(pattern, source, needle),
+                expected,
+                "{pattern} against {needle:?} in {source:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ascend_keeps_captures() {
+        // `Style/AmbiguousEndlessMethodDefinition` captures under `^`.
+        let compiled = CompiledPattern::compile("^$(if _ _ _)").unwrap();
+        let matched =
+            test_support::with_node_and_chain("if a then b else c end\n", "b", |node, chain| {
+                compiled
+                    .match_captures_with_ancestors(node, chain, &Params::new(), &NoResolver)
+                    .map(|captures| captures.node(0).is_some())
+            });
+        assert_eq!(matched, Some(true));
+    }
+
+    #[test]
+    fn descend_yields_the_element_then_its_subtree() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // `descend` yields the element itself first.
+            ("`(send nil? :foo)", "foo\n", "foo", true),
+            ("`(send nil? :bar)", "foo(bar)\n", "foo(bar)", true),
+            ("`(send nil? :baz)", "foo(bar)\n", "foo(bar)", false),
+            // Several levels down.
+            (
+                "`(lvasgn :x _)",
+                "foo { |y| [1, (x = 2)] }\n",
+                "foo { |y| [1, (x = 2)] }",
+                true,
+            ),
+            // `Rails/ReversibleMigrationMethodDefinition`. Upstream writes
+            // `(def :change (args) _)`; the `(args)` term is dropped here
+            // because Prism gives a parameterless `def` no `ParametersNode`
+            // at all, which is a pre-existing mapping gap unrelated to `` ` ``.
+            (
+                "`(def :change ...)",
+                "class M; def change; up; end; end\n",
+                "class M; def change; up; end; end",
+                true,
+            ),
+            (
+                "`(def :change ...)",
+                "class M; def other; up; end; end\n",
+                "class M; def other; up; end; end",
+                false,
+            ),
+            // `Style/SafeNavigation::and_inside_begin?`
+            ("`(begin and ...)", "(a && b)\n", "(a && b)", true),
+        ];
+        for &(pattern, source, needle, expected) in cases {
+            assert_eq!(
+                matches_at(pattern, source, needle),
+                expected,
+                "{pattern} against {needle:?} in {source:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn descend_binds_captures_from_the_matched_descendant() {
+        // `Gemspec/RequireMfa::metadata`
+        let compiled = CompiledPattern::compile("`(send _ :metadata= $_)").unwrap();
+        let source = "Gem::Specification.new do |spec|\n  spec.metadata = { 'a' => 'b' }\nend\n";
+        let bound = test_support::with_node_and_chain(source, source.trim_end(), |node, chain| {
+            compiled
+                .match_captures_with_ancestors(node, chain, &Params::new(), &NoResolver)
+                .and_then(|captures| {
+                    captures.node(0).map(|hash| {
+                        String::from_utf8_lossy(hash.location().as_slice()).into_owned()
+                    })
+                })
+        });
+        assert_eq!(bound.as_deref(), Some("{ 'a' => 'b' }"));
+    }
+
+    #[test]
+    fn a_sequence_head_can_be_more_than_a_type_name() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // `Performance/MethodObjectAsBlock::method_object_as_argument?`:
+            // the block-pass's parent is a send, and its own child is
+            // `(send _ :method sym)`.
+            (
+                "(^send (send _ :method sym))",
+                "array.map(&method(:foo))\n",
+                "&method(:foo)",
+                true,
+            ),
+            (
+                "(^send (send _ :method sym))",
+                "array.map(&other(:foo))\n",
+                "&other(:foo)",
+                false,
+            ),
+            // A union at the head, both arms seq-head compiled.
+            ("({send def} nil? :foo)", "foo\n", "foo", true),
+            ("({^send ^def} nil? :foo)", "bar(foo)\n", "foo", true),
+            ("({^def ^module} nil? :foo)", "bar(foo)\n", "foo", false),
+        ];
+        for &(pattern, source, needle, expected) in cases {
+            assert_eq!(
+                matches_at(pattern, source, needle),
+                expected,
+                "{pattern} against {needle:?} in {source:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn param_zero_is_the_node_the_matcher_was_called_on() {
+        // `Style/RedundantParentheses::first_send_argument?` — is the node the
+        // *first* argument of its enclosing send?
+        let pattern = "^(send _ _ equal?(%0) ...)";
+        assert!(matches_at(pattern, "foo((bar), baz)\n", "(bar)"));
+        assert!(!matches_at(pattern, "foo(baz, (bar))\n", "(bar)"));
+
+        // `Performance/RedundantMatch::only_truthiness_matters?`
+        let pattern = "^({if while until case while_post until_post} equal?(%0) ...)";
+        assert!(matches_at(
+            pattern,
+            "if foo.match(/x/)\n  1\nend\n",
+            "foo.match(/x/)"
+        ));
+        assert!(!matches_at(
+            pattern,
+            "if bar\n  foo.match(/x/)\nend\n",
+            "foo.match(/x/)"
+        ));
+
+        // `Style/RedundantParentheses::first_yield_argument?`
+        assert!(matches_at(
+            "^(yield equal?(%0) ...)",
+            "yield (a), b\n",
+            "(a)"
+        ));
+    }
+
+    #[test]
+    fn equal_compares_identity_not_structure() {
+        // Two structurally identical arguments; only the first is `%0`.
+        assert!(matches_at(
+            "^(send _ _ equal?(%0) ...)",
+            "foo((a), (a))\n",
+            "(a)"
+        ));
+        // `equal?` with no node bound answers false rather than matching.
+        assert!(!matches_at("equal?(%1)", "foo\n", "foo"));
+    }
+
+    #[test]
+    fn a_recursive_matcher_terminates_by_climbing() {
+        // `Style/MixinUsage::in_top_level_scope?`, verbatim. It recurses
+        // through `^`, which strictly shortens the chain, so it terminates.
+        const PATTERN: &str = "{root? ^[{kwbegin begin if def} #in_top_level_scope?]}";
+        let owner = Owner::new(&[("in_top_level_scope?", PATTERN)], &[]);
+
+        let cases: &[(&str, bool)] = &[
+            ("include Foo\n", true),
+            ("if x\n  include Foo\nend\n", true),
+            ("begin\n  include Foo\nend\n", true),
+            ("class C\n  include Foo\nend\n", false),
+            ("module M\n  include Foo\nend\n", false),
+            ("def m\n  include Foo\nend\n", true),
+        ];
+        for &(source, expected) in cases {
+            assert_eq!(
+                matches_at_with(PATTERN, source, "include Foo", &Params::new(), &owner),
+                expected,
+                "{source:?}",
+            );
+        }
+    }
+
     /// Helper: get first statement from parsed Ruby source.
     fn first_stmt<'a>(result: &'a ruby_prism::ParseResult<'a>) -> ruby_prism::Node<'a> {
         let root = result.node();
@@ -2186,16 +2747,34 @@ mod tests {
         constants: std::collections::HashMap<String, Arg>,
     }
 
+    /// Resolves every declared name to the same trivial pattern.
+    ///
+    /// Only [`collect_unresolved`] sees it, and that only asks whether a name
+    /// is known — which is what lets a set of matchers refer to each other,
+    /// and to themselves (`#in_top_level_scope?`), before any of them exists.
+    struct Declared<'a>(&'a [(&'a str, &'a str)], CompiledPattern);
+
+    impl Resolver for Declared<'_> {
+        fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
+            self.0
+                .iter()
+                .any(|(declared, _)| *declared == name)
+                .then_some(&self.1)
+        }
+    }
+
     impl Owner {
         fn new(matchers: &[(&str, &str)], constants: &[(&str, Arg)]) -> Self {
+            let declared = Declared(matchers, CompiledPattern::compile("_").unwrap());
             Self {
                 matchers: matchers
                     .iter()
                     .map(|(name, pattern)| {
                         (
                             (*name).to_string(),
-                            CompiledPattern::compile(pattern)
-                                .unwrap_or_else(|| panic!("matcher {name} should compile")),
+                            CompiledPattern::compile_with(pattern, &declared).unwrap_or_else(
+                                |error| panic!("matcher {name} should compile: {error:?}"),
+                            ),
                         )
                     })
                     .collect(),
