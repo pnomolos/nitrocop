@@ -1,0 +1,52 @@
+# Design §1.5 — Example 2: captures, constant table, YAML anchors and merge keys.
+schema: 1
+cop: "Style/RedundantMinMaxBy"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: safe
+
+constants:
+  replacements: { max_by: "max", min_by: "min", minmax_by: "minmax" }
+
+matchers:
+  block_form:
+    pattern: |
+      (block $(call _ {:max_by :min_by :minmax_by}) (args (arg $_x)) (lvar _x))
+    captures: [send, var]
+  numblock_form:
+    pattern: |
+      (numblock $(call _ {:max_by :min_by :minmax_by}) 1 (lvar :_1))
+    captures: [send]
+  itblock_form:
+    pattern: |
+      (itblock $(call _ {:max_by :min_by :minmax_by}) _ (lvar :it))
+    captures: [send]
+
+hooks:
+  - on: [block]
+    match: block_form
+    bind: &rmb_bind
+      method: $send.method_name
+      replacement: { lookup: [consts.replacements, $send.method_name] }
+    offense: &rmb_offense
+      location: &rmb_range
+        start: $send.selector.start
+        stop: node.end_keyword.stop
+      correct:
+        - { op: replace, range: *rmb_range, text: "%{replacement}" }
+      message: "Use `%{replacement}` instead of `%{method} { |%{var}| %{var} }`."
+
+  - on: [numblock]
+    match: numblock_form
+    bind: *rmb_bind
+    offense:
+      <<: *rmb_offense
+      message: "Use `%{replacement}` instead of `%{method} { _1 }`."
+
+  - on: [itblock]
+    match: itblock_form
+    bind: *rmb_bind
+    offense:
+      <<: *rmb_offense
+      message: "Use `%{replacement}` instead of `%{method} { it }`."

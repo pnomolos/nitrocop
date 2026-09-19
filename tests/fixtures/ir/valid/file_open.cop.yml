@@ -1,0 +1,27 @@
+# Design §1.6 — Example 3: guards NodePattern cannot express.
+schema: 1
+cop: "Style/FileOpen"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: none
+restrict_on_send: [open]
+
+matchers:
+  file_open:
+    pattern: |
+      (send (const {nil? cbase} :File) :open ...)
+
+hooks:
+  - on: [send, csend]
+    match: file_open
+    when:
+      all:
+        - { not: { pred: [node, "block_argument?"] } }
+        - any:
+            - { not: { pred: [node, "value_used?"] } }
+            - { pred: [parent, "type?", "lvasgn"] }
+            - { eq: [parent.receiver, node] }
+    offense:
+      location: node
+      message: "`File.open` without a block may leak a file descriptor; use the block form."

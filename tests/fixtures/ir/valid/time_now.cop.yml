@@ -1,0 +1,24 @@
+# Design §1.3 — Example 1: Style/TimeNow (trivial matcher + replace correction).
+schema: 1
+cop: "Style/TimeNow"
+version_added: "1.90"
+enabled_default: pending
+tier: preview
+autocorrect: safe
+restrict_on_send: [new]
+
+matchers:
+  time_new:
+    pattern: |
+      (call (const {nil? cbase} :Time) :new)
+
+hooks:
+  - on: [send, csend]
+    match: time_new
+    offense:
+      location: node
+      message: "Prefer `Time.now` over `Time.new` to retrieve the current time."
+      correct:
+        - op: replace
+          range: { start: node.selector.start, stop: node.expression.stop }
+          text: "now"
