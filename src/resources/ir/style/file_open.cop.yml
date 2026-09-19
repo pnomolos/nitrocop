@@ -1,0 +1,57 @@
+schema: 1
+cop: "Style/FileOpen"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: none
+docs: |
+  Checks for `File.open` without a block, which can leak file descriptors.
+
+  Only registers an offense when the result is assigned to a local variable or
+  has a method chained on it — the clearest indicators that the block form was
+  meant — or when the value is discarded entirely.
+restrict_on_send: [open]
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0 lib/rubocop/cop/style/file_open.rb.
+  # `(send ...)` rather than `(call ...)`: upstream aliases `on_csend` to
+  # `on_send`, but the matcher itself only ever accepts a `send`, so `File&.open`
+  # is never an offense. The `csend` hook is kept to transcribe the alias.
+  file_open:
+    pattern: |
+      (send (const {nil? cbase} :File) :open ...)
+
+hooks:
+  - on: [send, csend]
+    match: file_open
+    # Upstream is
+    #   return if node.block_argument?
+    #   return unless offensive_usage?(node)
+    # with
+    #   def offensive_usage?(node)
+    #     return true unless node.value_used?
+    #     node.parent.lvasgn_type? || receiver_of_chained_call?(node)
+    #   end
+    #   def receiver_of_chained_call?(node) = node.parent.receiver == node
+    #
+    # The `block_literal?` term has no upstream counterpart and is the one
+    # place this document is not a literal transcription. Parser splits
+    # `File.open('f') { |f| ... }` into `(block (send ...) ...)`, so upstream's
+    # `on_send` sees the *bare* send and `node.parent` is the `block` node —
+    # which is neither an `lvasgn` nor a node whose `receiver` is the send, so
+    # `offensive_usage?` is false for every call carrying a literal block.
+    # Prism has one `CallNode` for both levels, so `node.parent` here is
+    # whatever encloses the *whole* block form and both tests would be asked
+    # the wrong question. Excluding literal blocks reproduces upstream's answer
+    # exactly.
+    when:
+      all:
+        - { not: { pred: [node, "block_argument?"] } }
+        - { not: { pred: [node, "block_literal?"] } }
+        - any:
+            - { not: { pred: [node, "value_used?"] } }
+            - { pred: [parent, "type?", "lvasgn"] }
+            - { eq: [parent.receiver, node] }
+    offense:
+      location: node
+      message: "`File.open` without a block may leak a file descriptor; use the block form."
