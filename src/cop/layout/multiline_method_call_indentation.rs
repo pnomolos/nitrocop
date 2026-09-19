@@ -545,6 +545,26 @@ impl ChainVisitor<'_> {
             return self.expected_aligned_hash_pair(call_node, receiver, rhs_col, is_trailing_dot);
         }
 
+        // RuboCop's `semantic_alignment_node` tries `get_dot_right_above`
+        // FIRST, before any block-chain handling: any *ancestor* whose dot sits
+        // on the line directly above at the same column wins. That ordering
+        // matters for paren-less command chains such as
+        // `@cols\n  .concat ['a'].map { }\n  .concat ['b'].map { }`, where the
+        // second `.concat` is parsed as a call on the first `.map`'s block
+        // result and would otherwise align with `.map`.
+        //
+        // We only accept the dot above when it is NOT in the receiver chain —
+        // receiver chain dots are handled by the normal alignment logic.
+        // Only for `aligned` style — `indented_relative_to_receiver` expects
+        // indent relative to the receiver, not alignment with dots above.
+        if !is_trailing_dot
+            && self.style == "aligned"
+            && has_dot_at_col(self.source, rhs_line.saturating_sub(1), rhs_col)
+            && !is_dot_in_receiver_chain(self.source, receiver, rhs_line - 1, rhs_col)
+        {
+            return Some(rhs_col);
+        }
+
         // Try block chain continuation — when receiver is a call with a
         // single-line block, align with the block-bearing call's dot.
         if options.allow_block_chain_alignment && !is_trailing_dot {
@@ -563,24 +583,6 @@ impl ChainVisitor<'_> {
             {
                 return Some(col);
             }
-        }
-
-        // RuboCop's `get_dot_right_above`: check if any ancestor (not just
-        // the receiver chain) has a dot on the line directly above at the
-        // same column. This handles cases where the receiver chain goes
-        // through a different AST branch (e.g., `.and` chaining on
-        // `.with_payload` in RSpec matcher chains while `.to` has a dot
-        // directly above). We only accept this when the dot above is NOT
-        // in the receiver chain — receiver chain dots are handled by the
-        // normal alignment logic.
-        // Only for `aligned` style — `indented_relative_to_receiver` expects
-        // indent relative to the receiver, not alignment with dots above.
-        if !is_trailing_dot
-            && self.style == "aligned"
-            && has_dot_at_col(self.source, rhs_line.saturating_sub(1), rhs_col)
-            && !is_dot_in_receiver_chain(self.source, receiver, rhs_line - 1, rhs_col)
-        {
-            return Some(rhs_col);
         }
 
         if !is_trailing_dot {

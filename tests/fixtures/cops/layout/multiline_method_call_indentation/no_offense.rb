@@ -338,3 +338,12 @@ it "checks courses for a given student" do
       .filter { |cu| cu[:user_id] == student1.id }
       .pluck(:course_id)
 end
+
+# Paren-less command chain: `.concat ['b'].map { }` is parsed as a call on the
+# previous `.map` block result, so only `get_dot_right_above` (which runs
+# before any block-chain handling) keeps these lines aligned.
+def merge_columns
+  @cols
+    .concat ['nom'].map { |c| f(c) }
+    .concat ['man'].map { |c| f(c) }
+end
