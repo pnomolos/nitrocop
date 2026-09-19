@@ -1,0 +1,132 @@
+schema: 1
+cop: "Style/SelectByKind"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: unsafe
+docs: |
+  Looks for places where a subset of an Enumerable is calculated from a class
+  type check, and suggests `grep` or `grep_v` instead.
+
+  Hashes do not behave as you may expect with `grep`, so a receiver that is
+  statically a hash (a hash literal, `Hash.new`, `Hash#[]`, `to_h`/`to_hash`)
+  or `ENV` is left alone.
+
+constants:
+  # `CLASS_CHECK_METHODS`, verbatim.
+  CLASS_CHECK_METHODS: { "is_a?": true, "kind_of?": true }
+
+matchers:
+  # All four verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/style/select_by_kind.rb.
+  class_check:
+    pattern: |
+      {
+        (block call (args (arg $_)) ${(send (lvar _) %CLASS_CHECK_METHODS _)})
+        (block call (args (arg $_)) ${(send (send (lvar _) %CLASS_CHECK_METHODS _) :!)})
+        (numblock call $1 ${(send (lvar _) %CLASS_CHECK_METHODS _)})
+        (numblock call $1 ${(send (send (lvar _) %CLASS_CHECK_METHODS _) :!)})
+        (itblock call $_ ${(send (lvar _) %CLASS_CHECK_METHODS _)})
+        (itblock call $_ ${(send (send (lvar _) %CLASS_CHECK_METHODS _) :!)})
+      }
+    captures: [block_arg, class_check]
+    params: [CLASS_CHECK_METHODS]
+  creates_hash:
+    pattern: |
+      {
+        (call (const _ :Hash) {:new :[]} ...)
+        (block (call (const _ :Hash) :new ...) ...)
+        (call _ { :to_h :to_hash } ...)
+      }
+  env_const:
+    pattern: |
+      (const {nil? cbase} :ENV)
+
+hooks:
+  # Upstream hooks `on_send` on the `select`/`reject` call and reaches the block
+  # with `node.block_node`; Prism has one `CallNode` for both, so the hook is on
+  # the block and `node` is the call as well — `node.method_name` is the
+  # selector `RESTRICT_ON_SEND` gates (expressed as the `in:` guard, since a
+  # block hook is not a `send` hook) and `node.selector` is where the correction
+  # range starts.
+  #
+  # `receiver_allowed?` returns false for a nil receiver, which falls out here:
+  # `pred:` and `matches:` against an absent receiver are both false.
+  #
+  # `extract_send_node` re-runs `calls_lvar?`/`negated_calls_lvar?` with the
+  # block parameter's name after unwrapping `!`. Everything else about those
+  # two patterns is already established by `class_check`, so the residue is
+  # "the kind check's receiver is the block's own parameter" — under `!` that
+  # receiver is one level further down, which is what the `any:` covers. An
+  # `lvar` can never be named `is_a?`/`kind_of?`, so the two arms cannot be
+  # confused.
+  - on: [block]
+    match: class_check
+    when:
+      all: &sbk_guard
+        - { in: [node.method_name, [":select", ":filter", ":find_all", ":reject"]] }
+        - not:
+            any:
+              - { pred: [node.receiver, "hash_type?"] }
+              - { matches: [node.receiver, creates_hash] }
+              - { matches: [node.receiver, env_const] }
+        - any:
+            - { eq: [$class_check.receiver.name, $block_arg] }
+            - { eq: [$class_check.receiver.receiver.name, $block_arg] }
+    bind: &sbk_bind
+      # `original_method` is `node.method_name`.
+      method: node.method_name
+      # `negated?(class_check_send_node)` — the `{…}` branch that matched was
+      # the `(send … :!)` one.
+      negated: { eq: [$class_check.method_name, ":!"] }
+      # `find_class_constant`: `unwrap_negation(node).first_argument`.
+      klass:
+        if:
+          - bind.negated
+          - $class_check.receiver.first_argument.source
+          - $class_check.first_argument.source
+      # `replacement`: `SELECT_METHODS` keep the sense, `reject` inverts it.
+      replacement:
+        if:
+          - { in: [node.method_name, [":select", ":filter", ":find_all"]] }
+          - { if: [bind.negated, "grep_v", "grep"] }
+          - { if: [bind.negated, "grep", "grep_v"] }
+    offense: &sbk_offense
+      location: node
+      message: "Prefer `%{replacement}` to `%{method}` with a kind check."
+      correct:
+        - op: replace
+          range: { start: node.selector.start, stop: node.block.end.stop }
+          text: "%{replacement}(%{klass})"
+
+  - on: [numblock]
+    match: class_check
+    when:
+      all:
+        - { in: [node.method_name, [":select", ":filter", ":find_all", ":reject"]] }
+        - not:
+            any:
+              - { pred: [node.receiver, "hash_type?"] }
+              - { matches: [node.receiver, creates_hash] }
+              - { matches: [node.receiver, env_const] }
+        - any:
+            - { eq: [$class_check.receiver.name, ":_1"] }
+            - { eq: [$class_check.receiver.receiver.name, ":_1"] }
+    bind: *sbk_bind
+    offense: *sbk_offense
+
+  - on: [itblock]
+    match: class_check
+    when:
+      all:
+        - { in: [node.method_name, [":select", ":filter", ":find_all", ":reject"]] }
+        - not:
+            any:
+              - { pred: [node.receiver, "hash_type?"] }
+              - { matches: [node.receiver, creates_hash] }
+              - { matches: [node.receiver, env_const] }
+        - any:
+            - { eq: [$class_check.receiver.name, ":it"] }
+            - { eq: [$class_check.receiver.receiver.name, ":it"] }
+    bind: *sbk_bind
+    offense: *sbk_offense
