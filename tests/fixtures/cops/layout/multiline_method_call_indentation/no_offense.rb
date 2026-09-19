@@ -321,3 +321,20 @@ def new_email
     .index(@delivery_method.to_s) ? @delivery_method.to_s : "smtp"
   method
 end
+
+# Fallback indentation is `indentation(lhs) + 2`, where `lhs` is where
+# `left_hand_side` stops — at the block-bearing call, on the `.to` line.
+it "fetches entity" do
+  expect(DiasporaFederation::Federation::Fetcher)
+    .to receive(:fetch_public)
+      .with(remote_person.diaspora_handle, "post", guid) {
+        FactoryBot.create(:status_message, author: remote_person, guid: guid)
+      }
+end
+
+it "checks courses for a given student" do
+  expect(mntor.courses_for_user(student1))
+    .to eq courses_users
+      .filter { |cu| cu[:user_id] == student1.id }
+      .pluck(:course_id)
+end

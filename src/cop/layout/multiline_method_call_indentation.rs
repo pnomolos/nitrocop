@@ -366,16 +366,13 @@ struct ChainVisitor<'a> {
 impl ChainVisitor<'_> {
     fn indented_base_line(&self, call_node: &ruby_prism::CallNode<'_>) -> usize {
         if self.style == "aligned" {
-            if uses_outer_aligned_fallback_base(call_node, &self.ancestors) {
-                let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
-                let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
-                find_visual_chain_base_line(self.source, lhs_line)
-            } else {
-                let (call_start_line, _) = self
-                    .source
-                    .offset_to_line_col(call_node.location().start_offset());
-                find_visual_chain_base_line(self.source, call_start_line)
-            }
+            // RuboCop's fallback is `indentation(lhs) + correct_indentation(node)`,
+            // and `indentation` is just `lhs.source_range.source_line =~ /\S/` —
+            // the indentation of the line `left_hand_side` starts on. No walking
+            // up through visually-continued lines.
+            let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
+            let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
+            lhs_line
         } else {
             let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
             let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
@@ -2202,24 +2199,6 @@ fn find_hash_method_base_description(
     find_hash_method_base_description(source, &recv)
 }
 
-/// Walk backwards from a given line to find the first line that is not part of
-/// the same visual chain. Continuations can be expressed either with a leading
-/// dot on the current line (`.bar`) or a trailing dot on the previous one
-/// (`foo.` followed by `bar`).
-fn find_visual_chain_base_line(source: &SourceFile, start_line: usize) -> usize {
-    let lines: Vec<&[u8]> = source.lines().collect();
-    let mut line = start_line;
-    while line > 1 && line <= lines.len() {
-        let current_is_leading_continuation = line_starts_with_dot(lines[line - 1]);
-        let previous_has_trailing_dot = line_ends_with_dot(lines[line - 2]);
-        if !(current_is_leading_continuation || previous_has_trailing_dot) {
-            break;
-        }
-        line -= 1;
-    }
-    line
-}
-
 /// Walk backwards from a given line to find the first line that does not begin
 /// with a continuation dot. This matches the older behavior used by the
 /// non-default styles, which still depend on the narrower receiver-chain walk.
@@ -2248,15 +2227,6 @@ fn line_starts_with_dot(line_bytes: &[u8]) -> bool {
         .skip_while(|&b| b == b' ' || b == b'\t')
         .collect();
     trimmed.starts_with(b".") || trimmed.starts_with(b"&.")
-}
-
-fn line_ends_with_dot(line_bytes: &[u8]) -> bool {
-    line_bytes
-        .iter()
-        .rev()
-        .copied()
-        .find(|&b| b != b' ' && b != b'\t' && b != b'\r')
-        == Some(b'.')
 }
 
 fn find_chain_start_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -> usize {
