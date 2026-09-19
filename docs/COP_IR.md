@@ -36,6 +36,7 @@ loaded cop, because a silently dropped cop is an invisible false negative.
 | `enabled_default` | `true` \| `false` \| `pending` | `pending` | Maps to `EnabledState`. |
 | `tier` | `preview` \| `stable` | `preview` | Ignored for user cops. |
 | `autocorrect` | `none` \| `safe` \| `unsafe` | `none` | Must agree with the presence of `correct:` edits. |
+| `min_target_ruby` | float | — | Upstream `minimum_target_ruby_version`; below it the cop reports nothing. |
 | `include` / `exclude` | list of globs | `[]` | Become `default_include`/`default_exclude`. |
 | `restrict_on_send` | list of method names | `[]` | Requires at least one `send`/`csend` hook. |
 | `config` | map | `{}` | Declared config keys. |
@@ -103,7 +104,8 @@ hooks:
 
 **Anchors** are `<target>[.<accessor|part>]*[.start|.stop]`, where `target` is
 `node`, `parent` or a declared `$capture`; `accessor` is a structural accessor
-(`receiver`, `body`, `first_argument`, …) and `part` is a `node.loc.<part>` name
+(`receiver`, `body`, `first_argument`, `left_sibling`, …) and `part` is a
+`node.loc.<part>` name
 (`expression`, `selector`, `dot`, `keyword`, `end_keyword`, `operator`, `begin`,
 `end`). A `location:` shorthand denotes a range and must **not** end in an edge;
 an anchor inside `{ start:, stop: }` or `at:` must.
@@ -224,10 +226,20 @@ attribute of a non-node, or one the node does not have, is `nil`.
 | `type` | any | string — Parser-gem type name |
 | `parent_type` | any | string — sugar for `parent.type` |
 | `first_child`, `last_child` | any | node or nil — direct children, source order |
+| `left_sibling`, `right_sibling` | any | node or nil — the adjacent Parser-gem child of this node's parent |
+
+`left_sibling` / `right_sibling` mirror `RuboCop::AST::Node`'s: they index into
+the *Parser-gem* child list, where a `send`'s method name is a Symbol rather
+than a node, so `Struct.new(kw: nil)`'s hash has nothing before it while
+`Struct.new(:foo, kw: nil)`'s has `:foo`. They find the node's parent by
+scanning the enclosing-node chain for the innermost entry that has it as a
+direct child, so they work on `node` and on `parent` alike; a `$capture` from
+deeper inside the match is not on the chain and answers `nil`.
 
 ### Ancestors
 
-`parent`, `parent_type`, `over: ancestors`, `root?` and `value_used?` read
+`parent`, `parent_type`, `over: ancestors`, `root?`, `value_used?`,
+`left_sibling` and `right_sibling` read
 `EvalCtx::ancestors`, the walker's chain of enclosing nodes. Maintaining that
 chain costs a `Vec` push/pop per branch node, so the walker only does it when
 some active cop asks — and `IrCopRunner` asks exactly when the document needs
@@ -302,7 +314,40 @@ name a style this cop does not have.
    fails if you forget);
 3. add fixtures under `tests/fixtures/cops/<dept>/<snake>/` and one
    `crate::ir_cop_fixture_tests!(<mod>, "Dept/Name", "cops/<dept>/<snake>")`
-   line.
+   line. A fourth argument is a YAML mapping of config the fixtures run under,
+   values keeping their YAML type — `"TargetRubyVersion: 3.2"` for a cop with a
+   `min_target_ruby:`, which would otherwise never fire under the harness's
+   default `CopConfig`. The autocorrect assertion loops until the source stops
+   changing, as RuboCop's own `expect_correction` and `nitrocop -A` do.
+
+### Translating an upstream cop
+
+Two shapes recur and are worth knowing before you start.
+
+**`on_send` plus `node.block_node`.** Parser splits `a.select { … }` into
+`(block (send a :select) …)`, so upstream's `on_send` sees the bare send and
+walks *up*. Prism has one `CallNode` for both levels, so the hook becomes
+`on: [block]` (plus `numblock` / `itblock`) and `node` is both: its
+`method_name` is the selector and its `selector` part is that selector's `loc`.
+`restrict_on_send` then has no `send` hook to gate and has to be written as an
+`in:` guard on `node.method_name`. The converse also bites: a `send` hook *does*
+fire on a call carrying a literal block, so a cop whose guard reads
+`node.parent` needs `not block_literal?` to reproduce upstream's answer
+(`Style/FileOpen`).
+
+**`on_send` plus a loop over children.** A hook's `offense:` reports once and
+there is no "for each" construct, so a cop that calls `add_offense` per argument
+or per pair inverts its dispatch: the hook fires on the *child* and the matcher
+ascends with `^` / `^^`. `^` resolves against Parser-visible ancestry, so
+Prism's `ArgumentsNode` is traversed and only a genuine direct child matches.
+What `^` cannot say is *which* child, so a positional condition
+(`node.last_argument.hash_type?`) still needs a guard —
+`any_of: { over: ancestors, var: a, body: { eq: [a.last_argument, parent] } }`
+is the identity test for it.
+
+An `if`/`elsif`/`else` over correction *ranges* has no `correct:` spelling.
+Write one hook per branch, each with the `when:` upstream tests for it
+(`Style/RedundantStructKeywordInit` has four).
 
 A shipped document that fails to load is a **panic at startup**: it is a bug in
 the binary, not in the user's project, and `ir_embedded_cops_load` exercises

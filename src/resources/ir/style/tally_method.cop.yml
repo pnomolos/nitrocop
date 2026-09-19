@@ -1,0 +1,136 @@
+schema: 1
+cop: "Style/TallyMethod"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: unsafe
+# `minimum_target_ruby_version 2.7`.
+min_target_ruby: 2.7
+docs: |
+  Checks for manual counting patterns that can be replaced by
+  `Enumerable#tally`:
+
+  - `each_with_object(Hash.new(0)) { |item, counts| counts[item] += 1 }`
+  - `group_by(&:itself).transform_values(&:count)`
+  - `group_by { |x| x }.transform_values(&:size)`
+  - `group_by { |x| x }.transform_values { |v| v.length }`
+restrict_on_send: [each_with_object, transform_values]
+
+constants:
+  # `COUNTING_METHODS`, verbatim.
+  COUNTING_METHODS: { count: true, size: true, length: true }
+
+matchers:
+  # All four verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/style/tally_method.rb.
+  tally_each_with_object:
+    pattern: |
+      {
+        (block
+          (call _ :each_with_object
+            (send (const {nil? cbase} :Hash) :new (int 0)))
+          (args (arg _elem) (arg _hash))
+          (op_asgn
+            (send (lvar _hash) :[] (lvar _elem)) :+ (int 1)))
+        (numblock
+          (call _ :each_with_object
+            (send (const {nil? cbase} :Hash) :new (int 0)))
+          2
+          (op_asgn
+            (send (lvar :_2) :[] (lvar :_1)) :+ (int 1)))
+      }
+  tally_group_by_symbol:
+    pattern: |
+      (call
+        (call _ :group_by (block_pass (sym :itself)))
+        :transform_values
+        (block_pass (sym %COUNTING_METHODS)))
+    params: [COUNTING_METHODS]
+  tally_group_by_identity_block:
+    pattern: |
+      (call
+        {
+          (block (call _ :group_by) (args (arg _x)) (lvar _x))
+          (numblock (call _ :group_by) 1 (lvar :_1))
+          (itblock (call _ :group_by) :it (lvar :it))
+        }
+        :transform_values
+        (block_pass (sym %COUNTING_METHODS)))
+    params: [COUNTING_METHODS]
+  tally_group_by_transform_block:
+    pattern: |
+      {
+        (block
+          (call
+            {
+              (call _ :group_by (block_pass (sym :itself)))
+              (block (call _ :group_by) (args (arg _x)) (lvar _x))
+              (numblock (call _ :group_by) 1 (lvar :_1))
+              (itblock (call _ :group_by) :it (lvar :it))
+            }
+            :transform_values)
+          (args (arg _v))
+          (send (lvar _v) %COUNTING_METHODS))
+        (numblock
+          (call
+            {
+              (call _ :group_by (block_pass (sym :itself)))
+              (block (call _ :group_by) (args (arg _x)) (lvar _x))
+              (numblock (call _ :group_by) 1 (lvar :_1))
+              (itblock (call _ :group_by) :it (lvar :it))
+            }
+            :transform_values)
+          1
+          (send (lvar :_1) %COUNTING_METHODS))
+        (itblock
+          (call
+            {
+              (call _ :group_by (block_pass (sym :itself)))
+              (block (call _ :group_by) (args (arg _x)) (lvar _x))
+              (numblock (call _ :group_by) 1 (lvar :_1))
+              (itblock (call _ :group_by) :it (lvar :it))
+            }
+            :transform_values)
+          :it
+          (send (lvar :it) %COUNTING_METHODS))
+      }
+    params: [COUNTING_METHODS]
+
+hooks:
+  # `check_each_with_object`: upstream hooks the `each_with_object` send and
+  # reaches the block with `node.block_node`; the Prism `CallNode` is both, so
+  # the hook is on the block and `node.selector` is still the `each_with_object`
+  # token `add_offense` is given. `replacement_range(node, block_node)` — the
+  # selector through the end of the block — is `node.expression.stop`, because
+  # a call carrying a block extends to its closing `}`/`end`.
+  - on: [block, numblock]
+    match: tally_each_with_object
+    offense:
+      location: node.selector
+      message: "Use `tally` instead of `each_with_object`."
+      correct:
+        - op: replace
+          range: { start: node.selector.start, stop: node.expression.stop }
+          text: "tally"
+
+  # `check_transform_values`, first branch: a plain `transform_values(&:count)`
+  # send. `group_by_send_node` unwraps a block receiver to its send; in Prism
+  # that is the same node, so `node.receiver.selector` is the `group_by` token
+  # either way.
+  - on: [send, csend]
+    match: { any_of: [tally_group_by_symbol, tally_group_by_identity_block] }
+    offense: &tally_group_by
+      location: node.receiver.selector
+      message: "Use `tally` instead of `group_by` and `transform_values`."
+      correct:
+        - op: replace
+          range:
+            start: node.receiver.selector.start
+            stop: node.expression.stop
+          text: "tally"
+
+  # `check_transform_values`, second branch: `transform_values` carrying the
+  # counting block. `end_node` is the block, which is again this same node.
+  - on: [block, numblock, itblock]
+    match: tally_group_by_transform_block
+    offense: *tally_group_by

@@ -616,11 +616,35 @@ macro_rules! cop_autocorrect_fixture_tests {
 #[macro_export]
 macro_rules! ir_cop_fixture_tests {
     ($mod_name:ident, $cop:literal, $path:literal) => {
+        $crate::ir_cop_fixture_tests!($mod_name, $cop, $path, "{}");
+    };
+    ($mod_name:ident, $cop:literal, $path:literal, $config_yaml:literal) => {
         #[cfg(test)]
         mod $mod_name {
             fn cop() -> &'static $crate::cop::ir::IrCopRunner {
                 $crate::cop::ir::embedded::get($cop)
                     .unwrap_or_else(|| panic!("{} is not an embedded IR cop", $cop))
+            }
+
+            /// The `CopConfig` the fixtures run under, from the macro's YAML
+            /// mapping. Values keep their YAML type, so a numeric
+            /// `TargetRubyVersion` stays a number — which is what
+            /// `min_target_ruby:` compares against.
+            fn config() -> $crate::cop::CopConfig {
+                let parsed: serde_yml::Value =
+                    serde_yml::from_str($config_yaml).expect("fixture config must be valid YAML");
+                let mut options = std::collections::HashMap::new();
+                if let Some(map) = parsed.as_mapping() {
+                    for (key, value) in map {
+                        if let Some(key) = key.as_str() {
+                            options.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                $crate::cop::CopConfig {
+                    options,
+                    ..Default::default()
+                }
             }
 
             fn fixture(name: &str) -> Vec<u8> {
@@ -634,12 +658,20 @@ macro_rules! ir_cop_fixture_tests {
 
             #[test]
             fn offense_fixture() {
-                $crate::testutil::assert_cop_offenses_full(cop(), &fixture("offense.rb"));
+                $crate::testutil::assert_cop_offenses_full_with_config(
+                    cop(),
+                    &fixture("offense.rb"),
+                    config(),
+                );
             }
 
             #[test]
             fn no_offense_fixture() {
-                $crate::testutil::assert_cop_no_offenses_full(cop(), &fixture("no_offense.rb"));
+                $crate::testutil::assert_cop_no_offenses_full_with_config(
+                    cop(),
+                    &fixture("no_offense.rb"),
+                    config(),
+                );
             }
 
             #[test]
@@ -651,10 +683,11 @@ macro_rules! ir_cop_fixture_tests {
                 if !corrected.exists() {
                     return;
                 }
-                $crate::testutil::assert_cop_autocorrect(
+                $crate::testutil::assert_cop_autocorrect_loop_with_config(
                     cop(),
                     &fixture("offense.rb"),
                     &fixture("corrected.rb"),
+                    config(),
                 );
             }
 

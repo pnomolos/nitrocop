@@ -57,6 +57,10 @@
       ],
       "default": "none"
     },
+    "min_target_ruby": {
+      "type": "number",
+      "description": "Upstream `minimum_target_ruby_version`: the cop reports nothing below this `AllCops: TargetRubyVersion`."
+    },
     "include": {
       "type": "array",
       "items": {

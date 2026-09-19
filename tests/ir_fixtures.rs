@@ -128,6 +128,7 @@ fn json_schema_matches_rust_schema() {
         "enabled_default",
         "tier",
         "autocorrect",
+        "min_target_ruby",
         "include",
         "exclude",
         "restrict_on_send",

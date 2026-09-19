@@ -533,6 +533,13 @@ impl Cop for IrCopRunner {
         diagnostics: &mut Vec<Diagnostic>,
         mut corrections: Option<&mut Vec<Correction>>,
     ) {
+        // `minimum_target_ruby_version`: upstream registers the cop only when
+        // the target is new enough, so below it the cop reports nothing at all.
+        if let Some(minimum) = self.doc.document.min_target_ruby
+            && target_ruby_version(config) < minimum
+        {
+            return;
+        }
         let resolver = DocResolver(self.compiled());
         let owned_params = self.params(config);
         let params = owned_params.as_ref().unwrap_or(&self.const_params);
@@ -788,7 +795,7 @@ impl Anchor {
             AnchorTarget::Capture(slot) => dup_node(caps.node(slot)?),
         };
         for accessor in &self.accessors {
-            current = accessor_node(&current, accessor)?;
+            current = accessor_node(&current, accessor, ancestors)?;
         }
         let loc = match &self.part {
             Some(part) => part_loc(&current, part)?,
@@ -814,14 +821,31 @@ impl Anchor {
 
 /// The structural accessors of `load::ACCESSORS`.
 ///
+/// `left_sibling` / `right_sibling` read the enclosing-node chain; everything
+/// else is a field of the node itself.
+///
 /// `parent` and `name` are in that vocabulary but resolve to no node here:
 /// `parent` mid-path would need the ancestor chain of a node the walker never
 /// visited, and `name` is bytes rather than a node. Both fail closed.
 fn accessor_node<'pr>(
     node: &ruby_prism::Node<'pr>,
     accessor: &str,
+    ancestors: &[ruby_prism::Node<'pr>],
 ) -> Option<ruby_prism::Node<'pr>> {
     match accessor {
+        // The chain is the only place a parent can come from, so the parent is
+        // the innermost entry that has this node as a direct Parser-gem child.
+        // A `send`'s method name is not a node, so `Struct.new(kw: nil)` finds
+        // nothing before the hash while `Struct.new(:foo, kw: nil)` finds
+        // `:foo` — exactly `left_sibling` plus upstream's `.is_a?(AST::Node)`.
+        "left_sibling" | "right_sibling" => {
+            let offset = if accessor == "left_sibling" { -1 } else { 1 };
+            ancestors.iter().rev().find_map(|parent| {
+                crate::node_pattern::interpreter::is_parser_child(node, parent)
+                    .then(|| crate::node_pattern::interpreter::parser_sibling(node, parent, offset))
+                    .flatten()
+            })
+        }
         "receiver" => node.as_call_node()?.receiver(),
         "block" => node.as_call_node()?.block(),
         "arguments" => node.as_call_node()?.arguments().map(|a| a.as_node()),
@@ -1135,6 +1159,16 @@ fn yaml_to_arg(value: &serde_yml::Value) -> Arg {
     }
 }
 
+/// `AllCops: TargetRubyVersion`, defaulting to RuboCop's own 2.7 — the same
+/// read every hand-written cop with a `minimum_target_ruby_version` does.
+fn target_ruby_version(config: &CopConfig) -> f64 {
+    config
+        .options
+        .get("TargetRubyVersion")
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)))
+        .unwrap_or(2.7)
+}
+
 fn severity_of(severity: IrSeverity) -> Severity {
     match severity {
         IrSeverity::Convention => Severity::Convention,
@@ -1374,6 +1408,29 @@ hooks:
         );
         let diags = run_cop_full_with_config(&cop, b"Thing.wrap(1)\n", config);
         assert_eq!(diags[0].message, "X/yes: wrap 1 %");
+    }
+
+    /// `min_target_ruby:` is upstream's `minimum_target_ruby_version`: below
+    /// it the cop is not registered at all, so it reports nothing.
+    #[test]
+    fn min_target_ruby_gates_the_whole_cop() {
+        let cop = runner(&ANCHORS.replace(
+            "autocorrect: safe",
+            "autocorrect: safe\nmin_target_ruby: 3.2",
+        ));
+        let with_target = |version: f64| {
+            let mut config = CopConfig::default();
+            config.options.insert(
+                "TargetRubyVersion".to_string(),
+                serde_yml::Value::Number(serde_yml::value::Number::from(version)),
+            );
+            run_cop_full_with_config(&cop, b"Thing.wrap(1)\n", config)
+        };
+        assert!(with_target(3.1).is_empty());
+        assert_eq!(with_target(3.2).len(), 1);
+        assert_eq!(with_target(3.4).len(), 1);
+        // No `TargetRubyVersion` at all reads as RuboCop's default 2.7.
+        assert!(run_cop_full(&cop, b"Thing.wrap(1)\n").is_empty());
     }
 
     #[test]

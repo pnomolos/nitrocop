@@ -611,6 +611,63 @@ pub fn assert_cop_autocorrect_with_config(
     }
 }
 
+/// Assert autocorrect, re-running the cop until the source stops changing.
+///
+/// RuboCop's own `expect_correction` loops by default
+/// (`RuboCop::RSpec::ExpectOffense#expect_correction`, `loop: true`), and so
+/// does `nitrocop -A`, because a correction can expose another. The
+/// single-pass [`assert_cop_autocorrect`] cannot express a cop whose two
+/// offenses produce *overlapping* deletions — RuboCop's `TreeRewriter` merges
+/// those in one pass (`crossing_deletions: :accept`), `CorrectionSet` applies
+/// one and drops the other, and both reach the same file on the next pass.
+///
+/// Used by `ir_cop_fixture_tests!`; the hand-written-cop macros keep the
+/// single-pass assertion they were written against.
+pub fn assert_cop_autocorrect_loop_with_config(
+    cop: &dyn Cop,
+    fixture_bytes: &[u8],
+    expected_bytes: &[u8],
+    config: CopConfig,
+) {
+    let parsed = parse_fixture(fixture_bytes);
+    let filename = parsed.filename.as_deref().unwrap_or("test.rb");
+    let mut source = parsed.source.clone();
+    let mut any = false;
+    // `nitrocop -A`'s own cap is far higher; a fixture that needs more than a
+    // handful of passes is a bug in the fixture.
+    for _ in 0..10 {
+        let (_diagnostics, corrections) =
+            run_cop_autocorrect_internal(cop, &source, config.clone(), filename);
+        if corrections.is_empty() {
+            break;
+        }
+        any = true;
+        let next = crate::correction::CorrectionSet::from_vec(corrections).apply(&source);
+        if next == source {
+            break;
+        }
+        source = next;
+    }
+
+    assert!(
+        any,
+        "Cop {} produced no corrections — does it implement autocorrect?",
+        cop.name(),
+    );
+
+    if source != expected_bytes {
+        let corrected_str = String::from_utf8_lossy(&source);
+        let expected_str = String::from_utf8_lossy(expected_bytes);
+        panic!(
+            "Autocorrect output does not match expected.\n\
+             === Expected ===\n{expected_str}\n\
+             === Got ===\n{corrected_str}\n\
+             === Diff ===\n{}",
+            simple_diff(&expected_str, &corrected_str),
+        );
+    }
+}
+
 /// Simple line-by-line diff for test failure output.
 fn simple_diff(expected: &str, actual: &str) -> String {
     let exp_lines: Vec<&str> = expected.lines().collect();
