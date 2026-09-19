@@ -40,6 +40,10 @@ pub static FILES: &[(&str, &str)] = &[
         include_str!("../../resources/ir/style/redundant_min_max_by.cop.yml"),
     ),
     (
+        "src/resources/ir/style/tally_method.cop.yml",
+        include_str!("../../resources/ir/style/tally_method.cop.yml"),
+    ),
+    (
         "src/resources/ir/style/time_now.cop.yml",
         include_str!("../../resources/ir/style/time_now.cop.yml"),
     ),
@@ -60,6 +64,11 @@ crate::ir_cop_fixture_tests!(
     style_redundant_min_max_by,
     "Style/RedundantMinMaxBy",
     "cops/style/redundant_min_max_by"
+);
+crate::ir_cop_fixture_tests!(
+    style_tally_method,
+    "Style/TallyMethod",
+    "cops/style/tally_method"
 );
 crate::ir_cop_fixture_tests!(style_time_now, "Style/TimeNow", "cops/style/time_now");
 
