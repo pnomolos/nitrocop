@@ -7,6 +7,7 @@ dependencies = [
   "pytest",
   "tiktoken",
   "pyyaml",
+  "jsonschema",
 ]
 
 [tool.pytest.ini_options]
