@@ -20,16 +20,18 @@ Planning branch, not for upstream. Read this first when resuming.
 ## Workstreams
 | # | Stream | State |
 |---|--------|-------|
-| W0 | Corpus oracle baseline on fork (run 35413735947, branch ci/corpus-oracle-optional-app-token, PR #1) | running |
+| W0 | Corpus oracle baseline on fork (run 35413735947, success). 99.99%, 1,047 FP / 716 FN, 6 diverging cops. See 06-oracle-baseline-2026-09-19.md | done |
 | W1 | Vendor bump to latest: PR #2 (bump only, config_audit red on 8 new options) + stacked PR implementing the 8 options (branch vendor/new-cop-options) | PRs open |
-| W2 | Fix remaining diverging cops from fresh oracle | blocked on W0 |
+| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | in progress |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
-| W4 | node_pattern completion PRs (PR1 captures in progress, branch np/real-captures; then `<>`+mapping, predicate registry, `#helper`/`%param`, ancestors) | PR1 in progress |
+| W4 | node_pattern completion PRs (PR1 captures in progress, branch np/real-captures; then `<>`+mapping, predicate registry, `#helper`/`%param`, ancestors) | #3 captures, #4 `<>`+mapping open; predicates/`#helper`/`%param` in progress (branch np/predicates) |
 | W5 | IR loader/interpreter MVP | blocked on W4 |
 | W6 | Translator scripts + pilot on 23 new cops | blocked on W1, W5 |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
+- #3 np: real captures (base main)
+- #4 np: `<>` unordered + mapping expansion (base #3)
 - #2 vendor: bump rubocop 1.91.0 / rails 2.37.0 / rspec 3.10.2 / performance 1.27.0 / ast 1.50.0 (see 05-vendor-bump-scope.md; 280 implemented cops have upstream behavior changes; oracle re-run on main after merge measures drift)
 
 ## Sequencing notes
