@@ -83,7 +83,9 @@ impl CodeGenerator {
                     .max()
                     .unwrap_or(0)
             }
-            PatternNode::Conjunction(items) => items.iter().map(|c| Self::count_captures(c)).sum(),
+            PatternNode::Conjunction(items) | PatternNode::Subsequence(items) => {
+                items.iter().map(|c| Self::count_captures(c)).sum()
+            }
             PatternNode::Negation(inner) => Self::count_captures(inner),
             PatternNode::ParentRef(inner) => Self::count_captures(inner),
             PatternNode::DescendRef(inner) => Self::count_captures(inner),
@@ -296,6 +298,14 @@ impl CodeGenerator {
                 let fail = if self.has_captures { "None" } else { "false" };
                 self.writeln(&format!("// Float check: {s}"));
                 self.writeln(&format!("// if {var}.value() != {s} {{ return {fail}; }}"));
+            }
+            PatternNode::Subsequence(items) => {
+                // A `{a b | c}` branch spans several children; the generator
+                // emits per-child checks, so this is not expressible here.
+                self.writeln(&format!(
+                    "// TODO: multi-term union branch: {}",
+                    pattern_summary(&PatternNode::Subsequence(items.clone()))
+                ));
             }
         }
     }

@@ -707,6 +707,10 @@ fn matches_node<'pr>(
             }
         }
 
+        // A subsequence only has meaning as a `{}` branch inside a child list,
+        // where `match_sequence` splices it; anywhere else it matches nothing.
+        PatternNode::Subsequence(_) => false,
+
         PatternNode::Rest => true,
     }
 }
@@ -831,6 +835,26 @@ fn as_rest_term(pattern: &PatternNode) -> Option<Option<usize>> {
     }
 }
 
+/// Whether a term can match a number of children other than exactly one
+/// (RuboCop's `Node#variadic?`).
+fn is_variadic_term(pattern: &PatternNode) -> bool {
+    match pattern {
+        PatternNode::Subsequence(_) => true,
+        PatternNode::Alternatives(alts) => alts.iter().any(is_variadic_term),
+        _ => as_rest_term(pattern).is_some(),
+    }
+}
+
+/// Whether a term can consume an unbounded number of children.
+fn contains_rest(pattern: &PatternNode) -> bool {
+    match pattern {
+        PatternNode::Alternatives(items) | PatternNode::Subsequence(items) => {
+            items.iter().any(contains_rest)
+        }
+        _ => as_rest_term(pattern).is_some(),
+    }
+}
+
 /// Match a list of pattern children against a list of actual children.
 ///
 /// A rest term (`...`, `$...`) matches a variable-length run, so the walk
@@ -843,28 +867,55 @@ fn matches_children_list<'pr>(
     actuals: &[MatchChild<'pr>],
     env: &mut MatchEnv<'pr>,
 ) -> bool {
-    let exact = patterns.iter().any(|p| as_rest_term(p).is_some());
-    match_sequence(patterns, actuals, env, exact)
+    let terms: Vec<&PatternNode> = patterns.iter().collect();
+    let exact = patterns.iter().any(contains_rest);
+    match_sequence(&terms, actuals, env, exact)
+}
+
+/// Splice `head` (a union branch or subsequence body) in front of `tail`.
+fn splice<'p>(head: &'p PatternNode, tail: &[&'p PatternNode]) -> Vec<&'p PatternNode> {
+    match head {
+        PatternNode::Subsequence(items) => items.iter().chain(tail.iter().copied()).collect(),
+        other => std::iter::once(other).chain(tail.iter().copied()).collect(),
+    }
 }
 
 fn match_sequence<'pr>(
-    patterns: &[PatternNode],
+    terms: &[&PatternNode],
     actuals: &[MatchChild<'pr>],
     env: &mut MatchEnv<'pr>,
     exact: bool,
 ) -> bool {
-    let Some((pattern, rest_patterns)) = patterns.split_first() else {
+    let Some((term, rest_terms)) = terms.split_first() else {
         return !exact || actuals.is_empty();
     };
 
-    if let Some(capture_slot) = as_rest_term(pattern) {
+    // Terms that can match other than exactly one child are spliced into the
+    // walk rather than handed to `matches_child`.
+    if let PatternNode::Subsequence(_) = term {
+        return match_sequence(&splice(term, rest_terms), actuals, env, exact);
+    }
+    if let PatternNode::Alternatives(alts) = term
+        && alts.iter().any(is_variadic_term)
+    {
+        for alt in alts {
+            let mark = env.mark();
+            if match_sequence(&splice(alt, rest_terms), actuals, env, exact) {
+                return true;
+            }
+            env.rollback(mark);
+        }
+        return false;
+    }
+
+    if let Some(capture_slot) = as_rest_term(term) {
         for take in 0..=actuals.len() {
             let mark = env.mark();
             if let Some(slot) = capture_slot {
                 let run = actuals[..take].iter().map(capture_value_for).collect();
                 env.set(slot, CaptureValue::List(run));
             }
-            if match_sequence(rest_patterns, &actuals[take..], env, exact) {
+            if match_sequence(rest_terms, &actuals[take..], env, exact) {
                 return true;
             }
             env.rollback(mark);
@@ -877,9 +928,7 @@ fn match_sequence<'pr>(
     };
 
     let mark = env.mark();
-    if matches_child(pattern, actual, env)
-        && match_sequence(rest_patterns, rest_actuals, env, exact)
-    {
+    if matches_child(term, actual, env) && match_sequence(rest_terms, rest_actuals, env, exact) {
         return true;
     }
     env.rollback(mark);
@@ -1287,6 +1336,38 @@ mod tests {
             let compiled = CompiledPattern::compile(pattern).unwrap();
             assert_eq!(compiled.capture_count(), expected, "pattern: {pattern}");
         }
+    }
+
+    #[test]
+    fn test_multi_term_union_branch_matches_a_run_of_children() {
+        // `{a b | c d}` branches consume several children each.
+        let pattern = "(send {$_ :>= $_ | $_ :<= $_})";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 2);
+
+        let ge = ruby_prism::parse(b"a >= b");
+        let node = first_stmt(&ge);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "a");
+        assert_eq!(captured_src(&captures, 1), "b");
+
+        let le = ruby_prism::parse(b"c <= d");
+        let node = first_stmt(&le);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "c");
+        assert_eq!(captured_src(&captures, 1), "d");
+
+        let other = ruby_prism::parse(b"a > b");
+        let node = first_stmt(&other);
+        assert!(compiled.match_captures(&node).is_none());
+    }
+
+    #[test]
+    fn test_union_of_single_term_branches_still_matches_one_child() {
+        let result = ruby_prism::parse(b"obj.first");
+        let node = first_stmt(&result);
+        assert!(interpret_pattern("(send _ {:first :take})", &node));
+        assert!(!interpret_pattern("(send _ {:last :take})", &node));
     }
 
     #[test]

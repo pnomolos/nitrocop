@@ -72,6 +72,25 @@ impl<'a> Lexer<'a> {
         String::from_utf8_lossy(&self.input[start..self.pos]).into_owned()
     }
 
+    /// First byte of a `#function_call` name (`CALL` in `lexer.rex`).
+    fn is_call_start(ch: u8) -> bool {
+        ch.is_ascii_alphabetic() || ch == b'_'
+    }
+
+    /// Consume a `#{...}` interpolation, honouring nested braces.
+    fn skip_interpolation(&mut self) {
+        self.advance(); // opening `{`
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(ch) = self.advance() else { break };
+            match ch {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
     fn is_ident_char(ch: u8) -> bool {
         ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-'
     }
@@ -143,8 +162,20 @@ impl<'a> Lexer<'a> {
                 }
                 b'#' => {
                     self.advance();
-                    let name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
-                    tokens.push(Token::HelperCall(name));
+                    // `#name` is a function call; anything else starts a comment
+                    // that runs to end of line (`lexer.rex`: `/\#(CALL)/` is
+                    // tried before `/\#.*/`).
+                    if self.peek().is_some_and(Self::is_call_start) {
+                        let name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        tokens.push(Token::HelperCall(name));
+                    } else if self.peek() == Some(b'{') {
+                        // Ruby string interpolation left in a pattern extracted
+                        // from vendor source: skip the whole `#{...}` so the
+                        // braces around it stay balanced.
+                        self.skip_interpolation();
+                    } else {
+                        self.read_while(|c| c != b'\n');
+                    }
                 }
                 b':' => {
                     self.advance();
@@ -383,5 +414,58 @@ mod tests {
         assert_eq!(tokens[6], Token::Rest);
         assert_eq!(tokens[7], Token::RParen);
         assert_eq!(tokens[8], Token::SymbolLiteral("to".to_string()));
+    }
+
+    #[test]
+    fn test_comment_is_skipped() {
+        let mut lexer = Lexer::new("(send nil? :foo) # Array.new(3) { create(:user) }");
+        let tokens = lexer.tokenize();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LParen,
+                Token::Ident("send".to_string()),
+                Token::NilPredicate,
+                Token::SymbolLiteral("foo".to_string()),
+                Token::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_only_runs_to_end_of_line() {
+        let mut lexer = Lexer::new("{\n  (int 1) # one\n  (int 2)\n}");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens.iter().filter(|t| **t == Token::LParen).count(), 2);
+        assert_eq!(tokens.last(), Some(&Token::RBrace));
+    }
+
+    #[test]
+    fn test_function_call_is_not_a_comment() {
+        let mut lexer = Lexer::new("#mixin_method?");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::HelperCall("mixin_method?".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_ruby_interpolation_is_skipped_with_balanced_braces() {
+        // Patterns extracted from vendor source can still hold `#{...}`.
+        let mut lexer = Lexer::new("(send nil? {#{FILTERS.join(' ')}} $_)");
+        let tokens = lexer.tokenize();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LParen,
+                Token::Ident("send".to_string()),
+                Token::NilPredicate,
+                Token::LBrace,
+                Token::RBrace,
+                Token::Capture,
+                Token::Wildcard,
+                Token::RParen,
+            ]
+        );
     }
 }
