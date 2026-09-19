@@ -345,14 +345,7 @@ pub fn run_cop_full_internal(
     );
 
     // AST-based checks
-    let mut walker = CopWalker {
-        cop,
-        source: &source,
-        parse_result: &parse_result,
-        cop_config: &config,
-        diagnostics: Vec::new(),
-        corrections: None,
-    };
+    let mut walker = CopWalker::new(cop, &source, &parse_result, &config);
     walker.visit(&parse_result.node());
     diagnostics.extend(walker.diagnostics);
 
@@ -565,14 +558,7 @@ pub fn run_cop_autocorrect_internal(
     );
 
     // AST-based checks
-    let mut walker = CopWalker {
-        cop,
-        source: &source,
-        parse_result: &parse_result,
-        cop_config: &config,
-        diagnostics: Vec::new(),
-        corrections: Some(Vec::new()),
-    };
+    let mut walker = CopWalker::new(cop, &source, &parse_result, &config).with_corrections();
     walker.visit(&parse_result.node());
     diagnostics.extend(walker.diagnostics);
     if let Some(walker_corrections) = walker.corrections {

@@ -33,13 +33,22 @@
 //! understands rubocop-ast's `GROUP_FOR_TYPE` groups. `nil?`, `true?` and
 //! `false?` likewise have their own tokens.
 //!
+//! ## Ancestors
+//!
+//! `root?`, `parent?`, `chained?`, `argument?`, `macro?` and `value_used?`
+//! read the enclosing-node chain, which arrives on the [`PredCtx`]:
+//! `BatchedCopWalker` maintains it for cops that opt in
+//! (`Cop::wants_ancestors`), and the matcher extends it as it descends.
+//! [`super::ancestors`] normalizes the raw Prism chain to Parser ancestry
+//! first. With no chain the node reads as the root, which is the same answer
+//! upstream gives a genuinely parentless node.
+//!
 //! ## Deliberately absent
 //!
 //! | Predicate | Why |
 //! |---|---|
-//! | `value_used?`, `root?`, `chained?`, `argument?`, `macro?`, `guard_clause?`, `sibling_index` | need the ancestor chain (`node.rb:704-721`); the walker does not carry one yet |
-//! | `def_modifier?`, `pure?` | recursive over `children`, and unused by any vendored pattern |
-//! | `equal?` | identity against a `%param`; it needs the parameter bindings, not the node |
+//! | `sibling_index` | returns an index, not a boolean — the IR `Expr` layer's job |
+//! | `pure?` | recursive over `children`, and unused by any vendored pattern |
 //! | `const_name`, `receiver`, `arguments`, `first_line`, `column` | attribute readers, not predicates: they belong to the IR expression layer, which needs values rather than booleans |
 //!
 //! `receiver?` and `arguments?` do not exist in rubocop-ast either, but the IR
@@ -80,6 +89,15 @@ pub enum Arg {
     },
     /// `{:a :b}` — upstream's `NodePattern::Sets[…]`, matched by membership.
     Set(Vec<Arg>),
+    /// A node-valued argument: `%0` (the node the matcher was called on), or a
+    /// `%1` a caller bound to a node (`Layout/BlockAlignment`'s
+    /// `equal?(%1)`).
+    ///
+    /// It carries a [`NodeId`] rather than a `ruby_prism::Node<'pr>` so that
+    /// [`Arg`] stays lifetime-free — `Params`, `Resolver::constant` and every
+    /// registry signature would otherwise have to thread `'pr`. Identity is
+    /// all the one consumer, `equal?`, asks for.
+    Node(NodeId),
     /// An argument that could not be reduced to an atom: a `%param` with no
     /// binding, a constant the resolver does not know, or a nested pattern.
     Unresolved,
@@ -131,6 +149,8 @@ impl Arg {
         match self {
             Arg::Symbol(text) | Arg::Str(text) => text.as_bytes() == value,
             Arg::Set(items) => items.iter().any(|item| item.accepts_value(value)),
+            // A node is not a value matcher; `equal?` reads it directly.
+            Arg::Node(_) => false,
             Arg::Int(number) => {
                 std::str::from_utf8(value)
                     .ok()
@@ -158,6 +178,33 @@ impl Arg {
     }
 }
 
+/// The identity of a Prism node, standing in for Ruby's `object_id`.
+///
+/// `ruby_prism::Node` is a non-owning handle with private fields and no
+/// `PartialEq`, so identity is reconstructed from what uniquely determines a
+/// node in one parse: its type and its byte range. Two distinct nodes cannot
+/// share both — the same span with a different type is a different node, and
+/// no two nodes of one type start and end at the same offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeId {
+    tag: u8,
+    start: usize,
+    end: usize,
+}
+
+impl NodeId {
+    /// The identity of `node`.
+    #[must_use]
+    pub fn of(node: &ruby_prism::Node<'_>) -> Self {
+        let location = node.location();
+        Self {
+            tag: node_type_tag(node),
+            start: location.start_offset(),
+            end: location.end_offset(),
+        }
+    }
+}
+
 /// What a predicate is being applied to.
 ///
 /// `access_element` in upstream's compiler is whatever sits in the child slot,
@@ -176,8 +223,11 @@ pub enum PredTarget<'a, 'pr> {
     Synthetic {
         /// The Parser-gem type this stands in for (`str`, `regopt`, `int`, …).
         parser_type: &'static str,
-        /// The value the synthesized node carries.
-        value: &'a [u8],
+        /// The value the synthesized node carries. It points into the parsed
+        /// source rather than into the matcher's frame, so it outlives the
+        /// target (`` ` `` re-dispatches it into `matches_synthetic`, which
+        /// may capture it).
+        value: &'pr [u8],
     },
 }
 
@@ -204,19 +254,49 @@ impl<'a, 'pr> PredTarget<'a, 'pr> {
 
 /// Everything a predicate may read besides its target and arguments.
 ///
-/// Only the ancestor chain so far, and it is always empty until the walker
-/// carries one (design §3.3). Predicates that need it are not registered.
+/// Only the ancestor chain so far: the raw Prism chain, outermost last,
+/// exactly as [`crate::cop::walker::BatchedCopWalker`] maintains it and
+/// [`crate::node_pattern::captures::MatchEnv`] extends it. Parser-gem
+/// normalization is [`super::ancestors`]'s job, so the chain is read through
+/// [`PredCtx::nth_ancestor`] rather than indexed directly.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PredCtx<'a, 'pr> {
-    /// Enclosing nodes, innermost last.
-    pub ancestors: &'a [ruby_prism::Node<'pr>],
+    ancestors: &'a [ruby_prism::Node<'pr>],
 }
 
-impl PredCtx<'_, '_> {
-    /// A context with no ancestors.
+impl<'a, 'pr> PredCtx<'a, 'pr> {
+    /// A context with no ancestors — the node being matched is the root.
     #[must_use]
     pub fn empty() -> Self {
         Self { ancestors: &[] }
+    }
+
+    /// A context over the raw Prism chain, outermost first.
+    #[must_use]
+    pub fn new(ancestors: &'a [ruby_prism::Node<'pr>]) -> Self {
+        Self { ancestors }
+    }
+
+    /// The raw chain, for the callers that do their own normalization.
+    #[must_use]
+    pub fn chain(&self) -> &'a [ruby_prism::Node<'pr>] {
+        self.ancestors
+    }
+
+    /// The `n`-th Parser-visible ancestor, `n == 0` being the parent.
+    #[must_use]
+    pub fn nth_ancestor(&self, n: usize) -> Option<&'a ruby_prism::Node<'pr>> {
+        super::ancestors::nth_ancestor(self.ancestors, n)
+    }
+
+    /// The Parser-visible parent, plus the chain *it* would see.
+    #[must_use]
+    pub fn parent(&self) -> Option<(&'a ruby_prism::Node<'pr>, PredCtx<'a, 'pr>)> {
+        let index = super::ancestors::visible_index(self.ancestors, 0)?;
+        Some((
+            &self.ancestors[index],
+            PredCtx::new(&self.ancestors[..index]),
+        ))
     }
 }
 
@@ -305,6 +385,235 @@ macro_rules! method_name_pred {
     ($f:expr) => {
         |_ctx: &PredCtx<'_, '_>, target: &PredTarget<'_, '_>, _args: &[Arg]| -> bool {
             method_name_of(target).is_some_and(|name| $f(name))
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Ancestor-dependent predicates
+// ---------------------------------------------------------------------------
+//
+// These are the `RubocopAst` predicates that read `node.parent`. Upstream has
+// a real parent pointer (`node.rb:199-215`); here the chain arrives on the
+// [`PredCtx`], normalized to Parser ancestry by [`super::ancestors`].
+//
+// Each one bails to its "don't know" answer when the chain is empty, which is
+// the same answer upstream gives for a genuinely parentless node — a pattern
+// matched without a chain therefore behaves as if the node were the root, not
+// as if the predicate were true.
+
+use super::interpreter::{block_type_of, get_children, node_has_type, parser_type_for_node};
+
+/// The Parser-gem children of `node`, or `None` when it has no Parser type.
+fn parser_children<'pr>(
+    node: &ruby_prism::Node<'pr>,
+) -> Option<Vec<super::interpreter::MatchChild<'pr>>> {
+    let parser_type = parser_type_for_node(node).or_else(|| block_type_of(node))?;
+    get_children(parser_type, node)
+}
+
+/// `(index, child count)` of `child` among `parent`'s Parser children.
+///
+/// Upstream's `sibling_index` (`node.rb:244-246`) searches `parent.children`
+/// with `equal?`, so a name or absent slot never matches — only nodes do.
+fn sibling_index(parent: &ruby_prism::Node<'_>, child: NodeId) -> Option<(usize, usize)> {
+    let children = parser_children(parent)?;
+    let exact = children.iter().position(|slot| match slot {
+        super::interpreter::MatchChild::Node(node) => NodeId::of(node) == child,
+        _ => false,
+    });
+    // A Prism node the chain treated as transparent (a one-statement
+    // `StatementsNode`) is still a real child slot here, so the direct search
+    // misses. Fall back to the slot whose range encloses the child: the slots
+    // of one node are disjoint, so at most one can.
+    let index = exact.or_else(|| {
+        children.iter().position(|slot| match slot {
+            super::interpreter::MatchChild::Node(node) => {
+                let location = node.location();
+                location.start_offset() <= child.start && child.end <= location.end_offset()
+            }
+            _ => false,
+        })
+    })?;
+    Some((index, children.len()))
+}
+
+/// `Node#value_used?` — verbatim from `node.rb:704-721` and the four private
+/// helpers below it (`begin_value_used?`, `for_value_used?`,
+/// `case_if_value_used?`, `while_until_value_used?`).
+///
+/// Upstream's comment is "be conservative and return true if we're not sure",
+/// but the first line is `return false if parent.nil?` — a root node's value is
+/// not used — and the `else` arm is the conservative `true`.
+///
+/// Two Parser types it names have no Prism counterpart and so never reach the
+/// specific arms: `eflipflop`/`iflipflop`, and the post-condition loop forms
+/// `while_post`/`until_post` (Prism keeps one `WhileNode` with a flag). The
+/// first falls into `else => true`; the second is answered by the
+/// `while`/`until` arm, which is the same rule.
+fn value_used(node: &ruby_prism::Node<'_>, ctx: &PredCtx<'_, '_>) -> bool {
+    let Some((parent, outer)) = ctx.parent() else {
+        return false;
+    };
+    let Some(parser_type) = parser_type_for_node(parent) else {
+        return true;
+    };
+    let id = NodeId::of(node);
+    let position = || sibling_index(parent, id);
+
+    match parser_type {
+        "array" | "defined?" | "dstr" | "dsym" | "erange" | "float" | "hash" | "irange" | "not"
+        | "pair" | "regexp" | "str" | "sym" | "when" | "xstr" => value_used(parent, &outer),
+        // The last statement determines the value of the list.
+        "begin" | "kwbegin" => match position() {
+            Some((index, count)) if index + 1 == count => value_used(parent, &outer),
+            _ => false,
+        },
+        // `(for <var> <enum> <body>)`: the body's value is discarded, the
+        // other two are used.
+        "for" => match position() {
+            Some((2, _)) => value_used(parent, &outer),
+            _ => true,
+        },
+        // The condition is always used; the branches inherit.
+        "case" | "if" => matches!(position(), Some((0, _))) || value_used(parent, &outer),
+        // A loop evaluates to `nil`, so only its condition is used.
+        "while" | "until" => matches!(position(), Some((0, _))),
+        _ => true,
+    }
+}
+
+/// `MethodDispatchNode#in_macro_scope?`, the private matcher behind `macro?`
+/// (`node/mixin/method_dispatch_node.rb:255-269`).
+///
+/// The upstream pattern is
+/// `{root? ^{sclass class module class_constructor? [{kwbegin begin any_block (if _condition <%0 _>)} #in_macro_scope?]}}`,
+/// transcribed arm for arm. The `(if _condition <%0 _>)` arm is "this node is
+/// a branch of the `if`, not its condition".
+fn in_macro_scope(node: &ruby_prism::Node<'_>, ctx: &PredCtx<'_, '_>) -> bool {
+    let Some((parent, outer)) = ctx.parent() else {
+        // `root?`
+        return true;
+    };
+    let Some(parser_type) = parser_type_for_node(parent) else {
+        return false;
+    };
+    if matches!(parser_type, "sclass" | "class" | "module") {
+        return true;
+    }
+    if class_constructor(parent) {
+        return true;
+    }
+    if matches!(parser_type, "kwbegin" | "begin") || node_has_type(parent, "any_block") {
+        return in_macro_scope(parent, &outer);
+    }
+    if parser_type == "if" && !matches!(sibling_index(parent, NodeId::of(node)), Some((0, _))) {
+        return in_macro_scope(parent, &outer);
+    }
+    false
+}
+
+/// A pattern this module needs but does not want to hand-write, compiled once.
+///
+/// `class_constructor?`, `match_guard_clause?` and friends are
+/// `def_node_matcher`s on `Node` itself, so the honest implementation is to run
+/// them through the interpreter rather than to transcribe them into Rust and
+/// let the two drift.
+fn shared_pattern(source: &'static str) -> &'static super::interpreter::CompiledPattern {
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+
+    static CACHE: OnceLock<
+        RwLock<HashMap<&'static str, &'static super::interpreter::CompiledPattern>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(compiled) = cache
+        .read()
+        .expect("pattern cache is not poisoned")
+        .get(source)
+    {
+        return compiled;
+    }
+    let compiled: &'static _ = Box::leak(Box::new(
+        super::interpreter::CompiledPattern::compile(source)
+            .unwrap_or_else(|| panic!("built-in pattern should compile: {source}")),
+    ));
+    cache
+        .write()
+        .expect("pattern cache is not poisoned")
+        .insert(source, compiled);
+    compiled
+}
+
+/// `Node#class_constructor?` (`node.rb:608-618`).
+fn class_constructor(node: &ruby_prism::Node<'_>) -> bool {
+    shared_pattern(
+        "{(send #global_const?({:Class :Module :Struct}) :new ...)
+          (send #global_const?(:Data) :define ...)
+          (any_block {(send #global_const?({:Class :Module :Struct}) :new ...)
+                      (send #global_const?(:Data) :define ...)} ...)}",
+    )
+    .matches(node)
+}
+
+/// `Node#guard_clause?` (`node.rb:565-569`) plus `match_guard_clause?`
+/// (`node.rb:587-590`).
+///
+/// `node = operator_keyword? ? rhs : self` — an `and`/`or` delegates to its
+/// right-hand side, because `do_something or return` guards on the `return`.
+fn guard_clause(node: &ruby_prism::Node<'_>) -> bool {
+    const MATCH_GUARD_CLAUSE: &str =
+        "[{(send nil? {:raise :fail} ...) return break next} single_line?]";
+
+    let subject = if let Some(and) = node.as_and_node() {
+        and.right()
+    } else if let Some(or) = node.as_or_node() {
+        or.right()
+    } else {
+        return shared_pattern(MATCH_GUARD_CLAUSE).matches(node);
+    };
+    shared_pattern(MATCH_GUARD_CLAUSE).matches(&subject)
+}
+
+/// `MethodDispatchNode#def_modifier?` (`method_dispatch_node.rb:187-206`).
+///
+/// `private def foo; end` — a receiverless send whose third Parser child is a
+/// `def`/`defs`, possibly through another such send (`private memoize def …`).
+/// No ancestors involved; it is here because it is the other predicate the
+/// registry was missing.
+fn def_modifier(node: &ruby_prism::Node<'_>, depth: usize) -> bool {
+    // `def_modifier` recurses on `children[2]`, which strictly decreases the
+    // subtree; the cap is belt and braces against a pathological AST.
+    if depth > 32 {
+        return false;
+    }
+    if parser_type_for_node(node) != Some("send") {
+        return false;
+    }
+    let Some(children) = get_children("send", node) else {
+        return false;
+    };
+    // `node.receiver.nil?`
+    if !matches!(
+        children.first(),
+        Some(super::interpreter::MatchChild::Absent)
+    ) {
+        return false;
+    }
+    let Some(super::interpreter::MatchChild::Node(arg)) = children.get(2) else {
+        return false;
+    };
+    if node_has_type(arg, "any_def") {
+        return true;
+    }
+    def_modifier(arg, depth + 1)
+}
+
+/// Adapt a `fn(&Node, &PredCtx) -> bool` into a [`PredFn`].
+macro_rules! ancestor_pred {
+    ($f:expr) => {
+        |ctx: &PredCtx<'_, '_>, target: &PredTarget<'_, '_>, _args: &[Arg]| -> bool {
+            target.node().is_some_and(|node| $f(node, ctx))
         }
     };
 }
@@ -776,6 +1085,20 @@ static BUILTINS: &[Builtin] = &[
         eval: call_pred!(amp::is_access_modifier_declaration),
     },
     Builtin {
+        name: "argument?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:525-527",
+        eval: ancestor_pred!(|node: &ruby_prism::Node<'_>, ctx: &PredCtx<'_, '_>| {
+            // `parent&.send_type? && parent.arguments.include?(self)`; the
+            // Parser children of a `send` are `[receiver, name, *arguments]`.
+            ctx.nth_ancestor(0).is_some_and(|parent| {
+                parser_type_for_node(parent) == Some("send")
+                    && matches!(sibling_index(parent, NodeId::of(node)), Some((index, _)) if index >= 2)
+            })
+        }),
+    },
+    Builtin {
         name: "arguments?",
         arity: Arity::Nullary,
         source: Source::Extension,
@@ -889,6 +1212,19 @@ static BUILTINS: &[Builtin] = &[
         eval: method_name_pred!(mip::is_camel_case_method),
     },
     Builtin {
+        name: "chained?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:521-523",
+        eval: ancestor_pred!(|node: &ruby_prism::Node<'_>, ctx: &PredCtx<'_, '_>| {
+            // `parent&.call_type? && eql?(parent.receiver)`
+            ctx.nth_ancestor(0).is_some_and(|parent| {
+                node_has_type(parent, "call")
+                    && matches!(sibling_index(parent, NodeId::of(node)), Some((0, _)))
+            })
+        }),
+    },
+    Builtin {
         name: "command?",
         arity: Arity::Unary,
         source: Source::RubocopAst,
@@ -932,6 +1268,13 @@ static BUILTINS: &[Builtin] = &[
         source: Source::RubocopAst,
         backing: "method_dispatch_predicates::is_const_receiver",
         eval: call_pred!(mdp::is_const_receiver),
+    },
+    Builtin {
+        name: "def_modifier?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "method_dispatch_node.rb:187-206",
+        eval: node_pred!(|node: &ruby_prism::Node<'_>| def_modifier(node, 0)),
     },
     Builtin {
         name: "dot?",
@@ -987,6 +1330,21 @@ static BUILTINS: &[Builtin] = &[
         eval: method_name_pred!(mip::is_enumerator_method),
     },
     Builtin {
+        name: "equal?",
+        arity: Arity::Unary,
+        source: Source::RubocopAst,
+        backing: "Object#equal? over NodeId",
+        eval: |_ctx: &PredCtx<'_, '_>, target: &PredTarget<'_, '_>, args: &[Arg]| -> bool {
+            // `access_element.equal?(param)`. Every vendored use passes `%0`
+            // or a node-valued `%1`; anything else is not the same object by
+            // construction.
+            let Some(Arg::Node(other)) = args.first() else {
+                return false;
+            };
+            target.node().is_some_and(|node| NodeId::of(node) == *other)
+        },
+    },
+    Builtin {
         name: "equals_asgn?",
         arity: Arity::Nullary,
         source: Source::RubocopAst,
@@ -1024,6 +1382,13 @@ static BUILTINS: &[Builtin] = &[
             };
             args.first().is_some_and(|arg| arg.accepts_name(&name))
         },
+    },
+    Builtin {
+        name: "guard_clause?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:565-569 + match_guard_clause? (node.rb:587-590)",
+        eval: node_pred!(guard_clause),
     },
     Builtin {
         name: "immutable_literal?",
@@ -1080,6 +1445,18 @@ static BUILTINS: &[Builtin] = &[
         source: Source::RubocopAst,
         backing: "node_type_groups::is_loop_type",
         eval: node_pred!(is_loop_keyword),
+    },
+    Builtin {
+        name: "macro?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "method_dispatch_node.rb:57-59 + in_macro_scope? (:255-269)",
+        eval: ancestor_pred!(|node: &ruby_prism::Node<'_>, ctx: &PredCtx<'_, '_>| {
+            // `!receiver && in_macro_scope?`
+            node.as_call_node()
+                .is_some_and(|call| call.receiver().is_none())
+                && in_macro_scope(node, ctx)
+        }),
     },
     Builtin {
         name: "method?",
@@ -1192,6 +1569,15 @@ static BUILTINS: &[Builtin] = &[
         eval: method_name_pred!(mip::is_operator_method),
     },
     Builtin {
+        name: "parent?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:208-210",
+        eval: |ctx: &PredCtx<'_, '_>, target: &PredTarget<'_, '_>, _args: &[Arg]| -> bool {
+            target.node().is_some() && ctx.nth_ancestor(0).is_some()
+        },
+    },
+    Builtin {
         name: "parenthesized_call?",
         arity: Arity::Nullary,
         source: Source::RubocopAst,
@@ -1271,6 +1657,15 @@ static BUILTINS: &[Builtin] = &[
         eval: node_pred!(is_reference),
     },
     Builtin {
+        name: "root?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:213-215",
+        eval: |ctx: &PredCtx<'_, '_>, target: &PredTarget<'_, '_>, _args: &[Arg]| -> bool {
+            target.node().is_some() && ctx.nth_ancestor(0).is_none()
+        },
+    },
+    Builtin {
         name: "safe_navigation?",
         arity: Arity::Nullary,
         source: Source::RubocopAst,
@@ -1341,6 +1736,13 @@ static BUILTINS: &[Builtin] = &[
         eval: node_pred!(is_value_omission),
     },
     Builtin {
+        name: "value_used?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "node.rb:704-721",
+        eval: ancestor_pred!(value_used),
+    },
+    Builtin {
         name: "variable?",
         arity: Arity::Nullary,
         source: Source::RubocopAst,
@@ -1392,6 +1794,179 @@ mod tests {
     fn check_name(name: &str, value: &[u8], args: &[Arg]) -> bool {
         let builtin = lookup(name).unwrap_or_else(|| panic!("no builtin named {name}"));
         (builtin.eval)(&PredCtx::empty(), &PredTarget::Name(value), args)
+    }
+
+    /// Run a builtin against the node whose source text is `needle`, with the
+    /// ancestor chain the walker would have handed a cop.
+    fn check_at(name: &str, ruby: &str, needle: &str, args: &[Arg]) -> bool {
+        let builtin = lookup(name).unwrap_or_else(|| panic!("no builtin named {name}"));
+        super::super::interpreter::test_support::with_node_and_chain(ruby, needle, |node, chain| {
+            (builtin.eval)(&PredCtx::new(chain), &PredTarget::Node(node), args)
+        })
+    }
+
+    #[test]
+    fn root_and_parent_read_the_chain() {
+        assert!(check_at("root?", "foo\n", "foo", &[]));
+        assert!(!check_at("parent?", "foo\n", "foo", &[]));
+        assert!(!check_at("root?", "bar(foo)\n", "foo", &[]));
+        assert!(check_at("parent?", "bar(foo)\n", "foo", &[]));
+        // With no chain a node reads as the root, not as "unknown".
+        assert!(check("root?", "foo\n", &[]));
+    }
+
+    #[test]
+    fn chained_and_argument() {
+        // `foo.bar` — `foo` is the receiver of a call.
+        assert!(check_at("chained?", "foo.bar\n", "foo", &[]));
+        assert!(!check_at("argument?", "foo.bar\n", "foo", &[]));
+        // `bar(foo)` — `foo` is an argument, not a receiver.
+        assert!(!check_at("chained?", "bar(foo)\n", "foo", &[]));
+        assert!(check_at("argument?", "bar(foo)\n", "foo", &[]));
+        // A safe-navigation parent still counts as `call_type?`.
+        assert!(check_at("chained?", "foo&.bar\n", "foo", &[]));
+        // …but `argument?` is `send_type?` only.
+        assert!(!check_at("argument?", "bar&.baz(foo)\n", "foo", &[]));
+    }
+
+    #[test]
+    fn value_used_follows_node_rb() {
+        let cases: &[(&str, &str, bool)] = &[
+            // Root: `return false if parent.nil?`.
+            ("foo\n", "foo", false),
+            // `else` arm: anything not listed is conservatively used.
+            ("bar(foo)\n", "foo", true),
+            ("x = foo\n", "foo", true),
+            // A list's value is its last statement's, and the list here is a
+            // method body whose own value is discarded.
+            ("def m; foo; bar; end\n", "foo", false),
+            ("def m; foo; bar; end\n", "bar", true),
+            // The condition of an `if` is always used; branches inherit.
+            ("if foo\n  bar\nend\n", "foo", true),
+            ("def m; if x\n  bar\nend\nend\n", "bar", true),
+            // A loop evaluates to `nil`, so only its condition is used.
+            ("while foo\n  bar\nend\n", "foo", true),
+            ("while x\n  bar\nend\n", "bar", false),
+            // Composite literals pass the question up — including up to a
+            // root array, whose own value is not used.
+            ("[foo]\n", "foo", false),
+            ("x = [foo]\n", "foo", true),
+            ("def m; [foo]; bar; end\n", "foo", false),
+        ];
+        for &(ruby, needle, expected) in cases {
+            assert_eq!(
+                check_at("value_used?", ruby, needle, &[]),
+                expected,
+                "value_used?({needle:?}) in {ruby:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn macro_needs_a_receiverless_send_in_a_class_like_scope() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("class C\n  attr_reader :a\nend\n", "attr_reader :a", true),
+            ("module M\n  attr_reader :a\nend\n", "attr_reader :a", true),
+            (
+                "class << self\n  attr_reader :a\nend\n",
+                "attr_reader :a",
+                true,
+            ),
+            // Top level is a macro scope (`root?`).
+            ("attr_reader :a\n", "attr_reader :a", true),
+            // Inside a method body it is not.
+            (
+                "class C\n  def m\n    attr_reader :a\n  end\nend\n",
+                "attr_reader :a",
+                false,
+            ),
+            // A receiver disqualifies it outright.
+            (
+                "class C\n  self.attr_reader :a\nend\n",
+                "self.attr_reader :a",
+                false,
+            ),
+            // Wrappers are transparent.
+            (
+                "class C\n  begin\n    attr_reader :a\n  end\nend\n",
+                "attr_reader :a",
+                true,
+            ),
+            (
+                "class C\n  if x\n    attr_reader :a\n  end\nend\n",
+                "attr_reader :a",
+                true,
+            ),
+            // `class_constructor?`: `Class.new { … }`.
+            (
+                "C = Class.new do\n  attr_reader :a\nend\n",
+                "attr_reader :a",
+                true,
+            ),
+        ];
+        for &(ruby, needle, expected) in cases {
+            assert_eq!(
+                check_at("macro?", ruby, needle, &[]),
+                expected,
+                "macro?({needle:?}) in {ruby:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn guard_clause_and_def_modifier_need_no_chain() {
+        assert!(check_at("guard_clause?", "return if x\n", "return", &[]));
+        assert!(check("guard_clause?", "raise 'x'\n", &[]));
+        assert!(check("guard_clause?", "next\n", &[]));
+        // `do_something or return` delegates to the right-hand side.
+        assert!(check("guard_clause?", "do_something or return\n", &[]));
+        assert!(!check("guard_clause?", "do_something\n", &[]));
+
+        assert!(check("def_modifier?", "private def foo; end\n", &[]));
+        assert!(check(
+            "def_modifier?",
+            "private memoize def foo; end\n",
+            &[]
+        ));
+        assert!(!check("def_modifier?", "private :foo\n", &[]));
+        assert!(!check("def_modifier?", "self.private def foo; end\n", &[]));
+    }
+
+    #[test]
+    fn equal_is_identity_over_node_ids() {
+        let result = parse("foo\n");
+        let node = first_stmt(&result);
+        let builtin = lookup("equal?").expect("equal? is registered");
+        let id = Arg::Node(NodeId::of(&node));
+        assert!((builtin.eval)(
+            &PredCtx::empty(),
+            &PredTarget::Node(&node),
+            &[id.clone()]
+        ));
+
+        let other = parse("foo\n");
+        let other_node = first_stmt(&other);
+        // Same text, same offsets, same type — identity across two parses is
+        // deliberately indistinguishable; within one parse it is exact.
+        assert!((builtin.eval)(
+            &PredCtx::empty(),
+            &PredTarget::Node(&other_node),
+            &[id.clone()],
+        ));
+
+        let different = parse("bar(baz)\n");
+        let different_node = first_stmt(&different);
+        assert!(!(builtin.eval)(
+            &PredCtx::empty(),
+            &PredTarget::Node(&different_node),
+            &[id],
+        ));
+        // A non-node argument never satisfies identity.
+        assert!(!(builtin.eval)(
+            &PredCtx::empty(),
+            &PredTarget::Node(&node),
+            &[Arg::Symbol("foo".into())],
+        ));
     }
 
     #[test]

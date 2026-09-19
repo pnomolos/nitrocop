@@ -1,12 +1,13 @@
 # Cop IR (schema v1) — reference
 
-> **Experimental.** Nothing loads IR cops at runtime yet. What exists today is
-> the document schema (`src/cop/ir/schema.rs`), a fail-closed loader
-> (`src/cop/ir/load.rs`), the expression compiler (`src/cop/ir/expr.rs`) and
-> evaluator (`src/cop/ir/eval.rs`), the JSON Schema
-> (`scripts/shared/ir_schema.json`) and `nitrocop --validate-ir`. The `Cop`
-> implementation, registry integration and user-cop discovery land in later
-> PRs.
+> **Experimental.** IR cops shipped inside the binary run; user-supplied ones do
+> not yet. What exists today is the document schema (`src/cop/ir/schema.rs`), a
+> fail-closed loader (`src/cop/ir/load.rs`), the expression compiler
+> (`src/cop/ir/expr.rs`) and evaluator (`src/cop/ir/eval.rs`), the `Cop`
+> implementation (`src/cop/ir/cop.rs`), the embedded table
+> (`src/cop/ir/embedded.rs`), the JSON Schema (`scripts/shared/ir_schema.json`)
+> and `nitrocop --validate-ir`. Discovery of `.nitrocop/cops/**` and gem-shipped
+> packs (design §4.1 items 2-4) lands in a later PR.
 
 A cop IR document is one YAML file per cop, conventionally `<Name>.cop.yml`. It
 is `meta` + `config` declarations + named `matchers` (verbatim upstream
@@ -226,10 +227,88 @@ attribute of a non-node, or one the node does not have, is `nil`.
 
 ### Ancestors
 
-`parent`, `parent_type`, `over: ancestors`, `root?` and `value_used?` all read
-`EvalCtx::ancestors`, which is empty until `BatchedCopWalker` maintains an
-ancestor stack (design §3.3, separate PR). Until then they answer as if the
-node had no enclosing node.
+`parent`, `parent_type`, `over: ancestors`, `root?` and `value_used?` read
+`EvalCtx::ancestors`, the walker's chain of enclosing nodes. Maintaining that
+chain costs a `Vec` push/pop per branch node, so the walker only does it when
+some active cop asks — and `IrCopRunner` asks exactly when the document needs
+it, decided once at load by scanning every compiled matcher for `^` and every
+compiled expression for `parent`, `parent_type`, `over: ancestors`, `root?`,
+`value_used?` or one of the ancestor-reading `pred:` names (`argument?`,
+`chained?`, `def_modifier?`, `guard_clause?`, `macro?`, `parent?`). Nothing in
+the document has to declare it.
+
+The chain is the raw Prism stack; `node_pattern::ancestors` normalizes it to
+Parser-gem ancestry, with the two documented divergences (a call carrying a
+literal block is one level where Parser has two; there is no `rescue` level).
+
+## Runtime
+
+`IrCopRunner` (`src/cop/ir/cop.rs`) is the `Cop` implementation. Per node:
+
+1. **tag dispatch** — `interested_node_types()` is the union of the hooks' `on:`
+   lists mapped to Prism type tags, so the walker never calls a cop for a node
+   type it did not ask for;
+2. **type re-discrimination** — one Prism type covers several Parser types, so
+   each hook re-checks: `send` vs `csend` off the `&.` operator, and
+   `block`/`numblock`/`itblock`/`any_block` off the block's parameters node;
+3. **`restrict_on_send`** — a byte compare on the callee name, applied to
+   `send`/`csend` hooks only, exactly as upstream's `RESTRICT_ON_SEND` applies
+   to `on_send`/`on_csend` and not to `on_block`;
+4. **match** — the compiled NodePattern, with `#helper` resolved against the
+   document's own `matchers:` and `%param` against its `config:`/`constants:`;
+5. **`bind:` then `when:`**;
+6. **offense** — the `location:` anchor resolves to a byte range, the message
+   template renders, the `Diagnostic` is pushed;
+7. **`correct:`** — each edit resolves to a byte range and becomes a
+   `Correction`, honoring `autocorrect: safe|unsafe` through
+   `Cop::safe_autocorrect` and therefore the existing `-a` allowlist
+   (`src/resources/autocorrect_safe_allowlist.json`) and `SafeAutoCorrect`.
+
+Steps 1-4 allocate nothing. The config vector, the bind vector and the rendered
+message are built only after a matcher has matched.
+
+### What `on: [block]` dispatches on
+
+The Parser gem's `block` node is nitrocop's `CallNode` carrying a `BlockNode`
+(or a `LambdaNode`), which is what `on_block` visits upstream. A `block` hook
+therefore dispatches on `CallNode`/`LambdaNode` and **not** on Prism's
+`BlockNode` — dispatching on both would report every offense twice.
+
+### Anchors at runtime
+
+`node`, `parent` and `$capture` targets resolve to a node; accessors walk to a
+child; the `part` selects a `loc` range; the edge picks an endpoint. Two
+vocabulary entries deliberately resolve to nothing: `parent` *mid-path* (it
+would need the ancestor chain of a node the walker never visited) and `name`
+(bytes, not a node).
+
+An anchor that does not resolve against the node it matched — `node.selector` on
+something that is not a call — is a type error the loader's flat vocabulary
+check cannot catch. It panics under `debug_assertions`, so `cargo test` catches
+it, and drops the offense in a release build rather than reporting at a wrong
+location.
+
+### Config binding
+
+`cfg.<Key>` and `%{Key}` read the per-file `CopConfig`, falling back to the
+declared `default:`. An `enum` key whose configured value is not a member also
+falls back to the default rather than erroring, because a `.rubocop.yml` can
+name a style this cop does not have.
+
+### Registering a shipped cop
+
+1. write `src/resources/ir/<dept>/<snake>.cop.yml`;
+2. add it to `FILES` in `src/cop/ir/embedded.rs` (`ir_embedded_files_are_listed`
+   fails if you forget);
+3. add fixtures under `tests/fixtures/cops/<dept>/<snake>/` and one
+   `crate::ir_cop_fixture_tests!(<mod>, "Dept/Name", "cops/<dept>/<snake>")`
+   line.
+
+A shipped document that fails to load is a **panic at startup**: it is a bug in
+the binary, not in the user's project, and `ir_embedded_cops_load` exercises
+every one of them. New IR cops inherit `src/resources/tiers.json`'s
+`default_tier: preview`, so they are invisible without `--preview` until the
+corpus gate clears them.
 
 ## Complete example
 

@@ -220,13 +220,7 @@ pub fn eval<'pr>(expr: &Expr, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
                     _ => return Value::Bool(false),
                 },
             };
-            Value::Bool((pred.eval)(
-                &PredCtx {
-                    ancestors: ctx.ancestors,
-                },
-                &target,
-                args,
-            ))
+            Value::Bool((pred.eval)(&PredCtx::new(ctx.ancestors), &target, args))
         }
         Expr::Intrinsic { of, which } => Value::Bool(intrinsic(&eval(of, ctx), which, ctx)),
         Expr::Matches { of, matcher } => Value::Bool(matches(&eval(of, ctx), *matcher, ctx)),
@@ -522,7 +516,12 @@ fn matches<'pr>(value: &Value<'pr>, matcher: MatcherRef, ctx: &EvalCtx<'_, 'pr>)
                     _ => return false,
                 },
             };
-            pattern.matches_target(&target, ctx.params, ctx.resolver)
+            // The chain describes the hook's node; a `matches:` applied to a
+            // sub-node therefore sees a `^` one level too shallow. Same
+            // approximation `EvalCtx::rebound` documents, and the same one
+            // upstream has no equivalent of because its `#helper`s are methods
+            // on a node that carries its own parent pointer.
+            pattern.matches_target(&target, ctx.ancestors, ctx.params, ctx.resolver)
         }
         MatcherRef::Predicate(index) => {
             let (Some(node), Some(expr)) = (value.node(), ctx.doc.predicates.get(index)) else {

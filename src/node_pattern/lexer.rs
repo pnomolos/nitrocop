@@ -57,6 +57,12 @@ pub enum Token {
     Backtick, // ` (descend operator)
     LAngle,   // < (any-order group)
     RAngle,   // > (any-order group)
+    /// `?` — `repetition` in `parser.y`, arity `0..1`.
+    Question,
+    /// `*` — `repetition` in `parser.y`, arity `0..∞`.
+    Star,
+    /// `+` — `repetition` in `parser.y`, arity `1..∞`.
+    Plus,
 }
 
 pub struct Lexer<'a> {
@@ -246,6 +252,21 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     tokens.push(Token::Backtick);
                 }
+                b'?' => {
+                    self.advance();
+                    tokens.push(Token::Question);
+                }
+                b'*' => {
+                    self.advance();
+                    tokens.push(Token::Star);
+                }
+                // `lexer.rex` matches `/[-+]?\d+/` before the punctuation
+                // union, so `+1` is a number and a lone `+` is the repetition
+                // operator.
+                b'+' if !self.input.get(self.pos + 1).is_some_and(u8::is_ascii_digit) => {
+                    self.advance();
+                    tokens.push(Token::Plus);
+                }
                 b'<' => {
                     self.advance();
                     tokens.push(Token::LAngle);
@@ -307,13 +328,22 @@ impl<'a> Lexer<'a> {
                         self.advance();
                         tokens.push(Token::Ident("cbase".to_string()));
                     } else {
-                        // Ruby symbols can be operator method names: :==, :===, :!=,
-                        // :<=>, :<=, :>=, :<<, :>>, :+, :-, :*, :/, :%, :!, :[],
-                        // :[]=, :!~, :=~, :&, :|, :^, :~, :**
-                        let name = if self.peek().is_some_and(|c| b"=<>!~+*&|^/%-.".contains(&c)) {
-                            self.read_while(|c| b"=<>!~+*&|^/%-.[]".contains(&c))
+                        // `lexer.rex`: `SYMBOL_NAME = /[\w+@*\/?!<>=~|%^&-]+|\[\]=?/`.
+                        // The character class covers operator methods (`:<=>`,
+                        // `:**`) and the setter/predicate/bang suffixes
+                        // (`:metadata=`, `:empty?`, `:map!`) in one rule; only
+                        // `:[]` and `:[]=` need the second alternative,
+                        // because `[` is not in the class.
+                        let name = if self.input[self.pos..].starts_with(b"[]=") {
+                            self.pos += 3;
+                            "[]=".to_string()
+                        } else if self.input[self.pos..].starts_with(b"[]") {
+                            self.pos += 2;
+                            "[]".to_string()
                         } else {
-                            self.read_while(|c| Self::is_ident_char(c) || c == b'?')
+                            self.read_while(|c| {
+                                c.is_ascii_alphanumeric() || b"_+@*/?!<>=~|%^&-".contains(&c)
+                            })
                         };
                         tokens.push(Token::SymbolLiteral(name));
                     }
@@ -341,8 +371,11 @@ impl<'a> Lexer<'a> {
                     tokens.push(Token::StringLiteral(s));
                 }
                 b'_' => {
-                    // Could be just _ (wildcard) or an identifier starting with _
-                    let word = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                    // `lexer.rex`: `/_(IDENTIFIER)/` is `tUNIFY` and a bare
+                    // `/_/` is `tWILDCARD`. Neither swallows a `?`, so `_?` is
+                    // a wildcard repeated `0..1` — not an identifier named
+                    // `_?`, which is what it used to lex as.
+                    let word = self.read_while(Self::is_ident_char);
                     if word == "_" {
                         tokens.push(Token::Wildcard);
                     } else {
@@ -350,13 +383,14 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ if ch.is_ascii_digit()
-                    || (ch == b'-'
+                    || ((ch == b'-' || ch == b'+')
                         && self
                             .input
                             .get(self.pos + 1)
                             .is_some_and(|c| c.is_ascii_digit())) =>
                 {
-                    let num_str = self.read_while(|c| c.is_ascii_digit() || c == b'-' || c == b'.');
+                    let num_str = self
+                        .read_while(|c| c.is_ascii_digit() || c == b'-' || c == b'+' || c == b'.');
                     if num_str.contains('.') {
                         tokens.push(Token::FloatLiteral(num_str));
                     } else if let Ok(n) = num_str.parse::<i64>() {
@@ -821,6 +855,68 @@ mod tests {
                 Token::Wildcard,
                 Token::RParen,
             ]
+        );
+    }
+
+    #[test]
+    fn repetition_operators_are_their_own_tokens() {
+        assert_eq!(
+            Lexer::new("_?").tokenize(),
+            vec![Token::Wildcard, Token::Question],
+        );
+        assert_eq!(
+            Lexer::new("_ ?").tokenize(),
+            vec![Token::Wildcard, Token::Question],
+        );
+        assert_eq!(
+            Lexer::new("_foo?").tokenize(),
+            vec![Token::Ident("_foo".to_string()), Token::Question],
+        );
+        assert_eq!(
+            Lexer::new("(sym)*").tokenize(),
+            vec![
+                Token::LParen,
+                Token::Ident("sym".to_string()),
+                Token::RParen,
+                Token::Star,
+            ],
+        );
+        assert_eq!(
+            Lexer::new("{sym str}+").tokenize(),
+            vec![
+                Token::LBrace,
+                Token::Ident("sym".to_string()),
+                Token::Ident("str".to_string()),
+                Token::RBrace,
+                Token::Plus,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_predicate_still_swallows_its_question_mark() {
+        // `lexer.rex` tries `/#{IDENTIFIER}\?/` (tPREDICATE) before the
+        // punctuation union, so `nil?` / `int?` / `empty?` are one token and
+        // never a node type repeated `0..1`.
+        assert_eq!(Lexer::new("nil?").tokenize(), vec![Token::NilPredicate]);
+        assert_eq!(
+            Lexer::new("int?").tokenize(),
+            vec![Token::TypePredicate("int".to_string())],
+        );
+        assert_eq!(
+            Lexer::new("empty?").tokenize(),
+            vec![Token::Predicate("empty?".to_string())],
+        );
+    }
+
+    #[test]
+    fn a_signed_number_beats_the_plus_operator() {
+        // `/[-+]?\d+/` is matched before the punctuation union.
+        assert_eq!(Lexer::new("+1").tokenize(), vec![Token::IntLiteral(1)]);
+        assert_eq!(Lexer::new("-1").tokenize(), vec![Token::IntLiteral(-1)]);
+        assert_eq!(
+            Lexer::new("_+").tokenize(),
+            vec![Token::Wildcard, Token::Plus],
         );
     }
 }
