@@ -304,6 +304,105 @@ use crate::parse::source::SourceFile;
 /// only the receiver of the current call. This accepts continuations after
 /// completed block receivers, while still flagging assignment-RHS chains after
 /// multiline block continuations.
+///
+/// ## Corpus fix (2026-09-18/19) — faithful port pass
+///
+/// Starting point (fresh-fork oracle): default 216 FP / 192 FN over 40,367
+/// matches; `indented` 61 FP / 188 FN; `indented_relative_to_receiver`
+/// 19 FP / 266 FN.
+///
+/// Method: 30 corpus repos cloned at their manifest SHAs (the 22 that carried
+/// the oracle's FP/FN examples plus 8 high-volume clean repos as a regression
+/// guard), both tools run with oracle-identical invocation, diffed on
+/// `(path, line)` exactly as `bench/corpus/diff_results.py` does. The sample
+/// reproduced the oracle's per-repo counts before any change, and ends at
+/// default 0 FP / 0 FN over 8,591 matches, `indented` 2 FP / 3 FN,
+/// `indented_relative_to_receiver` 0 FP / 4 FN.
+///
+/// The recurring theme is that most of this cop's earlier heuristics were
+/// standing in for RuboCop code that ports cleanly once the Prism/parser node
+/// shape differences are spelled out:
+///
+/// * **`UNALIGNED_RHS_TYPES`** is `if while until for return array kwbegin`.
+///   `case` / `case ... in` are NOT members, so `x = case k ... when ... Foo\n
+///   .bar` aligns `.bar` with the `case k` keyword expression. The port broke
+///   the `part_of_assignment_rhs` walk on any control-flow node.
+/// * **Tabs**: `indentation` is `source_line =~ /\S/`, which counts tabs.
+///   `shared::util::indentation_of` counts spaces only, so every continuation
+///   line in a tab-indented file was measured against column 0.
+/// * **`check_hash_pair_indentation`** consults only
+///   `find_hash_pair_alignment_base` (which requires the chain's *base
+///   receiver* to be a hash literal) and `aligned_with_first_line_dot?`. There
+///   is no block-chain escape hatch on that path.
+/// * **`handle_descendant_block`** returns `receiver.call_type? ? receiver :
+///   block_node.parent`. A call carrying a real block is one `CallNode` in
+///   Prism but a `block` node wrapping a `send` in the parser gem, so the
+///   second branch means "align with your own dot" — which is why
+///   `[1, 2].map do ... end\n  .compact` never offends.
+/// * **`each_descendant(:any_block).first` is parser pre-order.** The parser's
+///   `block` node starts at the receiver, so the *outer* block of
+///   `a.reject { ... }.map { ... }` is reached first; Prism's `BlockNode`
+///   spans only the braces, so ordering by start offset picks the inner one.
+/// * **`first_call_has_a_dot`** walks to the chain root through block nodes.
+///   Stopping at a multiline-block receiver hid the base for
+///   `Seq.run(x) do ... end\n.then(y) do ... end`.
+/// * **`left_hand_side`** stops when the current call carries a real block
+///   (its parser parent is the `block` node, not a call), and `indentation(lhs)`
+///   is just that node's start line — no walking up through visually continued
+///   lines, in any `EnforcedStyle`.
+/// * **`not_for_this_cop?`**: `#{ ... }` interpolation is a `begin` node with a
+///   `begin` location, i.e. a grouped expression. Conversely
+///   `inside_arg_list_parentheses?` covers only real `(` argument lists, never
+///   `[]` / `[]=`, in any style.
+/// * **`kw_node_with_special_indentation`** skips ternaries, and
+///   `correct_indentation` adds `Layout/IndentationWidth`'s `Width` only for
+///   *prefix* keywords — `return if cond\n  .chain` gets no extra indent.
+/// * **`method_on_receiver_last_line?(node, base, :array)`** needs the dot on
+///   the array literal's last line.
+/// * **`semantic_alignment_node` order** is `get_dot_right_above ||
+///   find_multiline_block_chain_node || first_call_alignment_node`. Running the
+///   block-chain checks first mis-handles paren-less command chains such as
+///   `@cols\n  .concat ['a'].map { }\n  .concat ['b'].map { }`, where the
+///   second `.concat` is parsed as a call on the first `.map`'s block result.
+///
+/// Messages were wrong at scale and are now ported verbatim: the no-base
+/// message is `"Use E (not U) spaces for indenting <what> spanning multiple
+/// lines."` (never "indentation of a chained method call"), `U` may be
+/// negative, `<what>` comes from `operation_description`, `rhs.source` includes
+/// the call operator (`&.foo`), and `base_source` is the literal first line of
+/// the base range. On the 30-repo sample, message mismatches went from 401 to
+/// 10 (default), 2,876 to 6 (`indented`) and 1,193 to 0
+/// (`indented_relative_to_receiver`).
+///
+/// ### Removed as redundant
+///
+/// The "previous continuation dot anchor" fallback
+/// (`find_previous_continuation_dot_anchor` /
+/// `previous_continuation_anchor_is_valid` / `uses_outer_aligned_fallback_base`)
+/// has no RuboCop counterpart. Once `indentation(lhs)` was correct it returned
+/// the same column as the no-base fallback everywhere the corpus exercises it,
+/// but tagged the offense as an `Align ... with ...` one, so it only ever
+/// corrupted the message. Likewise `find_visual_chain_base_line`,
+/// `find_leading_continuation_ancestor_line`, `find_block_chain_col` and
+/// `hash_pair_value_starts_on_key_line` are gone; the behaviour they
+/// approximated now comes from the ported RuboCop rules. Do not reintroduce
+/// them without corpus evidence.
+///
+/// ### Known remaining divergence on the 30-repo sample
+///
+/// * `EnforcedStyle: indented`, backup/backup `lib/backup/notifier/http_post.rb`
+///   99-104: a hash-pair value whose chain base receiver is a hash literal.
+///   RuboCop takes `check_hash_pair_indented_style`, which sets
+///   `@hash_pair_base_column = pair_key.column + width` and expects
+///   `pair_key.column + 2 * width`; that path is not implemented here (2 FP,
+///   3 FN).
+/// * `EnforcedStyle: indented_relative_to_receiver`, discourse
+///   `app/models/group.rb` 785-788 and `script/build_jsconfig.rb` 35-36: 4 FN,
+///   not yet diagnosed.
+/// * 10 default-style message mismatches where the *column* agrees but the
+///   base node RuboCop names differs (e.g. `::XML` vs `.XML`,
+///   `.permissions` vs `.post`). These are invisible to the corpus oracle,
+///   which keys on `(path, line, cop)`.
 pub struct MultilineMethodCallIndentation;
 
 impl Cop for MultilineMethodCallIndentation {
