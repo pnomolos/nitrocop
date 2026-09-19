@@ -252,3 +252,108 @@ def visible_variants_for_outgoing_exchanges
     visible[enterprise.id] = variants if variants.any?
   end
 end
+
+# Tab-indented continuation lines: leading tabs count as one column each,
+# so the chain below is correctly indented by two spaces past the receiver.
+def run_command_stdout(cmd)
+	run_command(cmd).
+	  select { |l| l[0] == :stdout }.
+	  map { |l| l[1] }.
+	  join("\n")
+end
+
+# Hash pair value whose chain base receiver IS a hash literal: the base is the
+# chain's first dotted call (RuboCop's `find_hash_pair_alignment_base`).
+foo(bar: { a: 1 }.merge(b: 2)
+                 .transform_values(&:to_s)
+                 .to_a)
+
+# A `->() {}` literal is a `block` node in the parser gem, so its body stops
+# `part_of_assignment_rhs` and the chain falls back to plain indentation.
+def events_by_id
+  recursive_query = ->(non_recursive_term, recursive_term) {
+    Event
+      .unscoped
+      .with_recursive(event_graph: [non_recursive_term, recursive_term])
+      .strict_loading
+  }
+  recursive_query
+end
+
+# A `->() {}` argument is a descendant block, so the following continuation
+# aligns with the receiver call's dot (`handle_descendant_block`).
+def stub
+  WebMock.stub_request(:post, "https://api.stripe.com/v1/payment_intents")
+         .with(body: ->(request) {
+           params = Rack::Utils.parse_query(request)
+           expect(params["confirm"]).to eq "true"
+         })
+         .to_return(
+           status: 400
+         )
+end
+
+# `#{ ... }` is a grouped expression (a `begin` node with a `begin` location),
+# so `not_for_this_cop?` skips chains inside interpolation.
+def loaded
+  x "loaded (#{self.class.properties.sort_by { |name, p| name }
+    .select { |name, p| p.is_set?(self) }
+    .join(", ")})"
+end
+
+# Hash pair whose chain base receiver IS a hash: the base is the chain's first
+# dotted call, which is the node itself on the first continuation line.
+def opts(headers, params, msg, status)
+  {
+    headers: { "User-Agent" => "Backup" }
+      .merge(headers).reject { |_, value| value.nil? }
+      .merge("Content-Type" => "application/x-www-form-urlencoded"),
+    body: URI.encode_www_form({ "message" => msg }
+        .merge(params).reject { |_, value| value.nil? }
+        .merge("status" => status.to_s))
+  }
+end
+
+# `kw_node_with_special_indentation` skips ternaries, so the chain in a ternary
+# condition gets plain indentation rather than the condition's column.
+def new_email
+  method = %w[smtp sendmail exim file test]
+    .index(@delivery_method.to_s) ? @delivery_method.to_s : "smtp"
+  method
+end
+
+# Fallback indentation is `indentation(lhs) + 2`, where `lhs` is where
+# `left_hand_side` stops — at the block-bearing call, on the `.to` line.
+it "fetches entity" do
+  expect(DiasporaFederation::Federation::Fetcher)
+    .to receive(:fetch_public)
+      .with(remote_person.diaspora_handle, "post", guid) {
+        FactoryBot.create(:status_message, author: remote_person, guid: guid)
+      }
+end
+
+it "checks courses for a given student" do
+  expect(mntor.courses_for_user(student1))
+    .to eq courses_users
+      .filter { |cu| cu[:user_id] == student1.id }
+      .pluck(:course_id)
+end
+
+# Paren-less command chain: `.concat ['b'].map { }` is parsed as a call on the
+# previous `.map` block result, so only `get_dot_right_above` (which runs
+# before any block-chain handling) keeps these lines aligned.
+def merge_columns
+  @cols
+    .concat ['nom'].map { |c| f(c) }
+    .concat ['man'].map { |c| f(c) }
+end
+
+# `if` IS in UNALIGNED_RHS_TYPES, so a chain inside a branch of an assigned
+# `if` keeps its branch-local alignment instead of the assignment RHS column.
+def branchy(key, value)
+  result = if key
+    Member
+      .joins(:current_or_future_membership)
+      .distinct
+  end
+end

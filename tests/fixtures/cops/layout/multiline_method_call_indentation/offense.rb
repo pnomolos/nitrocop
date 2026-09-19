@@ -1,19 +1,19 @@
 foo
   .bar
     .baz
-    ^^^ Layout/MultilineMethodCallIndentation: Align `.baz` with `foo` on line 1.
+    ^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indenting an expression spanning multiple lines.
 
 thing
   .first
   .second
       .third
-      ^^^ Layout/MultilineMethodCallIndentation: Align `.third` with `thing` on line 5.
+      ^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 6) spaces for indenting an expression spanning multiple lines.
 
 query
   .select('foo')
   .where(x: 1)
     .order(:name)
-    ^^^ Layout/MultilineMethodCallIndentation: Align `.order` with `query` on line 10.
+    ^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indenting an expression spanning multiple lines.
 
 # Block chain continuation: .sort_by should align with .with_index dot
 frequencies.map.with_index { |f, i| [f / total, hex[i]] }
@@ -63,7 +63,7 @@ method(key: value.foo.bar
 # Aligned style fallback: implicit receiver chain with no indent
 where("first_condition")
 .where("second_condition")
-^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
 
 # Block continuation: .map has block, aligned with receiver's continuation dot
 # RuboCop accepts .map because find_continuation_node returns .select's dot
@@ -96,38 +96,38 @@ end
 trigger = proc do
   described_class.new(url: url, inputs: { name: 'value' }).
       nonce_name = 'stuff'
-      ^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indentation of a chained method call.
+      ^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indenting an expression spanning multiple lines.
 end
 
 # Repeated continuation dots should not inherit a bad column from the first one
 def self.pull_request_filter
   where("contributions.user_id = aggregation_filters.user_id")
   .where("contributions.title ILIKE aggregation_filters.title_pattern")
-  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
   .arel.exists.not
-  ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
 end
 
 # Long leading-dot chains: later continuations still use the base indentation
 def organisation_roles(type)
   @organisation
   .organisation_roles
-  ^^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
   .joins(:role)
-  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
   .merge(roles_for_type(type))
-  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
   .order(:ordering)
-  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indentation of a chained method call.
+  ^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
 end
 
 # RSpec stub chain: later dots still use the chain indent when the first continuation is wrong
 before do
   allow(SteamCondenser::Community::SteamId).to receive(:steam_id_to_community_id)
                                               .with("STEAM_0:0:173804217")
-                                              ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 44) spaces for indentation of a chained method call.
+                                              ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 44) spaces for indenting an expression spanning multiple lines.
                                               .and_return(76_561_198_307_874_162)
-                                              ^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 44) spaces for indentation of a chained method call.
+                                              ^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 44) spaces for indenting an expression spanning multiple lines.
 end
 
 # A later continuation should not reuse an earlier column that was only valid
@@ -136,7 +136,7 @@ def household_size_options
   (0..10).map { |i| i }
          .unshift([t('common.prefer_not_to_answer'), -1])
          .unshift([nil, nil])
-         ^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 7) spaces for indentation of a chained method call.
+         ^^^^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 7) spaces for indenting an expression spanning multiple lines.
 end
 
 # Operator RHS: later continuation dots still align with the operator RHS base
@@ -181,9 +181,9 @@ it 'enqueues SetPointsCountryIdsJob for points without country_id' do
   expect { described_class.perform_now }.to \
     have_enqueued_job(DataMigrations::SetPointsCountryIdsJob)
       .with(point_without_country1.id)
-      ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indentation of a chained method call.
+      ^^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indenting an expression spanning multiple lines.
       .and have_enqueued_job(DataMigrations::SetPointsCountryIdsJob)
-      ^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indentation of a chained method call.
+      ^^^^ Layout/MultilineMethodCallIndentation: Use 2 (not 4) spaces for indenting an expression spanning multiple lines.
       .with(point_without_country2.id)
 end
 
@@ -270,3 +270,86 @@ foo(
       .map { |k, v| { id: v, name: ReviewableScore.type_title(k) } },
       ^^^^ Layout/MultilineMethodCallIndentation: Align `.map` with `ReviewableScore` on line 216.
 )
+
+# `case` is not in RuboCop's UNALIGNED_RHS_TYPES, so a chain inside a `when`
+# branch of an assigned `case` aligns with the `case` keyword expression.
+def members(key, value)
+  base_members = case key
+  when :basket_size_id
+    Member
+      .joins(:current_or_future_membership)
+      ^^^^^^ Layout/MultilineMethodCallIndentation: Align `.joins` with `case key` on line 225.
+      .distinct
+      ^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.distinct` with `case key` on line 225.
+  else
+    Member.where(id: value)
+  end
+end
+
+# Hash pair value whose chain base receiver is NOT a hash: every continuation
+# line is measured against the left-hand side, with no block-chain escape.
+def rows(bid)
+  [
+    {
+      prev: @prev_rows
+        .select { |r| r.budget_id == bid }
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `@prev_rows` on line 240.
+        .collect { |r| r.amount }
+        ^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.collect` with `@prev_rows` on line 240.
+        .inject(0) { |sum, x| sum + x }
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.inject` with `@prev_rows` on line 240.
+    }
+  ]
+end
+
+# A block-bearing continuation after a multiline-block receiver falls through
+# `find_continuation_node` to `first_call_alignment_node`, which walks past the
+# block to the chain's first dotted call.
+def actions
+  RSpec::Sequencing.run("quit after a short time") do
+    File.open(file_path, "wb") { |file| file.write("line1") }
+  end
+  .then("watch") do
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 252.
+    reading.watch_this(watch_dir)
+  end
+  .then("wait") do
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 252.
+    wait(2)
+  end
+end
+
+# `each_descendant(:any_block).first` is parser pre-order: the outer `.map { }`
+# block of the argument comes before the inner `.reject { ... }` one, and it is
+# single-line, so no descendant-block alignment applies and the chain falls
+# back to the assignment RHS.
+def list
+  subquery = joins(:dates, :translations)
+    .select("events.*", "event_dates.start_at")
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 268.
+    .select(Event::Translation.column_names
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 268.
+                              .reject { |col|
+              ["id", "event_id"].include?(col)
+            }
+                              .map { |col| "event_translations.#{col}" })
+    .preload_all_dates
+    ^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.preload_all_dates` with `joins(:dates, :translations)` on line 268.
+  subquery
+end
+
+# Safe navigation: `right_hand_side` is `dot.join(selector)`, so the reported
+# source is `&.foo`, not `.foo`.
+def links(item)
+  item.edition_organisations
+      .first
+    &.organisation
+    ^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `&.organisation` with `.edition_organisations` on line 282.
+end
+
+# Attribute-assignment call: the parser gem's `loc.selector` covers the method
+# name only, so `right_hand_side` is `dot.join(selector)` and the reported
+# source is `.nonce_name`, not `.nonce_name=`.
+described_class.new(url: url)
+    .nonce_name = 'stuff'
+    ^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.nonce_name` with `.new` on line 290.

@@ -1,7 +1,6 @@
 use ruby_prism::Visit;
 
 use crate::cop::shared::method_identifier_predicates;
-use crate::cop::shared::util::indentation_of;
 use crate::cop::{Cop, CopConfig};
 use crate::diagnostic::Diagnostic;
 use crate::parse::source::SourceFile;
@@ -305,6 +304,105 @@ use crate::parse::source::SourceFile;
 /// only the receiver of the current call. This accepts continuations after
 /// completed block receivers, while still flagging assignment-RHS chains after
 /// multiline block continuations.
+///
+/// ## Corpus fix (2026-09-18/19) — faithful port pass
+///
+/// Starting point (fresh-fork oracle): default 216 FP / 192 FN over 40,367
+/// matches; `indented` 61 FP / 188 FN; `indented_relative_to_receiver`
+/// 19 FP / 266 FN.
+///
+/// Method: 30 corpus repos cloned at their manifest SHAs (the 22 that carried
+/// the oracle's FP/FN examples plus 8 high-volume clean repos as a regression
+/// guard), both tools run with oracle-identical invocation, diffed on
+/// `(path, line)` exactly as `bench/corpus/diff_results.py` does. The sample
+/// reproduced the oracle's per-repo counts before any change, and ends at
+/// default 0 FP / 0 FN over 8,591 matches, `indented` 2 FP / 3 FN,
+/// `indented_relative_to_receiver` 0 FP / 4 FN.
+///
+/// The recurring theme is that most of this cop's earlier heuristics were
+/// standing in for RuboCop code that ports cleanly once the Prism/parser node
+/// shape differences are spelled out:
+///
+/// * **`UNALIGNED_RHS_TYPES`** is `if while until for return array kwbegin`.
+///   `case` / `case ... in` are NOT members, so `x = case k ... when ... Foo\n
+///   .bar` aligns `.bar` with the `case k` keyword expression. The port broke
+///   the `part_of_assignment_rhs` walk on any control-flow node.
+/// * **Tabs**: `indentation` is `source_line =~ /\S/`, which counts tabs.
+///   `shared::util::indentation_of` counts spaces only, so every continuation
+///   line in a tab-indented file was measured against column 0.
+/// * **`check_hash_pair_indentation`** consults only
+///   `find_hash_pair_alignment_base` (which requires the chain's *base
+///   receiver* to be a hash literal) and `aligned_with_first_line_dot?`. There
+///   is no block-chain escape hatch on that path.
+/// * **`handle_descendant_block`** returns `receiver.call_type? ? receiver :
+///   block_node.parent`. A call carrying a real block is one `CallNode` in
+///   Prism but a `block` node wrapping a `send` in the parser gem, so the
+///   second branch means "align with your own dot" — which is why
+///   `[1, 2].map do ... end\n  .compact` never offends.
+/// * **`each_descendant(:any_block).first` is parser pre-order.** The parser's
+///   `block` node starts at the receiver, so the *outer* block of
+///   `a.reject { ... }.map { ... }` is reached first; Prism's `BlockNode`
+///   spans only the braces, so ordering by start offset picks the inner one.
+/// * **`first_call_has_a_dot`** walks to the chain root through block nodes.
+///   Stopping at a multiline-block receiver hid the base for
+///   `Seq.run(x) do ... end\n.then(y) do ... end`.
+/// * **`left_hand_side`** stops when the current call carries a real block
+///   (its parser parent is the `block` node, not a call), and `indentation(lhs)`
+///   is just that node's start line — no walking up through visually continued
+///   lines, in any `EnforcedStyle`.
+/// * **`not_for_this_cop?`**: `#{ ... }` interpolation is a `begin` node with a
+///   `begin` location, i.e. a grouped expression. Conversely
+///   `inside_arg_list_parentheses?` covers only real `(` argument lists, never
+///   `[]` / `[]=`, in any style.
+/// * **`kw_node_with_special_indentation`** skips ternaries, and
+///   `correct_indentation` adds `Layout/IndentationWidth`'s `Width` only for
+///   *prefix* keywords — `return if cond\n  .chain` gets no extra indent.
+/// * **`method_on_receiver_last_line?(node, base, :array)`** needs the dot on
+///   the array literal's last line.
+/// * **`semantic_alignment_node` order** is `get_dot_right_above ||
+///   find_multiline_block_chain_node || first_call_alignment_node`. Running the
+///   block-chain checks first mis-handles paren-less command chains such as
+///   `@cols\n  .concat ['a'].map { }\n  .concat ['b'].map { }`, where the
+///   second `.concat` is parsed as a call on the first `.map`'s block result.
+///
+/// Messages were wrong at scale and are now ported verbatim: the no-base
+/// message is `"Use E (not U) spaces for indenting <what> spanning multiple
+/// lines."` (never "indentation of a chained method call"), `U` may be
+/// negative, `<what>` comes from `operation_description`, `rhs.source` includes
+/// the call operator (`&.foo`), and `base_source` is the literal first line of
+/// the base range. On the 30-repo sample, message mismatches went from 401 to
+/// 10 (default), 2,876 to 6 (`indented`) and 1,193 to 0
+/// (`indented_relative_to_receiver`).
+///
+/// ### Removed as redundant
+///
+/// The "previous continuation dot anchor" fallback
+/// (`find_previous_continuation_dot_anchor` /
+/// `previous_continuation_anchor_is_valid` / `uses_outer_aligned_fallback_base`)
+/// has no RuboCop counterpart. Once `indentation(lhs)` was correct it returned
+/// the same column as the no-base fallback everywhere the corpus exercises it,
+/// but tagged the offense as an `Align ... with ...` one, so it only ever
+/// corrupted the message. Likewise `find_visual_chain_base_line`,
+/// `find_leading_continuation_ancestor_line`, `find_block_chain_col` and
+/// `hash_pair_value_starts_on_key_line` are gone; the behaviour they
+/// approximated now comes from the ported RuboCop rules. Do not reintroduce
+/// them without corpus evidence.
+///
+/// ### Known remaining divergence on the 30-repo sample
+///
+/// * `EnforcedStyle: indented`, backup/backup `lib/backup/notifier/http_post.rb`
+///   99-104: a hash-pair value whose chain base receiver is a hash literal.
+///   RuboCop takes `check_hash_pair_indented_style`, which sets
+///   `@hash_pair_base_column = pair_key.column + width` and expects
+///   `pair_key.column + 2 * width`; that path is not implemented here (2 FP,
+///   3 FN).
+/// * `EnforcedStyle: indented_relative_to_receiver`, discourse
+///   `app/models/group.rb` 785-788 and `script/build_jsconfig.rb` 35-36: 4 FN,
+///   not yet diagnosed.
+/// * 10 default-style message mismatches where the *column* agrees but the
+///   base node RuboCop names differs (e.g. `::XML` vs `.XML`,
+///   `.permissions` vs `.post`). These are invisible to the corpus oracle,
+///   which keys on `(path, line, cop)`.
 pub struct MultilineMethodCallIndentation;
 
 impl Cop for MultilineMethodCallIndentation {
@@ -344,12 +442,6 @@ enum MsgStyle {
     ReceiverRelative,
 }
 
-#[derive(Clone, Copy)]
-struct AlignedExpectationOptions {
-    allow_previous_continuation: bool,
-    allow_block_chain_alignment: bool,
-}
-
 struct ChainVisitor<'a> {
     cop: &'a MultilineMethodCallIndentation,
     source: &'a SourceFile,
@@ -365,23 +457,14 @@ struct ChainVisitor<'a> {
 }
 
 impl ChainVisitor<'_> {
+    /// RuboCop's `indentation(lhs)`: the indentation of the line that
+    /// `left_hand_side(node.receiver)` starts on. The same for every
+    /// `EnforcedStyle` — there is no walking up through visually continued
+    /// lines anywhere in the mixin.
     fn indented_base_line(&self, call_node: &ruby_prism::CallNode<'_>) -> usize {
-        if self.style == "aligned" {
-            if uses_outer_aligned_fallback_base(call_node, &self.ancestors) {
-                let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
-                let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
-                find_visual_chain_base_line(self.source, lhs_line)
-            } else {
-                let (call_start_line, _) = self
-                    .source
-                    .offset_to_line_col(call_node.location().start_offset());
-                find_visual_chain_base_line(self.source, call_start_line)
-            }
-        } else {
-            let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
-            let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
-            find_leading_continuation_ancestor_line(self.source, lhs_line)
-        }
+        let lhs_start = left_hand_side_start_offset(call_node, &self.ancestors);
+        let (lhs_line, _) = self.source.offset_to_line_col(lhs_start);
+        lhs_line
     }
 
     fn check_call(&mut self, call_node: &ruby_prism::CallNode<'_>) {
@@ -483,8 +566,8 @@ impl ChainVisitor<'_> {
     ) -> usize {
         let base_line = self.indented_base_line(call_node);
         let base_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
-        let base_indent = indentation_of(base_line_bytes);
-        let kw_extra = keyword_extra_indent(self.source, call_node, self.width);
+        let base_indent = line_indentation(base_line_bytes);
+        let kw_extra = keyword_extra_indent(call_node, &self.ancestors);
         base_indent + self.width + kw_extra
     }
 
@@ -501,17 +584,32 @@ impl ChainVisitor<'_> {
     /// `extra_indentation` subtracts the operator length.
     fn expected_relative_to_receiver(
         &self,
-        _call_node: &ruby_prism::CallNode<'_>,
+        call_node: &ruby_prism::CallNode<'_>,
         receiver: &ruby_prism::Node<'_>,
     ) -> usize {
         let splat_adj = splat_operator_length(self.source, receiver);
         let effective_width = self.width.saturating_sub(splat_adj);
+        let (start, _) = self.receiver_alignment_base(call_node, receiver);
+        let (_, base_col) = self.source.offset_to_line_col(start);
+        base_col + effective_width
+    }
 
-        if let Some(base_col) = find_hash_method_base_col(self.source, receiver) {
-            base_col + effective_width
-        } else {
-            find_chain_root_col(self.source, receiver) + effective_width
+    /// RuboCop's `receiver_alignment_base`: the hash/`begin`-method base in the
+    /// receiver chain if there is one, else `first_call_has_a_dot(node).receiver`.
+    /// Returns that range's `(start_offset, end_offset)`.
+    fn receiver_alignment_base(
+        &self,
+        call_node: &ruby_prism::CallNode<'_>,
+        receiver: &ruby_prism::Node<'_>,
+    ) -> (usize, usize) {
+        if let Some(range) = find_hash_method_base_range(self.source, receiver) {
+            return range;
         }
+        if let Some(range) = first_dotted_call_receiver_range(call_node) {
+            return range;
+        }
+        let loc = receiver.location();
+        (loc.start_offset(), loc.end_offset())
     }
 
     fn expected_aligned(
@@ -522,20 +620,9 @@ impl ChainVisitor<'_> {
         rhs_col: usize,
         is_trailing_dot: bool,
     ) -> Option<usize> {
-        self.expected_aligned_impl(
-            call_node,
-            receiver,
-            rhs_line,
-            rhs_col,
-            is_trailing_dot,
-            AlignedExpectationOptions {
-                allow_previous_continuation: true,
-                allow_block_chain_alignment: true,
-            },
-        )
+        self.expected_aligned_impl(call_node, receiver, rhs_line, rhs_col, is_trailing_dot)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn expected_aligned_impl(
         &self,
         call_node: &ruby_prism::CallNode<'_>,
@@ -543,21 +630,34 @@ impl ChainVisitor<'_> {
         rhs_line: usize,
         rhs_col: usize,
         is_trailing_dot: bool,
-        options: AlignedExpectationOptions,
     ) -> Option<usize> {
         if self.in_hash_value {
-            return self.expected_aligned_hash_pair(
-                call_node,
-                receiver,
-                rhs_line,
-                rhs_col,
-                is_trailing_dot,
-            );
+            return self.expected_aligned_hash_pair(call_node, receiver, rhs_col, is_trailing_dot);
+        }
+
+        // RuboCop's `semantic_alignment_node` tries `get_dot_right_above`
+        // FIRST, before any block-chain handling: any *ancestor* whose dot sits
+        // on the line directly above at the same column wins. That ordering
+        // matters for paren-less command chains such as
+        // `@cols\n  .concat ['a'].map { }\n  .concat ['b'].map { }`, where the
+        // second `.concat` is parsed as a call on the first `.map`'s block
+        // result and would otherwise align with `.map`.
+        //
+        // We only accept the dot above when it is NOT in the receiver chain —
+        // receiver chain dots are handled by the normal alignment logic.
+        // Only for `aligned` style — `indented_relative_to_receiver` expects
+        // indent relative to the receiver, not alignment with dots above.
+        if !is_trailing_dot
+            && self.style == "aligned"
+            && has_dot_at_col(self.source, rhs_line.saturating_sub(1), rhs_col)
+            && !is_dot_in_receiver_chain(self.source, receiver, rhs_line - 1, rhs_col)
+        {
+            return Some(rhs_col);
         }
 
         // Try block chain continuation — when receiver is a call with a
         // single-line block, align with the block-bearing call's dot.
-        if options.allow_block_chain_alignment && !is_trailing_dot {
+        if !is_trailing_dot {
             if let Some(col) = find_block_chain_alignment(self.source, call_node, rhs_line) {
                 return Some(col);
             }
@@ -575,27 +675,9 @@ impl ChainVisitor<'_> {
             }
         }
 
-        // RuboCop's `get_dot_right_above`: check if any ancestor (not just
-        // the receiver chain) has a dot on the line directly above at the
-        // same column. This handles cases where the receiver chain goes
-        // through a different AST branch (e.g., `.and` chaining on
-        // `.with_payload` in RSpec matcher chains while `.to` has a dot
-        // directly above). We only accept this when the dot above is NOT
-        // in the receiver chain — receiver chain dots are handled by the
-        // normal alignment logic.
-        // Only for `aligned` style — `indented_relative_to_receiver` expects
-        // indent relative to the receiver, not alignment with dots above.
-        if !is_trailing_dot
-            && self.style == "aligned"
-            && has_dot_at_col(self.source, rhs_line.saturating_sub(1), rhs_col)
-            && !is_dot_in_receiver_chain(self.source, receiver, rhs_line - 1, rhs_col)
-        {
-            return Some(rhs_col);
-        }
-
         if !is_trailing_dot {
             if let Some(col) =
-                find_descendant_block_chain_alignment(self.source, call_node, receiver)
+                find_descendant_block_chain_alignment(self.source, call_node, receiver, rhs_col)
             {
                 return Some(col);
             }
@@ -620,28 +702,6 @@ impl ChainVisitor<'_> {
             return Some(col);
         }
 
-        if options.allow_previous_continuation && !is_trailing_dot {
-            // Try previous continuation dot alignment — when there's a
-            // continuation dot on a previous line in the chain, align with it.
-            if let Some(anchor) =
-                find_previous_continuation_dot_anchor(self.source, receiver, rhs_line)
-            {
-                let anchor_receiver_is_post_multiline_block_call =
-                    call_receiver_is_post_multiline_block_call(self.source, &anchor);
-                let can_use_anchor = anchor_receiver_is_post_multiline_block_call
-                    || !uses_outer_aligned_fallback_base(call_node, &self.ancestors);
-                if can_use_anchor
-                    && (anchor_receiver_is_post_multiline_block_call
-                        || self.previous_continuation_anchor_is_valid(&anchor))
-                {
-                    if let Some(dot_loc) = anchor.call_operator_loc() {
-                        let (_, dot_col) = self.source.offset_to_line_col(dot_loc.start_offset());
-                        return Some(dot_col);
-                    }
-                }
-            }
-        }
-
         if is_trailing_dot {
             return None;
         }
@@ -649,44 +709,16 @@ impl ChainVisitor<'_> {
         None
     }
 
-    fn previous_continuation_anchor_is_valid(&self, call_node: &ruby_prism::CallNode<'_>) -> bool {
-        let receiver = match call_node.receiver() {
-            Some(receiver) => receiver,
-            None => return false,
-        };
-        let dot_loc = match call_node.call_operator_loc() {
-            Some(dot_loc) => dot_loc,
-            None => return false,
-        };
-        let (rhs_line, rhs_col) = self.source.offset_to_line_col(dot_loc.start_offset());
-        let expected = match self.expected_aligned_impl(
-            call_node,
-            &receiver,
-            rhs_line,
-            rhs_col,
-            false,
-            AlignedExpectationOptions {
-                allow_previous_continuation: false,
-                allow_block_chain_alignment: false,
-            },
-        ) {
-            Some(col) => col,
-            None => self.expected_indented(call_node, &receiver),
-        };
-
-        rhs_col == expected
-    }
-
     fn expected_aligned_hash_pair(
         &self,
         call_node: &ruby_prism::CallNode<'_>,
         receiver: &ruby_prism::Node<'_>,
-        rhs_line: usize,
         rhs_col: usize,
         is_trailing_dot: bool,
     ) -> Option<usize> {
-        // Inside a hash pair value: RuboCop uses the chain root's
-        // start column as the alignment base, BUT with escape hatches.
+        // RuboCop's `check_hash_pair_indentation`: the base is
+        // `find_hash_pair_alignment_base(node) || lhs.source_range`, plus the
+        // `aligned_with_first_line_dot?` acceptance. Nothing else.
 
         if !is_trailing_dot {
             // `aligned_with_first_line_dot?`: if the current dot's column
@@ -696,11 +728,10 @@ impl ChainVisitor<'_> {
                 return Some(rhs_col); // Accept — aligned with first line dot
             }
 
-            // Block chain continuation. RuboCop only lets this override the
-            // hash-pair base when the value starts on the key line.
-            if hash_pair_value_starts_on_key_line(self.source, call_node, &self.ancestors)
-                && let Some(col) = find_block_chain_col(self.source, receiver, rhs_line)
-            {
+            // RuboCop's `find_hash_pair_alignment_base`: only when the chain's
+            // base receiver is a hash literal does the pair value align with
+            // the chain's first dot instead of the left-hand side.
+            if let Some(col) = find_hash_pair_alignment_base_col(self.source, call_node) {
                 return Some(col);
             }
         }
@@ -716,8 +747,7 @@ impl ChainVisitor<'_> {
         receiver: &ruby_prism::Node<'_>,
         is_trailing_dot: bool,
     ) -> String {
-        let selector = call_node.name().as_slice();
-        let selector_str = std::str::from_utf8(selector).unwrap_or("?");
+        let selector_str = selector_text(call_node);
 
         let (base_name, base_line) = if self.in_hash_value {
             // In hash pair context, RuboCop uses left_hand_side(node.receiver),
@@ -736,10 +766,17 @@ impl ChainVisitor<'_> {
         if is_trailing_dot {
             format!("Align `{selector_str}` with `{base_name}` on line {base_line}.")
         } else {
-            format!("Align `.{selector_str}` with `{base_name}` on line {base_line}.")
+            // `right_hand_side` is `dot.join(selector)`, so the operator text is
+            // part of the reported source: `&.foo` for safe navigation.
+            let operator = call_operator_text(self.source, call_node);
+            format!("Align `{operator}{selector_str}` with `{base_name}` on line {base_line}.")
         }
     }
 
+    /// RuboCop's `no_base_message`:
+    /// `"Use E (not U) spaces for indenting <what> spanning multiple lines."`
+    /// where `U = rhs.column - indentation(lhs)`, `E = correct_indentation(node)`
+    /// and `<what>` comes from `operation_description`.
     fn indented_message(
         &self,
         call_node: &ruby_prism::CallNode<'_>,
@@ -748,13 +785,13 @@ impl ChainVisitor<'_> {
     ) -> String {
         let base_line = self.indented_base_line(call_node);
         let chain_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
-        let chain_indent = indentation_of(chain_line_bytes);
-        let _ = call_node;
-        format!(
-            "Use {} (not {}) spaces for indentation of a chained method call.",
-            self.width,
-            rhs_col.saturating_sub(chain_indent)
-        )
+        let chain_indent = line_indentation(chain_line_bytes);
+        let expected = self.width + keyword_extra_indent(call_node, &self.ancestors);
+        let what = operation_description(call_node, &self.ancestors);
+        // `rhs.column - indentation(lhs)` is a plain subtraction in RuboCop and
+        // goes negative when the continuation is outdented past its lhs line.
+        let used = rhs_col as isize - chain_indent as isize;
+        format!("Use {expected} (not {used}) spaces for indenting {what} spanning multiple lines.")
     }
 
     /// Message for `indented_relative_to_receiver` style.
@@ -767,23 +804,67 @@ impl ChainVisitor<'_> {
     ) -> String {
         let selector_str = if is_trailing_dot {
             // For trailing dot, the selector (method name) is the RHS
-            let name = call_node.name().as_slice();
-            std::str::from_utf8(name).unwrap_or("?").to_string()
+            selector_text(call_node)
         } else if call_node.message_loc().is_some() {
-            let name = call_node.name().as_slice();
-            format!(".{}", std::str::from_utf8(name).unwrap_or("?"))
+            let operator = call_operator_text(self.source, call_node);
+            format!("{operator}{}", selector_text(call_node))
         } else {
             // Implicit call (proc call) — `a\n  .(args)`
             ".(".to_string()
         };
 
-        let (base_name, base_line) = find_receiver_relative_base_description(self.source, receiver);
+        // RuboCop's `base_source` is `@base.source[/[^\n]*/]` — the literal
+        // first line of the base range, not a reconstruction.
+        let (start, end) = self.receiver_alignment_base(call_node, receiver);
+        let (base_line, _) = self.source.offset_to_line_col(start);
+        let base_name = self
+            .source
+            .try_byte_slice(start, end)
+            .and_then(|text| text.lines().next())
+            .unwrap_or("?")
+            .to_string();
 
         format!(
             "Indent `{selector_str}` {} spaces more than `{base_name}` on line {base_line}.",
             self.width
         )
     }
+}
+
+/// RuboCop's `node.loc.selector` source, i.e. the method-name token alone.
+///
+/// `right_hand_side` reports `dot.join(selector)`, and the parser gem's
+/// `selector` range for an attribute writer (`obj.foo = 1`) covers `foo` only —
+/// the `=` is a separate `loc.operator` token. Prism has no separate operator
+/// location on `CallNode`; `name()` is the full `foo=`, so the trailing `=` has
+/// to come back off or the message reads ``Align `.foo=` `` where RuboCop says
+/// ``Align `.foo` ``. Operator methods that legitimately end in `=` (`==`,
+/// `<=`, `>=`, `!=`, `===`, `[]=`) keep their name: for those the parser's
+/// selector range is the whole operator, and `[]=` cannot reach this message
+/// anyway because `relevant_node?` requires `loc.dot`.
+fn selector_text(call: &ruby_prism::CallNode<'_>) -> String {
+    let name = std::str::from_utf8(call.name().as_slice()).unwrap_or("?");
+    let Some(stem) = name.strip_suffix('=') else {
+        return name.to_string();
+    };
+    if !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || !c.is_ascii())
+    {
+        stem.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The literal call-operator text (`.` or `&.`).
+fn call_operator_text(source: &SourceFile, call_node: &ruby_prism::CallNode<'_>) -> String {
+    call_node
+        .call_operator_loc()
+        .and_then(|loc| source.try_byte_slice(loc.start_offset(), loc.end_offset()))
+        .unwrap_or(".")
+        .to_string()
 }
 
 /// Get the line number of the selector/method name for a call node.
@@ -970,124 +1051,142 @@ fn find_current_node_block_continuation(
     None
 }
 
+/// RuboCop's `handle_descendant_block`: for a block-less call whose first
+/// descendant block is multiline, the alignment node is the receiver when the
+/// receiver is a plain send, and `block_node.parent` otherwise.
+///
+/// Prism caveat: a call carrying a real block is one `CallNode`, so the
+/// "receiver is a block node" case is `receiver` being a call with a real
+/// block. The first descendant block is then the receiver's own block and its
+/// parser parent is the *current* call — i.e. the node aligns with its own
+/// dot, which always accepts. That is why `[1, 2].map do ... end\n  .compact`
+/// is never an offense.
 fn find_descendant_block_chain_alignment(
     source: &SourceFile,
     call_node: &ruby_prism::CallNode<'_>,
     receiver: &ruby_prism::Node<'_>,
+    rhs_col: usize,
 ) -> Option<usize> {
-    let receiver_call = find_descendant_block_chain_call(source, call_node, receiver)?;
+    // `node.block_node` in RuboCop is nil for a block-pass argument (`&:foo`),
+    // so only a real `{}` / `do..end` block diverts to `find_continuation_node`.
+    if has_real_block(call_node) {
+        return None;
+    }
+    if !first_descendant_block_is_multiline(source, &call_node.as_node()) {
+        return None;
+    }
+
+    let receiver_call = receiver.as_call_node()?;
+    if has_real_block(&receiver_call) {
+        return Some(rhs_col);
+    }
+
     let dot_loc = receiver_call.call_operator_loc()?;
     let (_, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
     Some(dot_col)
 }
 
+/// Description-side counterpart of [`find_descendant_block_chain_alignment`].
+/// Only the "receiver is a plain send" branch can produce a message: the other
+/// branch aligns the node with its own dot and therefore never offends.
 fn find_descendant_block_chain_call<'a>(
     source: &SourceFile,
     call_node: &ruby_prism::CallNode<'a>,
     receiver: &ruby_prism::Node<'a>,
 ) -> Option<ruby_prism::CallNode<'a>> {
-    if call_node.block().is_some() {
+    if has_real_block(call_node) {
         return None;
     }
-
-    let receiver_call = receiver.as_call_node()?;
-    if first_descendant_block_is_multiline(source, &call_node.as_node(), receiver) {
-        return Some(receiver_call);
+    if !first_descendant_block_is_multiline(source, &call_node.as_node()) {
+        return None;
     }
-
-    None
+    let receiver_call = receiver.as_call_node()?;
+    if has_real_block(&receiver_call) {
+        return None;
+    }
+    Some(receiver_call)
 }
 
 /// Mirrors RuboCop's `node.each_descendant(:any_block).first` followed by
-/// `block_node&.multiline?` — only the *first* descendant block (in source
-/// order) matters. Parser does not treat a multiline block receiver as this
-/// descendant for calls like `items.map do ... end\n  .compact`, so skip blocks
-/// fully contained by the current call's receiver.
-fn first_descendant_block_is_multiline(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-    receiver: &ruby_prism::Node<'_>,
-) -> bool {
-    let receiver_loc = receiver.location();
-    let skip_receiver_blocks = receiver_is_multiline_block_call(source, receiver);
+/// `block_node&.multiline?` — only the *first* descendant block matters, and
+/// "first" is parser pre-order, not Prism source order.
+///
+/// The parser gem wraps a block-bearing send in a `block` node whose range
+/// starts at the receiver, so `each_descendant` reaches the *outer* block of
+/// `a.reject { ... }.map { ... }` before the inner one. Prism instead hangs a
+/// `BlockNode` (whose range is just the braces) off each `CallNode`, so
+/// ordering by start offset picks the inner `reject` block. This walker
+/// restores parser order: at every call, its own block counts first, then the
+/// receiver, then the arguments. A `LambdaNode` is a `block` node too.
+fn first_descendant_block_is_multiline(source: &SourceFile, node: &ruby_prism::Node<'_>) -> bool {
     struct Finder<'a> {
         source: &'a SourceFile,
-        receiver_start: usize,
-        receiver_end: usize,
-        skip_receiver_blocks: bool,
-        first_offset: Option<usize>,
-        first_is_multiline: bool,
+        at_root: bool,
+        found: Option<bool>,
     }
 
-    impl<'pr> Visit<'pr> for Finder<'_> {
-        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
-            let loc = node.location();
-            let start_offset = loc.start_offset();
-            let end_offset = loc.end_offset();
-            if self.skip_receiver_blocks
-                && start_offset >= self.receiver_start
-                && end_offset <= self.receiver_end
-            {
+    impl Finder<'_> {
+        fn record(&mut self, loc: ruby_prism::Location<'_>) {
+            let (start_line, _) = self.source.offset_to_line_col(loc.start_offset());
+            let (end_line, _) = self.source.offset_to_line_col(loc.end_offset());
+            self.found = Some(start_line != end_line);
+        }
+    }
+
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found.is_some() {
                 return;
             }
-            if self.first_offset.is_none_or(|prior| start_offset < prior) {
-                let (start_line, _) = self.source.offset_to_line_col(start_offset);
-                let (end_line, _) = self.source.offset_to_line_col(end_offset);
-                self.first_offset = Some(start_offset);
-                self.first_is_multiline = start_line != end_line;
+            let was_root = self.at_root;
+            self.at_root = false;
+
+            if !was_root && has_real_block(node) {
+                if let Some(block) = node.block().and_then(|block| block.as_block_node()) {
+                    self.record(block.location());
+                    return;
+                }
             }
 
-            ruby_prism::visit_block_node(self, node);
+            if let Some(receiver) = node.receiver() {
+                self.visit(&receiver);
+            }
+            if self.found.is_some() {
+                return;
+            }
+            if let Some(arguments) = node.arguments() {
+                self.visit_arguments_node(&arguments);
+            }
+            if self.found.is_some() {
+                return;
+            }
+            if let Some(block) = node.block() {
+                self.visit(&block);
+            }
+        }
+
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            self.record(node.location());
+        }
+
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            self.record(node.location());
         }
     }
 
     let mut finder = Finder {
         source,
-        receiver_start: receiver_loc.start_offset(),
-        receiver_end: receiver_loc.end_offset(),
-        skip_receiver_blocks,
-        first_offset: None,
-        first_is_multiline: false,
+        at_root: true,
+        found: None,
     };
     finder.visit(node);
-    finder.first_is_multiline
-}
-
-fn call_receiver_is_post_multiline_block_call(
-    source: &SourceFile,
-    call: &ruby_prism::CallNode<'_>,
-) -> bool {
-    let Some(receiver) = call.receiver() else {
-        return false;
-    };
-
-    receiver_is_multiline_block_call(source, &receiver)
-        || receiver
-            .as_call_node()
-            .and_then(|receiver_call| receiver_call.receiver())
-            .is_some_and(|inner_receiver| receiver_is_multiline_block_call(source, &inner_receiver))
-}
-
-fn hash_pair_value_starts_on_key_line(
-    source: &SourceFile,
-    call_node: &ruby_prism::CallNode<'_>,
-    ancestors: &[ruby_prism::Node<'_>],
-) -> bool {
-    let current = call_node.as_node();
-    for ancestor in ancestors.iter().rev() {
-        let Some(assoc) = ancestor.as_assoc_node() else {
-            continue;
-        };
-        let value = assoc.value();
-        if !node_within_node(&current, &value) {
-            continue;
-        }
-        let (key_line, _) = source.offset_to_line_col(assoc.key().location().start_offset());
-        let (value_line, _) = source.offset_to_line_col(value.location().start_offset());
-        return key_line == value_line;
-    }
-
-    false
+    finder.found.unwrap_or(false)
 }
 
 /// Check if a given line has a `.` or `&.` at a specific column.
@@ -1154,16 +1253,12 @@ fn find_first_dot_alignment(
         first_dot_col,
         _name,
         first_call_start_line,
-        first_call_has_multiline_block,
+        _first_call_has_multiline_block,
     ) = find_first_call_info(source, &receiver)?;
 
     // Check that the first dot is inline (not a continuation dot)
     if is_first_on_line(source, first_dot_offset) {
         return None; // First dot is also a continuation dot — no inline base
-    }
-
-    if first_call_has_multiline_block {
-        return None;
     }
 
     // Check the base receiver type. RuboCop skips if the base receiver is
@@ -1174,9 +1269,12 @@ fn find_first_dot_alignment(
         }
     }
 
-    // For array literal bases, the first dot is valid even on a different line
-    if chain_root_is_array(&receiver) {
-        return Some(first_dot_col);
+    // `method_on_receiver_last_line?(node, base_receiver, :array)` accepts an
+    // array-literal base only when the dot sits on the array's *last* line.
+    if let Some(array_end_line) = chain_root_array_end_line(source, &receiver) {
+        if first_dot_line == array_end_line {
+            return Some(first_dot_col);
+        }
     }
 
     if first_dot_line != first_call_start_line {
@@ -1238,22 +1336,28 @@ fn find_assignment_rhs_base<'a>(
     ancestors: &[ruby_prism::Node<'a>],
 ) -> Option<ruby_prism::Node<'a>> {
     for ancestor in ancestors.iter().rev().skip(1) {
-        if ancestor.as_block_node().is_some() || ancestor.as_begin_node().is_some() {
+        // `part_of_block_body?` and the `kwbegin` member of UNALIGNED_RHS_TYPES.
+        // A `->() {}` literal is a `block` node in the parser gem, so a
+        // `LambdaNode` body stops the walk exactly like a `do ... end` body.
+        if ancestor.as_block_node().is_some()
+            || ancestor.as_lambda_node().is_some()
+            || ancestor.as_begin_node().is_some()
+        {
             break;
         }
-        // Conditional/loop branches reset the alignment base — RuboCop does
-        // not pull the assignment RHS through into a branch body, even when
-        // the assignment value is `if cond ... end.method`.
-        if is_control_flow_expression(ancestor) {
+        // Mirrors RuboCop's `disqualified_rhs?` / `UNALIGNED_RHS_TYPES`: an
+        // `if`/`unless`/`while`/`until`/`for`/`return`/array/`begin` ancestor
+        // resets the alignment base, so a chain in a conditional branch keeps
+        // its branch-local alignment even when the branch is an assignment
+        // value. `case`/`case ... in` are deliberately absent from that list,
+        // so `x = case k ... when ... Foo\n  .bar` still aligns with `case k`.
+        if is_unaligned_rhs_type(ancestor) {
             break;
         }
 
         let Some(value) = assignment_rhs_node(ancestor) else {
             continue;
         };
-        if is_control_flow_expression(&value) {
-            continue;
-        }
         if node_within_node(current, &value) {
             return Some(value);
         }
@@ -1370,45 +1474,120 @@ fn assignment_rhs_node<'a>(node: &ruby_prism::Node<'a>) -> Option<ruby_prism::No
     None
 }
 
-fn is_control_flow_expression(node: &ruby_prism::Node<'_>) -> bool {
+/// Leading-whitespace width of a line, counting tabs as one column each.
+///
+/// RuboCop's `MultilineExpressionIndentation#indentation` is
+/// `node.source_range.source_line =~ /\S/`, which counts every leading
+/// whitespace character. `shared::util::indentation_of` counts spaces only and
+/// therefore returns 0 on tab-indented files, which made every continuation
+/// line in such files look over-indented by its whole leading-tab run.
+fn line_indentation(line: &[u8]) -> usize {
+    line.iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count()
+}
+
+/// Mirrors RuboCop's `MultilineExpressionIndentation::UNALIGNED_RHS_TYPES`
+/// (`if while until for return array kwbegin`). `unless` is an `if` node in
+/// the parser gem, and `kwbegin` is Prism's `BeginNode`. `case` / `case ... in`
+/// are intentionally *not* members: RuboCop happily pulls the assignment RHS
+/// base through a `case` into its `when` branches.
+fn is_unaligned_rhs_type(node: &ruby_prism::Node<'_>) -> bool {
     node.as_if_node().is_some()
         || node.as_unless_node().is_some()
-        || node.as_case_node().is_some()
-        || node.as_case_match_node().is_some()
         || node.as_while_node().is_some()
         || node.as_until_node().is_some()
         || node.as_for_node().is_some()
+        || node.as_return_node().is_some()
+        || node.as_array_node().is_some()
+}
+
+/// RuboCop's `operation_description`: the tail of `no_base_message`.
+fn operation_description(
+    call_node: &ruby_prism::CallNode<'_>,
+    ancestors: &[ruby_prism::Node<'_>],
+) -> String {
+    let current = call_node.as_node();
+    if let Some(keyword) = find_special_indentation_keyword(&current, ancestors) {
+        let kind = if keyword == "for" {
+            "collection"
+        } else {
+            "condition"
+        };
+        let article = if keyword.starts_with('i') || keyword.starts_with('u') {
+            "an"
+        } else {
+            "a"
+        };
+        return format!("a {kind} in {article} `{keyword}` statement");
+    }
+
+    if find_assignment_rhs_base(&current, ancestors).is_some() {
+        return "an expression in an assignment".to_string();
+    }
+
+    "an expression".to_string()
+}
+
+/// The keyword of the `kw_node_with_special_indentation` ancestor, if any.
+fn find_special_indentation_keyword(
+    current: &ruby_prism::Node<'_>,
+    ancestors: &[ruby_prism::Node<'_>],
+) -> Option<String> {
+    let (_, keyword, _) = find_keyword_expression_ancestor(current, ancestors)?;
+    Some(keyword)
 }
 
 fn find_keyword_expression_base<'a>(
     current: &ruby_prism::Node<'a>,
     ancestors: &[ruby_prism::Node<'a>],
 ) -> Option<ruby_prism::Node<'a>> {
+    find_keyword_expression_ancestor(current, ancestors).map(|(expression, _, _)| expression)
+}
+
+/// RuboCop's `kw_node_with_special_indentation`: the innermost `for`/`if`/
+/// `while`/`until`/`return` ancestor whose `indented_keyword_expression`
+/// contains `current`, together with that node's keyword text. Ternaries are
+/// skipped.
+fn find_keyword_expression_ancestor<'a>(
+    current: &ruby_prism::Node<'a>,
+    ancestors: &[ruby_prism::Node<'a>],
+) -> Option<(ruby_prism::Node<'a>, String, bool)> {
     for ancestor in ancestors.iter().rev().skip(1) {
         if let Some(node) = ancestor.as_if_node() {
+            // `kw_node_with_special_indentation` skips ternaries outright.
+            if crate::cop::shared::util::is_ternary(&node) {
+                continue;
+            }
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                let keyword = node
+                    .if_keyword_loc()
+                    .and_then(|loc| String::from_utf8(loc.as_slice().to_vec()).ok())
+                    .unwrap_or_else(|| "if".to_string());
+                let postfix = crate::cop::shared::util::is_modifier_if(&node);
+                return Some((predicate, keyword, postfix));
             }
         } else if let Some(node) = ancestor.as_unless_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                let postfix = crate::cop::shared::util::is_modifier_unless(&node);
+                return Some((predicate, "unless".to_string(), postfix));
             }
         } else if let Some(node) = ancestor.as_while_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                return Some((predicate, "while".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_until_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                return Some((predicate, "until".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_for_node() {
             let collection = node.collection();
             if node_within_node(current, &collection) {
-                return Some(collection);
+                return Some((collection, "for".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_return_node() {
             let Some(arguments) = node.arguments() else {
@@ -1418,7 +1597,7 @@ fn find_keyword_expression_base<'a>(
                 continue;
             };
             if node_within_node(current, &first_argument) {
-                return Some(first_argument);
+                return Some((first_argument, "return".to_string(), false));
             }
         }
     }
@@ -1523,42 +1702,6 @@ fn prev_line_ends_with_assignment(source: &SourceFile, receiver: &ruby_prism::No
     }
 }
 
-/// Find the earliest previous continuation-dot call in the receiver chain.
-/// A continuation dot is one that is the first non-whitespace on its line, or
-/// an inline post-block call like `end.compact` that RuboCop can use as the
-/// next chain anchor.
-fn find_previous_continuation_dot_anchor<'a>(
-    source: &SourceFile,
-    receiver: &ruby_prism::Node<'a>,
-    current_line: usize,
-) -> Option<ruby_prism::CallNode<'a>> {
-    if let Some(call) = receiver.as_call_node() {
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (dot_line, _dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            if dot_line < current_line
-                && (is_first_on_line(source, dot_loc.start_offset())
-                    || call_receiver_is_post_multiline_block_call(source, &call))
-            {
-                // Found a continuation dot on an earlier line.
-                // Check if there's an even earlier one to use as the alignment base.
-                if let Some(recv) = call.receiver() {
-                    if let Some(earlier) =
-                        find_previous_continuation_dot_anchor(source, &recv, dot_line)
-                    {
-                        return Some(earlier);
-                    }
-                }
-                return Some(call);
-            }
-            // Dot is inline or on same line; keep looking
-            if let Some(recv) = call.receiver() {
-                return find_previous_continuation_dot_anchor(source, &recv, current_line);
-            }
-        }
-    }
-    None
-}
-
 /// RuboCop's `left_hand_side(node.receiver)` climbs parent send nodes, not just
 /// the receiver chain. This matters for matcher chains nested inside
 /// non-parenthesized arguments such as:
@@ -1603,6 +1746,13 @@ fn left_hand_side_start_offset(
             }
 
             lhs_start = call.location().start_offset();
+            // A call carrying a real block is wrapped in a `block` node by the
+            // parser gem, so `lhs.parent` there is not a call and RuboCop's
+            // `left_hand_side` loop stops. Prism keeps the block on the
+            // `CallNode`, so the stop has to be spelled out.
+            if has_real_block(&call) {
+                break;
+            }
             continue;
         }
 
@@ -1614,42 +1764,6 @@ fn left_hand_side_start_offset(
     }
 
     lhs_start
-}
-
-fn uses_outer_aligned_fallback_base(
-    call_node: &ruby_prism::CallNode<'_>,
-    ancestors: &[ruby_prism::Node<'_>],
-) -> bool {
-    if call_node.receiver().is_none() {
-        return false;
-    };
-
-    let current_loc = call_node.location();
-    let mut started = false;
-
-    for ancestor in ancestors.iter().rev() {
-        if !started {
-            if ancestor.as_call_node().is_some_and(|call| {
-                let loc = call.location();
-                loc.start_offset() == current_loc.start_offset()
-                    && loc.end_offset() == current_loc.end_offset()
-            }) {
-                started = true;
-            }
-            continue;
-        }
-
-        if ancestor.as_arguments_node().is_some() {
-            continue;
-        }
-
-        return ancestor.as_call_node().is_some_and(|call| {
-            call.call_operator_loc().is_some()
-                && !method_identifier_predicates::is_assignment_method(call.name().as_slice())
-        });
-    }
-
-    false
 }
 
 fn find_left_hand_side_description(
@@ -1687,12 +1801,8 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
 
         // RuboCop only skips actual parenthesized arg lists here. Prism also
         // reports `opening_loc` for `[]`/`[]=`, but square brackets do not
-        // suppress this cop.
-        let has_parens = if self.style == "aligned" {
-            call_has_parenthesized_args(node)
-        } else {
-            node.opening_loc().is_some()
-        };
+        // suppress this cop, in any `EnforcedStyle`.
+        let has_parens = call_has_parenthesized_args(node);
         if let Some(args) = node.arguments() {
             if has_parens {
                 let saved_paren = self.in_paren_args;
@@ -1720,6 +1830,18 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
         self.in_paren_args = saved_paren;
     }
 
+    fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
+        // `#{ ... }` is a `begin` node with a `begin` location in the parser
+        // gem, so `not_for_this_cop?`'s `grouped_expression?` skips chains
+        // inside string / heredoc / symbol interpolation.
+        let saved_paren = self.in_paren_args;
+        self.in_paren_args = true;
+        if let Some(statements) = node.statements() {
+            self.visit_statements_node(&statements);
+        }
+        self.in_paren_args = saved_paren;
+    }
+
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
         // Visit key normally
         self.visit(&node.key());
@@ -1736,24 +1858,40 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
 /// Block chain alignment ONLY (no continuation dot search). Used for hash
 /// pair values where continuation dot alignment is NOT wanted, but block
 /// chain continuation IS.
-fn find_block_chain_col(
+/// RuboCop's `find_hash_pair_alignment_base`: inside a hash pair value the
+/// alignment base is the chain's first dotted call *only* when the chain's
+/// base receiver is a hash literal; otherwise the base is the left-hand side.
+///
+/// There is no block-chain escape hatch on this path — `check_hash_pair_indentation`
+/// consults `find_hash_pair_alignment_base` and `aligned_with_first_line_dot?`
+/// and nothing else, so `prev: @ivar\n  .select { }\n  .collect { }` keeps
+/// reporting every continuation line against the `@ivar` column.
+fn find_hash_pair_alignment_base_col(
     source: &SourceFile,
-    receiver: &ruby_prism::Node<'_>,
-    current_dot_line: usize,
+    call_node: &ruby_prism::CallNode<'_>,
 ) -> Option<usize> {
-    if let Some(call) = receiver.as_call_node() {
-        if has_real_block(&call) {
-            if let Some(dot_loc) = call.call_operator_loc() {
-                let (dot_line, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-                let loc = call.location();
-                let (end_line, _) = source.offset_to_line_col(loc.end_offset());
-                if dot_line == end_line && dot_line < current_dot_line {
-                    return Some(dot_col);
-                }
-            }
-        }
+    let receiver = call_node.receiver()?;
+    if !chain_base_receiver_is_hash(&receiver) {
+        return None;
     }
-    None
+    // `first_call_has_a_dot(node)` starts at the node itself, so for
+    // `{ ... }\n  .merge(x)` the first dotted call is `.merge`, not something
+    // in the (dot-less) receiver.
+    let (_, col, _) = find_first_call_dot(source, &call_node.as_node())?;
+    Some(col)
+}
+
+/// RuboCop's `find_base_receiver(...).hash_type?`: walk `.receiver` down to the
+/// chain root and report whether that root is a hash literal (`{ ... }` or a
+/// braceless keyword hash, both `:hash` in the parser gem).
+fn chain_base_receiver_is_hash(node: &ruby_prism::Node<'_>) -> bool {
+    if let Some(call) = node.as_call_node() {
+        return match call.receiver() {
+            Some(receiver) => chain_base_receiver_is_hash(&receiver),
+            None => false,
+        };
+    }
+    node.as_hash_node().is_some() || node.as_keyword_hash_node().is_some()
 }
 
 /// RuboCop's `aligned_with_first_line_dot?`: check whether the first call
@@ -1768,10 +1906,18 @@ fn has_matching_dot_on_line(
     if let Some((fc_line, fc_col, fc_offset)) = first_call_dot {
         // Check `first_call == node.receiver`: if the first call's dot
         // belongs to the direct receiver, skip (return false).
+        //
+        // Prism caveat: a call with a real block is one `CallNode`, while the
+        // parser gem wraps the send in a `block` node. When the receiver
+        // carries a block, RuboCop's `node.receiver` is that block node and
+        // therefore never equal to the `send` returned by
+        // `first_call_has_a_dot`, so the identity check must not fire.
         if let Some(call) = receiver.as_call_node() {
-            if let Some(dot_loc) = call.call_operator_loc() {
-                if dot_loc.start_offset() == fc_offset {
-                    return false;
+            if !has_real_block(&call) {
+                if let Some(dot_loc) = call.call_operator_loc() {
+                    if dot_loc.start_offset() == fc_offset {
+                        return false;
+                    }
                 }
             }
         }
@@ -1818,10 +1964,12 @@ fn find_first_call_info(
 ) -> Option<(usize, usize, usize, String, usize, bool)> {
     if let Some(call) = node.as_call_node() {
         if let Some(recv) = call.receiver() {
-            if !receiver_is_multiline_block_call(source, &recv) {
-                if let Some(deeper) = find_first_call_info(source, &recv) {
-                    return Some(deeper);
-                }
+            // RuboCop's `first_call_has_a_dot` walks all the way down to the
+            // chain root (`find_base_receiver` sees through block nodes) and
+            // then climbs back up to the first node carrying a dot, so a
+            // multiline block on an intermediate call does not stop the walk.
+            if let Some(deeper) = find_first_call_info(source, &recv) {
+                return Some(deeper);
             }
         }
         if let Some(dot_loc) = call.call_operator_loc() {
@@ -1878,81 +2026,42 @@ fn chain_root_is_paren(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Opti
 }
 
 /// Check if the chain root is an array literal.
-fn chain_root_is_array(node: &ruby_prism::Node<'_>) -> bool {
+/// Last line of the chain root when that root is an array literal, else `None`.
+fn chain_root_array_end_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Option<usize> {
     if let Some(call) = node.as_call_node() {
         if let Some(recv) = call.receiver() {
-            return chain_root_is_array(&recv);
+            return chain_root_array_end_line(source, &recv);
         }
     }
-    node.as_array_node().is_some()
+    let array = node.as_array_node()?;
+    let (end_line, _) = source.offset_to_line_col(array.location().end_offset());
+    Some(end_line)
 }
 
 /// Check if the chain root is inside a keyword expression and return extra indent.
+/// `Layout/IndentationWidth`'s `Width`, which RuboCop's `correct_indentation`
+/// adds on top of this cop's own `IndentationWidth` for prefix keywords.
+const LAYOUT_INDENTATION_WIDTH: usize = 2;
+
+/// RuboCop's `correct_indentation`: this cop's `IndentationWidth` plus
+/// `Layout/IndentationWidth`'s own `Width` when the node sits in the condition
+/// (or collection) of a *prefix* keyword. Postfix conditionals ("next if foo &&
+/// \n  bar") get no such "special indentation".
 fn keyword_extra_indent(
-    source: &SourceFile,
     call_node: &ruby_prism::CallNode<'_>,
-    _width: usize,
+    ancestors: &[ruby_prism::Node<'_>],
 ) -> usize {
-    let receiver = match call_node.receiver() {
-        Some(r) => r,
-        None => return 0,
-    };
-    let Some(dot_loc) = call_node.call_operator_loc() else {
-        return 0;
-    };
-    if chain_starts_from_completed_keyword_receiver(source, &receiver, dot_loc.start_offset()) {
-        return 0;
-    }
-    let chain_start_line = find_chain_start_line(source, &receiver);
-    let chain_line_bytes = source.lines().nth(chain_start_line - 1).unwrap_or(b"");
-    let trimmed = chain_line_bytes
-        .iter()
-        .skip_while(|&&b| b == b' ' || b == b'\t');
-    let text: Vec<u8> = trimmed.copied().collect();
-    let keywords: &[&[u8]] = &[
-        b"return ", b"return(", b"if ", b"while ", b"until ", b"for ", b"unless ",
-    ];
-    for kw in keywords {
-        if text.starts_with(kw) {
-            return 2;
+    let current = call_node.as_node();
+    match find_keyword_expression_ancestor(&current, ancestors) {
+        Some((_, _, postfix)) => {
+            if postfix {
+                0
+            } else {
+                LAYOUT_INDENTATION_WIDTH
+            }
         }
+        None => 0,
     }
-    0
-}
-
-fn chain_starts_from_completed_keyword_receiver(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-    current_dot_offset: usize,
-) -> bool {
-    let Some(root_end_line) = completed_keyword_receiver_end_line(source, node) else {
-        return false;
-    };
-    let (dot_line, _) = source.offset_to_line_col(current_dot_offset);
-    dot_line > root_end_line
-}
-
-fn completed_keyword_receiver_end_line(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-) -> Option<usize> {
-    if let Some(call) = node.as_call_node() {
-        if let Some(recv) = call.receiver() {
-            return completed_keyword_receiver_end_line(source, &recv);
-        }
-    }
-
-    let is_keyword_receiver = node.as_if_node().is_some()
-        || node.as_unless_node().is_some()
-        || node.as_while_node().is_some()
-        || node.as_until_node().is_some()
-        || node.as_for_node().is_some();
-    if !is_keyword_receiver {
-        return None;
-    }
-
-    let (end_line, _) = source.offset_to_line_col(node.location().end_offset());
-    Some(end_line)
 }
 
 /// Find the start column of the chain root (deepest receiver).
@@ -2002,161 +2111,48 @@ fn splat_operator_length(source: &SourceFile, receiver: &ruby_prism::Node<'_>) -
     0
 }
 
-/// RuboCop's `find_hash_method_base_in_receiver_chain` for
-/// `indented_relative_to_receiver` style.
-///
-/// Walks the receiver chain downward. For each call node, checks if its
-/// receiver is:
-/// 1. A hash literal (`HashNode`) → return that call's dot column
-/// 2. A parenthesized expression (`ParenthesesNode`) where the dot is on
-///    the same line as the closing paren → return that call's dot column
-///
-/// This handles patterns like:
-/// ```ruby
-/// { a: 1, b: 2 }.keys     # base = `.keys` dot
-///                  .first  # indented relative to `.keys`
-///
-/// (date_columns + cols).uniq    # base = `.uniq` dot
-///                        .each  # indented relative to `.uniq`
-/// ```
-fn find_hash_method_base_col(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Option<usize> {
-    let call = node.as_call_node()?;
-    let recv = call.receiver()?;
-
-    // Check if receiver is a hash literal (HashNode or KeywordHashNode —
-    // RuboCop's `hash_type?` matches both)
-    if recv.as_hash_node().is_some() || recv.as_keyword_hash_node().is_some() {
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (_, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            return Some(dot_col);
+/// RuboCop's `first_call_has_a_dot(node).receiver` as a `(start, end)` range.
+fn first_dotted_call_receiver_range(node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+    let receiver = node.receiver()?;
+    if let Some(receiver_call) = receiver.as_call_node() {
+        if let Some(deeper) = first_dotted_call_receiver_range(&receiver_call) {
+            return Some(deeper);
         }
     }
-    // Check if receiver is a parenthesized expression with dot on
-    // the same line as the closing paren
-    if recv.as_parentheses_node().is_some() {
-        let (recv_end_line, _) = source.offset_to_line_col(recv.location().end_offset());
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (dot_line, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            if dot_line == recv_end_line {
-                return Some(dot_col);
-            }
-        }
+    if node.call_operator_loc().is_some() {
+        let loc = receiver.location();
+        return Some((loc.start_offset(), loc.end_offset()));
     }
-
-    // Recurse into receiver chain
-    find_hash_method_base_col(source, &recv)
+    None
 }
 
-/// Build base description for `indented_relative_to_receiver` messages.
-///
-/// Returns (base_source_text, base_line) matching RuboCop's `base_source`
-/// which is `@base.source[/[^\n]*/]` — the first line of the base range.
-///
-/// For hash/paren chains, the base is the dot+selector (e.g., `.keys`).
-/// For normal chains, the base is the chain root (e.g., `Thing`).
-fn find_receiver_relative_base_description(
-    source: &SourceFile,
-    receiver: &ruby_prism::Node<'_>,
-) -> (String, usize) {
-    // Check for hash/paren method base first
-    if let Some((desc, line)) = find_hash_method_base_description(source, receiver) {
-        return (desc, line);
-    }
-
-    // Normal chain: base is the chain root receiver
-    find_chain_root_description(source, receiver)
-}
-
-/// Build description for hash/paren method base.
-/// Walks receiver chain looking for hash/paren receivers (same logic as
-/// `find_hash_method_base_col`), returns the dot+selector text.
-fn find_hash_method_base_description(
+/// RuboCop's `find_hash_method_base_in_receiver_chain` as a `(start, end)`
+/// range covering `dot.join(selector)`.
+fn find_hash_method_base_range(
     source: &SourceFile,
     node: &ruby_prism::Node<'_>,
-) -> Option<(String, usize)> {
+) -> Option<(usize, usize)> {
     let call = node.as_call_node()?;
     let recv = call.receiver()?;
 
     let is_hash = recv.as_hash_node().is_some() || recv.as_keyword_hash_node().is_some();
-    let is_paren_same_line = if recv.as_parentheses_node().is_some() {
-        if let Some(dot_loc) = call.call_operator_loc() {
+    let is_paren_same_line = recv.as_parentheses_node().is_some()
+        && call.call_operator_loc().is_some_and(|dot_loc| {
             let (recv_end_line, _) = source.offset_to_line_col(recv.location().end_offset());
             let (dot_line, _) = source.offset_to_line_col(dot_loc.start_offset());
             dot_line == recv_end_line
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+        });
 
     if is_hash || is_paren_same_line {
-        let name = std::str::from_utf8(call.name().as_slice()).unwrap_or("?");
         if let Some(dot_loc) = call.call_operator_loc() {
-            let (line, _) = source.offset_to_line_col(dot_loc.start_offset());
-            return Some((format!(".{name}"), line));
+            let end = call
+                .message_loc()
+                .map_or_else(|| dot_loc.end_offset(), |loc| loc.end_offset());
+            return Some((dot_loc.start_offset(), end));
         }
     }
 
-    // Recurse into receiver chain
-    find_hash_method_base_description(source, &recv)
-}
-
-/// Walk backwards from a given line to find the first line that is not part of
-/// the same visual chain. Continuations can be expressed either with a leading
-/// dot on the current line (`.bar`) or a trailing dot on the previous one
-/// (`foo.` followed by `bar`).
-fn find_visual_chain_base_line(source: &SourceFile, start_line: usize) -> usize {
-    let lines: Vec<&[u8]> = source.lines().collect();
-    let mut line = start_line;
-    while line > 1 && line <= lines.len() {
-        let current_is_leading_continuation = line_starts_with_dot(lines[line - 1]);
-        let previous_has_trailing_dot = line_ends_with_dot(lines[line - 2]);
-        if !(current_is_leading_continuation || previous_has_trailing_dot) {
-            break;
-        }
-        line -= 1;
-    }
-    line
-}
-
-/// Walk backwards from a given line to find the first line that does not begin
-/// with a continuation dot. This matches the older behavior used by the
-/// non-default styles, which still depend on the narrower receiver-chain walk.
-fn find_leading_continuation_ancestor_line(source: &SourceFile, start_line: usize) -> usize {
-    let lines: Vec<&[u8]> = source.lines().collect();
-    let mut line = start_line;
-    while line >= 1 {
-        if line > lines.len() {
-            break;
-        }
-        if !line_starts_with_dot(lines[line - 1]) {
-            break;
-        }
-        if line <= 1 {
-            break;
-        }
-        line -= 1;
-    }
-    line
-}
-
-fn line_starts_with_dot(line_bytes: &[u8]) -> bool {
-    let trimmed: Vec<u8> = line_bytes
-        .iter()
-        .copied()
-        .skip_while(|&b| b == b' ' || b == b'\t')
-        .collect();
-    trimmed.starts_with(b".") || trimmed.starts_with(b"&.")
-}
-
-fn line_ends_with_dot(line_bytes: &[u8]) -> bool {
-    line_bytes
-        .iter()
-        .rev()
-        .copied()
-        .find(|&b| b != b' ' && b != b'\t' && b != b'\r')
-        == Some(b'.')
+    find_hash_method_base_range(source, &recv)
 }
 
 fn find_chain_start_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -> usize {
@@ -2218,10 +2214,10 @@ fn find_alignment_base_description(
             _,
             name,
             _,
-            first_call_has_multiline_block,
+            _first_call_has_multiline_block,
         )) = find_first_call_info(source, receiver)
         {
-            if !is_first_on_line(source, first_dot_offset) && !first_call_has_multiline_block {
+            if !is_first_on_line(source, first_dot_offset) {
                 // First dot is inline — use it as alignment base description
                 return (format!(".{name}"), first_dot_line);
             }

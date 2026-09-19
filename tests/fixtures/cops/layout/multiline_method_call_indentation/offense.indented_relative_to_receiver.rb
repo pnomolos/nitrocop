@@ -63,8 +63,14 @@ a
  .(args)
 
 # Trailing-dot setter call: still indented relative to the receiver
-# nitrocop-expect: 57:6 Layout/MultilineMethodCallIndentation: Indent `nonce_name=` 2 spaces more than `described_class` on line 56.
+# nitrocop-expect: 57:6 Layout/MultilineMethodCallIndentation: Indent `nonce_name` 2 spaces more than `described_class` on line 56.
 trigger = proc do
   described_class.new(url: url, inputs: { name: 'value' }).
       nonce_name = 'stuff'
 end
+
+# `base_source` is the literal first line of the base range, so the whole
+# argument list shows up, not a reconstruction.
+# nitrocop-expect: 63:1 Layout/MultilineMethodCallIndentation: Indent `.collect` 2 spaces more than `answer_options(answer, course)` on line 62.
+answer_options(answer, course)
+ .collect { |o| o }
