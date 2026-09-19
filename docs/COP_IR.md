@@ -1,10 +1,12 @@
 # Cop IR (schema v1) — reference
 
-> **Experimental.** Nothing loads IR cops at runtime yet. This PR ships the
-> document schema (`src/cop/ir/schema.rs`), a fail-closed loader
-> (`src/cop/ir/load.rs`), the JSON Schema (`scripts/shared/ir_schema.json`) and
-> `nitrocop --validate-ir`. The expression compiler, the `Cop` implementation,
-> registry integration and user-cop discovery land in later PRs.
+> **Experimental.** Nothing loads IR cops at runtime yet. What exists today is
+> the document schema (`src/cop/ir/schema.rs`), a fail-closed loader
+> (`src/cop/ir/load.rs`), the expression compiler (`src/cop/ir/expr.rs`) and
+> evaluator (`src/cop/ir/eval.rs`), the JSON Schema
+> (`scripts/shared/ir_schema.json`) and `nitrocop --validate-ir`. The `Cop`
+> implementation, registry integration and user-cop discovery land in later
+> PRs.
 
 A cop IR document is one YAML file per cop, conventionally `<Name>.cop.yml`. It
 is `meta` + `config` declarations + named `matchers` (verbatim upstream
@@ -71,8 +73,12 @@ matchers:
 ```
 
 Patterns are **copied verbatim from upstream, never synthesized**; each is
-checked with nitrocop's NodePattern parser at load. A name may not be declared
-as both a matcher and a predicate.
+fully compiled at load (`CompiledPattern::compile_with`), so an unresolvable
+`#helper`, `%param` or `pred?` is a load error rather than a silent `true`.
+Matchers are compiled in name order and each sees the ones before it as
+`#helper` targets, which makes the pattern reference graph acyclic by
+construction; declaring more capture names than the pattern has `$` slots is an
+error. A name may not be declared as both a matcher and a predicate.
 
 ## `hooks:`
 
@@ -107,19 +113,123 @@ declared config keys. Every placeholder must resolve; a bare `%` is an error
 
 ## Expressions (`when:`, `bind:`, `predicates[].expr`)
 
-Schema v1 keeps expressions as structured-but-untyped YAML; the typed `Expr`
-enum arrives with the compiler PR. The loader still enforces the shape:
+`load_str` compiles every expression into the typed `Expr` tree of design §2.1
+(`src/cop/ir/expr.rs`); `IrCop::compiled` carries the result. The language is
+**total by construction**: no recursion (the `matches:` graph between named
+predicates is checked to be a DAG), no user-defined functions, and the only
+iteration is the bounded quantifier family. Operator nesting is capped at 6
+levels.
 
-* a **scalar** is a literal (`"is_a?"`, `3`, `true`) or a path reference —
-  `node`, `parent`, `$capture[.attr]*`, `cfg.<Key>`, `bind.<Name>`,
-  `consts.<Table>`. References must resolve to something declared; anything that
-  does not look like a reference is a string literal;
-* a **mapping** is an operator application with exactly one key, drawn from
-  `all any not eq ne lt le gt ge in if lit lookup attr pred matches regex any_of
-  all_of none_of count`;
-* a **sequence** is an operand list;
-* operator nesting is capped at 6 levels, so the language cannot drift into a
-  programming language by accretion.
+### Operands
+
+* A **scalar** is either a literal or a path reference:
+  * `true`, `false`, `3`, `null` — literals;
+  * `:sym` — a symbol literal;
+  * `node`, `parent`, `$capture`, a quantifier's `var:` name — a node value,
+    optionally followed by `.attr` segments (see the attribute table);
+  * `cfg.<Key>`, `bind.<Name>`, `consts.<Table>` — exactly two segments, the
+    second naming a declared key. Undeclared names are a load error;
+  * anything else is a string literal (`"is_a?"`, `"block_argument?"`). Wrap a
+    string that would otherwise read as a reference in `{ lit: … }`.
+* A **sequence** is an operand list, never an expression in its own right.
+* A **mapping** is a single-key operator application.
+
+`bind:` entries see only the binds declared **before** them, so a forward or
+self reference is a load error.
+
+### Operator grammar
+
+| Operator | Operand shape | Result |
+|---|---|---|
+| `all` | expr list | bool — every operand truthy |
+| `any` | expr list | bool — some operand truthy |
+| `not` | 1 expr | bool |
+| `eq`, `ne` | 2 exprs | bool |
+| `lt`, `le`, `gt`, `ge` | 2 exprs | bool |
+| `in` | `[expr, [expr, …]]` | bool — `eq` against any member |
+| `if` | 3 exprs (cond, then, else) | the taken branch's value |
+| `lit` | 1 scalar | that literal, never a reference |
+| `lookup` | `[consts.<Table>, expr]` | the table's value, or `nil` |
+| `attr` | `[expr, "<attr>"]`, or `[expr, "arg", <int>]` | see attribute table |
+| `pred` | `[expr, "<name>", <arg>…]` | bool |
+| `matches` | `[expr, "<matcher or predicate>"]` | bool |
+| `regex` | `[expr, "<source>"]` or `[expr, "<source>", "<imx flags>"]` | bool |
+| `any_of`, `all_of`, `none_of` | quantifier mapping | bool |
+| `count` | quantifier mapping | int — matching elements |
+
+Comparison rules: two nodes compare by byte range (identity, which is what `==`
+on Parser nodes means); ints, bools and `nil` compare by value; anything else
+that has a text form — strings, symbols, and a node's source — compares
+bytewise. Operands with no common form are only ever `ne`.
+
+Truthiness follows Ruby: only `nil` and `false` are falsey.
+
+### `pred:` names
+
+`pred:` resolves against the NodePattern builtin registry
+(`src/node_pattern/predicates.rs`, ~80 entries), with the declared arity
+enforced at load (`Arity`) and an unknown name rejected (`UnknownPredicate`).
+Four spellings the registry deliberately omits are compiled directly instead:
+
+| Name | Meaning |
+|---|---|
+| `type?(t, …)` | the node answers to any of those Parser types, groups included |
+| `<t>_type?` | `type?(t)` |
+| `root?` | no enclosing node |
+| `value_used?` | conservative reading of `node.rb:704-721`: a statement that is not the last of its `StatementsNode` is unused, anything else is assumed used |
+
+### Quantifiers
+
+```yaml
+when:
+  any_of:
+    of: node                 # optional subject, defaults to `node`
+    over: args               # args | children | ancestors | descendants(N)
+    var: a                   # bound to each element inside `body:`
+    body: { eq: [a.type, "int"] }
+```
+
+`over:` collections:
+
+| Name | Elements |
+|---|---|
+| `args` | the subject call's arguments |
+| `children` | direct children, source order (`descendants(1)`) |
+| `ancestors` | enclosing nodes, innermost first |
+| `descendants` / `descendants(N)` | every node at most `N` levels below; `N` defaults to and is capped at 8 |
+
+Prism traverses its synthetic `ArgumentsNode` wrapper transparently, so a
+call's `children` are its receiver, its individual arguments and its block —
+not an arguments wrapper.
+
+### Attributes
+
+Applied with `.name` in a path, or with `{ attr: [<expr>, "<name>"] }`. An
+attribute of a non-node, or one the node does not have, is `nil`.
+
+| Attribute | Applies to | Result |
+|---|---|---|
+| `method_name` | call, def | symbol — the callee/definition name |
+| `name` | call, def, const, local/ivar/cvar/gvar, symbol | symbol |
+| `receiver` | call | node or nil |
+| `body` | def, block, class, module | node or nil |
+| `arg_count` | call | int |
+| `arg` (index) | call | node or nil — `{ attr: [x, "arg", 1] }` |
+| `first_argument`, `last_argument` | call | node or nil |
+| `source` | any | string — verbatim source text |
+| `line` | any | int — 1-based start line |
+| `column` | any | int — 0-based start column |
+| `value` | str, sym, int, true, false | the literal's value |
+| `type` | any | string — Parser-gem type name |
+| `parent_type` | any | string — sugar for `parent.type` |
+| `first_child`, `last_child` | any | node or nil — direct children, source order |
+
+### Ancestors
+
+`parent`, `parent_type`, `over: ancestors`, `root?` and `value_used?` all read
+`EvalCtx::ancestors`, which is empty until `BatchedCopWalker` maintains an
+ancestor stack (design §3.3, separate PR). Until then they answer as if the
+node had no enclosing node.
 
 ## Complete example
 
@@ -161,4 +271,12 @@ with `block`/`numblock`/`itblock` variants shares one offense spec — see
   the rest. A `*.user.cop.yml` fixture is loaded with `LoadMode::User`.
 
 `tests/ir_fixtures.rs` walks both directories and also asserts
-`scripts/shared/ir_schema.json` has not drifted from the Rust schema.
+`scripts/shared/ir_schema.json` has not drifted from the Rust schema (top-level
+fields, operator vocabulary, quantifier keys, `over:` collections, config
+types).
+
+Expression evaluation has its own table-driven tests in `src/cop/ir/eval.rs`:
+a Ruby snippet, a matcher, a `when:` guard and the boolean it must produce, one
+row per operator and per attribute, plus the §1.6 `Style/FileOpen` guard lifted
+byte-identically out of `tests/fixtures/ir/valid/file_open.cop.yml` and
+evaluated against a real NodePattern match.
