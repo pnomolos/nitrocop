@@ -180,6 +180,7 @@ pub mod optional_boolean_parameter;
 pub mod or_assignment;
 pub mod parallel_assignment;
 pub mod parentheses_around_condition;
+pub mod partition_instead_of_double_select;
 pub mod percent_literal_delimiters;
 pub mod percent_q_literals;
 pub mod perl_backrefs;
@@ -305,6 +306,9 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(negated_while::NegatedWhile));
     registry.register(Box::new(
         parentheses_around_condition::ParenthesesAroundCondition,
+    ));
+    registry.register(Box::new(
+        partition_instead_of_double_select::PartitionInsteadOfDoubleSelect,
     ));
     registry.register(Box::new(if_unless_modifier::IfUnlessModifier));
     registry.register(Box::new(word_array::WordArray));
