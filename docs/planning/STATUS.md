@@ -22,10 +22,10 @@ Planning branch, not for upstream. Read this first when resuming.
 |---|--------|-------|
 | W0 | Corpus oracle baseline on fork (run 35413735947, success). 99.99%, 1,047 FP / 716 FN, 6 diverging cops. See 06-oracle-baseline-2026-09-19.md | done |
 | W1 | Vendor bump to latest: PR #2 (bump only, config_audit red on 8 new options) + stacked PR implementing the 8 options (branch vendor/new-cop-options) | PRs open |
-| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Layout/MultilineOperationIndentation and Lint/UselessAssignment in progress (branches fix/layout-multiline-operation-indentation, fix/lint-useless-assignment). After these, W2 pauses until #2/#6 merge and the oracle re-runs on main. Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
+| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Lint/UselessAssignment in progress (branch fix/lint-useless-assignment). After these, W2 pauses until #2/#6 merge and the oracle re-runs on main. Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
-| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch) | in progress |
+| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); user-cop discovery in progress (branch ir/user-cop-discovery) | in progress |
 | W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; synth (ir_synth.py) + verify (ir_verify.py) after IrCop lands | in progress |
 
 ## Open PRs
@@ -42,11 +42,17 @@ Planning branch, not for upstream. Read this first when resuming.
 - #16 ir: first translated cop Style/TimeNow (base #14); engine fix: exact child arity for every sequence
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
+- #20 fix: Layout/MultilineOperationIndentation (base main) — line-by-line port; 97-repo sample 19/39 → 0/0 (aligned), 49/173 → 0/0 (indented), zero message mismatches
 - #18 fix: Layout/RedundantLineBreak (base main) — 66-repo sample 41/81 → 0/4; residue is invalid-Ruby files Parser error-recovers and Prism does not (parse/discovery divergence, not cop logic); deleted ~560 lines of text-based backslash heuristics
 - #17 fix: Layout/MultilineMethodCallIndentation (base main) — 30-repo sample default 89/88 → 0/0, indented 59/85 → 2/3, irtr 10/107 → 0/4; open: `check_hash_pair_indented_style` path
 - #10 fix: Layout/HashAlignment separator variant (base main) — two structural causes; note it still replicates the 1.84.2 clobber-abort quirk that 1.91.0 removes, revisit after the bump
 - #4 np: `<>` unordered + mapping expansion (base #3)
 - #2 vendor: bump rubocop 1.91.0 / rails 2.37.0 / rspec 3.10.2 / performance 1.27.0 / ast 1.50.0 (see 05-vendor-bump-scope.md; 280 implemented cops have upstream behavior changes; oracle re-run on main after merge measures drift)
+
+## Cross-cutting findings
+- Tab-indented files: `shared::util::indentation_of` counts spaces only; RuboCop's `indentation` uses `/\S/`. Bit three Layout cops (#17, #20, HashAlignment-adjacent). Each fix so far is cop-local; a shared audit of every `indentation_of` caller is pending.
+- `gen_repo_config.py` writes to a fixed `/tmp/nitrocop_corpus_configs/corpus_config_<repo>.yml`; running `run_nitrocop.py` between generating a variant overlay and invoking RuboCop silently reverts the variant.
+- Local runs must be wrapped in `mise exec --` or `bundle info --path` plugin lookups fail silently and create phantom divergence.
 
 ## Owner decisions needed
 - **Config-relative Include/Exclude (PR #8 cluster 4, 110 FN + 2 FP):** RuboCop absolutizes cop-level Include/Exclude against the config file's directory; the oracle passes a temp-dir config so RuboCop never runs include-gated cops there. Options: (a) match RuboCop in `CopFilterSet` (see docs/investigations/investigation-target-dir-relativization.md), or (b) teach the oracle's include-gated pass to re-derive Lint/RedundantCopDisableDirective. Do NOT ignore include-gated cops when marking directives used.
