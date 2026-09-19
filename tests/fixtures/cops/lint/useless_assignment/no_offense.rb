@@ -768,3 +768,30 @@ def loop_shape_equality_quirk(timeout)
 rescue Timeout::Error
   false
 end
+
+# RuboCop's `find_variables_in_loop` classifies `op_asgn`/`or_asgn`/`and_asgn`
+# through `descendant_reference` as a *reference* to the left-hand local
+# (`VariableReference.new(node.lhs.name)`), not as an assignment node. So a
+# loop whose only mention of the variable after the write is `u += 1` still
+# puts `u` in `referenced_variable_names_in_loop`, and the structurally
+# identical write outside the loop gets the same back-edge reference as in
+# `loop_shape_equality_quirk` above.
+def loop_shape_operator_assignment_counts_as_read
+  u = 0
+  while cond
+    u = 0
+    u += 1
+  end
+rescue StandardError
+  nil
+end
+
+def loop_shape_or_assignment_counts_as_read
+  p = 0
+  while cond
+    p = 0
+    p ||= 1
+  end
+rescue StandardError
+  nil
+end

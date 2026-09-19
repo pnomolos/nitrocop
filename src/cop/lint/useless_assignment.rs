@@ -1278,7 +1278,10 @@ impl<'pr> Visit<'pr> for ChainedAssignmentDescendantCollector {
 //   end
 //
 // We approximate RuboCop's structural node equality with a whitespace-
-// stripped comparison of the assigned value's source text, and approximate
+// normalized comparison of the assigned value's source text (see
+// `normalized_value_shape`: a whitespace run is dropped only when it does not
+// separate two word characters, so `[1, 2]`/`[1,2]` match — as their ASTs do —
+// while `"a b"`/`"ab"` and `foo bar`/`foobar` do not), and approximate
 // "same local-variable scope" by requiring both the candidate write and the
 // matching loop to share the same nearest enclosing `def`/`defs` (or both be
 // outside any method). This mirrors the corpus example without matching
@@ -1313,13 +1316,48 @@ fn collect_loop_shape_referenced_offsets(
     offsets
 }
 
+/// Whitespace-normalized source text of an assigned value, used as a proxy for
+/// RuboCop's structural `Parser::AST::Node#==`.
+///
+/// RuboCop compares ASTs, so formatting is irrelevant: `[1, 2]` and `[1,2]`
+/// are the same node and *do* match. But dropping every whitespace byte is
+/// *broader* than AST equality and suppresses real offenses — `"a b"` and
+/// `"ab"` are different `str` nodes, and `foo bar` (a send with an argument)
+/// is a different node from the `foobar` identifier, yet both pairs collapse
+/// to the same text.
+///
+/// A whitespace run is therefore dropped only when it is *not* flanked by word
+/// characters on both sides; when it is, it is kept verbatim (verbatim, not
+/// collapsed, so `"a  b"` still differs from `"a b"`). That keeps the
+/// formatting-insensitivity the quirk needs while preserving every
+/// whitespace run that can change the parse or a literal's value.
 fn normalized_value_shape(node: &ruby_prism::Node<'_>) -> Vec<u8> {
-    node.location()
-        .as_slice()
-        .iter()
-        .filter(|b| !b.is_ascii_whitespace())
-        .copied()
-        .collect()
+    let bytes = node.location().as_slice();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if !bytes[idx].is_ascii_whitespace() {
+            out.push(bytes[idx]);
+            idx += 1;
+            continue;
+        }
+        let run_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let before_is_word = run_start
+            .checked_sub(1)
+            .is_some_and(|i| is_word_byte(bytes[i]));
+        let after_is_word = bytes.get(idx).copied().is_some_and(is_word_byte);
+        if before_is_word && after_is_word {
+            out.extend_from_slice(&bytes[run_start..idx]);
+        }
+    }
+    out
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 #[derive(Default)]
@@ -1339,6 +1377,42 @@ impl<'pr> Visit<'pr> for LoopShapeSubCollector {
         self.shape
             .read_names
             .insert(node.name().as_slice().to_vec());
+    }
+
+    // `descendant_reference` maps RuboCop's `OPERATOR_ASSIGNMENT_TYPES`
+    // (`op_asgn`, `or_asgn`, `and_asgn`) to `VariableReference.new(lhs.name)`,
+    // i.e. a *read* of the left-hand local — not an entry in
+    // `assignment_nodes_in_loop`. So `u += 1` inside the loop is enough to put
+    // `u` in `referenced_variable_names_in_loop` and give a structurally
+    // identical write outside the loop its back-edge reference.
+    fn visit_local_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+    ) {
+        self.shape
+            .read_names
+            .insert(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+
+    fn visit_local_variable_or_write_node(
+        &mut self,
+        node: &ruby_prism::LocalVariableOrWriteNode<'pr>,
+    ) {
+        self.shape
+            .read_names
+            .insert(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+
+    fn visit_local_variable_and_write_node(
+        &mut self,
+        node: &ruby_prism::LocalVariableAndWriteNode<'pr>,
+    ) {
+        self.shape
+            .read_names
+            .insert(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_and_write_node(self, node);
     }
 
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {

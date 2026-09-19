@@ -529,3 +529,33 @@ def chained_assignment_single_occurrence(records, properties, value)
   result = resolve(records, properties, name = value)
   ^^^^^^ Lint/UselessAssignment: Useless assignment to variable - `result`.
 end
+
+# The loop-shape quirk replication must not be *broader* than RuboCop's AST
+# equality. RuboCop's `Array#include?` compares `Parser::AST::Node`s
+# structurally, so `q = "a b"` and `q = "ab"` do NOT match and the outer,
+# genuinely dead write is still reported. A normalization that strips every
+# whitespace byte from the value's source text would collapse both to `"ab"`
+# and wrongly suppress this.
+def loop_shape_string_literals_differ_only_by_space
+  q = "a b"
+  ^ Lint/UselessAssignment: Useless assignment to variable - `q`.
+  while cond
+    q = "ab"
+    break if q
+  end
+rescue StandardError
+  nil
+end
+
+# Same for a paren-less send vs. a single identifier: `foo bar` and `foobar`
+# are different ASTs, so RuboCop reports the outer write.
+def loop_shape_send_vs_identifier
+  r = foo bar
+  ^ Lint/UselessAssignment: Useless assignment to variable - `r`.
+  while cond
+    r = foobar
+    break if r
+  end
+rescue StandardError
+  nil
+end
