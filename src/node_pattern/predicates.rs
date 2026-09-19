@@ -607,6 +607,19 @@ fn is_special_modifier(call: &ruby_prism::CallNode<'_>) -> bool {
     amp::is_bare_access_modifier(call) && amp::is_special_modifier_name(call.name().as_slice())
 }
 
+/// `block_argument?` — the call is passed an explicit block argument, `&blk`
+/// (`method_dispatch_node.rb:158-160`).
+///
+/// Parser hangs `&blk` off the send as a `block_pass` child; Prism puts a
+/// `BlockArgumentNode` in the same `block` slot a literal block would use, so
+/// the two forms are told apart by the node type rather than by position.
+fn is_block_argument(node: &ruby_prism::Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|call| {
+        call.block()
+            .is_some_and(|block| block.as_block_argument_node().is_some())
+    })
+}
+
 /// `block_literal?` — `method_dispatch_node.rb:167-169`.
 ///
 /// Upstream asks the *send* whether its parent is a block node; Prism hangs
@@ -846,6 +859,13 @@ static BUILTINS: &[Builtin] = &[
         eval: |_ctx, target, _args| {
             string_value(target).is_some_and(|bytes| bytes.iter().all(|b| b.is_ascii_whitespace()))
         },
+    },
+    Builtin {
+        name: "block_argument?",
+        arity: Arity::Nullary,
+        source: Source::RubocopAst,
+        backing: "method_dispatch_node.rb:158-160",
+        eval: node_pred!(is_block_argument),
     },
     Builtin {
         name: "block_literal?",

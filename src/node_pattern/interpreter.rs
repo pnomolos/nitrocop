@@ -667,6 +667,20 @@ fn concrete_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> Option<&'st
     None
 }
 
+/// The Parser-gem type name `node` reports as, for the IR expression layer's
+/// `.type` attribute (`src/cop/ir/expr.rs`).
+#[must_use]
+pub fn parser_type_name(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    parser_type_for_node(node)
+}
+
+/// Whether `node` answers to the Parser type `parser_type`, directly or
+/// through rubocop-ast's `GROUP_FOR_TYPE`, for the IR `pred: type?` intrinsic.
+#[must_use]
+pub fn node_answers_to_type(node: &ruby_prism::Node<'_>, parser_type: &str) -> bool {
+    node_has_type(node, parser_type)
+}
+
 /// Whether `node` answers to the Parser type `pattern_type`.
 fn node_has_type(node: &ruby_prism::Node<'_>, pattern_type: &str) -> bool {
     concrete_type(node, pattern_type).is_some()

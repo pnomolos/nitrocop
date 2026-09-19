@@ -19,6 +19,7 @@ pub use extract::{
 };
 pub use interpreter::{
     CompiledPattern, Unresolved, collect_unresolved, interpret_pattern, match_with_captures,
+    node_answers_to_type, parser_type_name,
 };
 pub use lexer::{Lexer, Token};
 pub use mapping::{NodeMapping, build_mapping_table};
