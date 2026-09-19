@@ -49,6 +49,7 @@ pub mod def_with_parentheses;
 pub mod dig_chain;
 pub mod dir;
 pub mod dir_empty;
+pub mod directive_scope;
 pub mod disable_cops_within_source_code_directive;
 pub mod document_dynamic_eval_definition;
 pub mod documentation;
@@ -501,6 +502,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(date_time::DateTime));
     registry.register(Box::new(dig_chain::DigChain));
     registry.register(Box::new(self::dir::Dir));
+    registry.register(Box::new(directive_scope::DirectiveScope));
     registry.register(Box::new(dir_empty::DirEmpty));
     registry.register(Box::new(
         disable_cops_within_source_code_directive::DisableCopsWithinSourceCodeDirective,
