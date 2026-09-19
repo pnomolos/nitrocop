@@ -22,11 +22,11 @@ Planning branch, not for upstream. Read this first when resuming.
 |---|--------|-------|
 | W0 | Corpus oracle baseline on fork (run 35413735947, success). 99.99%, 1,047 FP / 716 FN, 6 diverging cops. See 06-oracle-baseline-2026-09-19.md | done |
 | W1 | Vendor bump to latest: PR #2 (bump only, config_audit red on 8 new options) + stacked PR implementing the 8 options (branch vendor/new-cop-options) | PRs open |
-| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Layout/MultilineMethodCallIndentation in progress (branch fix/layout-multiline-method-call-indentation). Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
+| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Layout/MultilineMethodCallIndentation and Layout/RedundantLineBreak in progress (branches fix/layout-multiline-method-call-indentation, fix/layout-redundant-line-break). Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); IrCop + registry + Style/TimeNow in progress (branches ir/ir-cop, ir/first-cop-time-now) | in progress |
-| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py in progress (branch ir/translator-extract, base ir/expr); synth + verify after IrCop lands | in progress |
+| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; synth (ir_synth.py) + verify (ir_verify.py) after IrCop lands | in progress |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
@@ -38,6 +38,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #11 np: walker ancestor stack, `^`/`` ` ``/`%0`, ancestor predicates (base #7)
 - #13 np: `?`/`*`/`+` repetition operators (base #11). np stack complete: #3→#4→#5→#7→#11→#13. Known mapping gap worth its own PR: Prism `StatementsNode` wrapper where Parser has a bare body statement (breaks `(def _ (args) $(...))`-shaped patterns); parameterless `def` has no `ParametersNode` so `(args)` cannot match
 - #12 ir: Expr compiler + evaluator (base #9, includes merge of np/predicate-resolution)
+- #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #10 fix: Layout/HashAlignment separator variant (base main) — two structural causes; note it still replicates the 1.84.2 clobber-abort quirk that 1.91.0 removes, revisit after the bump
 - #4 np: `<>` unordered + mapping expansion (base #3)
