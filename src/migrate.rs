@@ -1,7 +1,7 @@
 //! `--migrate` command: config analysis without linting.
 //!
 //! Classifies every enabled cop into one of four buckets (stable, preview,
-//! unimplemented, outside_baseline) and reports counts + top examples.
+//! unimplemented, outside_baseline, custom) and reports counts + top examples.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -20,6 +20,9 @@ pub enum CopStatus {
     Preview,
     Unimplemented,
     OutsideBaseline,
+    /// A user cop from `.nitrocop/cops/**` or `AllCops.CustomCopPaths`. It runs,
+    /// it is never preview-gated, and it is deliberately not in the baseline.
+    Custom,
 }
 
 /// Full migrate report.
@@ -36,6 +39,7 @@ pub struct MigrateCounts {
     pub preview: usize,
     pub unimplemented: usize,
     pub outside_baseline: usize,
+    pub custom: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,12 +74,23 @@ pub fn build_report(
 
     let mut cops = Vec::new();
 
-    // Classify every enabled cop
+    // Classify every enabled cop. User cops are added unconditionally: they
+    // are enabled by existing, so most projects never name one in .rubocop.yml.
     let mut enabled_names = config.enabled_cop_names();
+    enabled_names.extend(
+        registry
+            .cops()
+            .iter()
+            .map(|c| c.name().to_string())
+            .filter(|n| tier_map.is_custom(n)),
+    );
     enabled_names.sort();
+    enabled_names.dedup();
 
     for name in &enabled_names {
-        let status = if preview_set.contains(name.as_str()) {
+        let status = if tier_map.is_custom(name) {
+            CopStatus::Custom
+        } else if preview_set.contains(name.as_str()) {
             CopStatus::Preview
         } else if unimplemented_set.contains(name.as_str()) {
             CopStatus::Unimplemented
@@ -111,6 +126,10 @@ pub fn build_report(
             .iter()
             .filter(|c| c.status == CopStatus::OutsideBaseline)
             .count(),
+        custom: cops
+            .iter()
+            .filter(|c| c.status == CopStatus::Custom)
+            .count(),
     };
 
     MigrateReport {
@@ -144,9 +163,15 @@ pub fn print_text(report: &MigrateReport, args: &Args) {
         report.counts.unimplemented
     );
     println!(
-        "  Outside baseline: {:>4}  (custom or unknown)",
+        "  Outside baseline: {:>4}  (unknown to RuboCop)",
         report.counts.outside_baseline
     );
+    if report.counts.custom > 0 {
+        println!(
+            "  Custom:           {:>4}  (user cops in .nitrocop/cops)",
+            report.counts.custom
+        );
+    }
 
     // Top examples per non-stable category (up to 5 each)
     let max_examples = 5;

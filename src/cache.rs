@@ -103,10 +103,15 @@ pub enum CacheLookup {
 
 impl ResultCache {
     /// Create a new result cache with session-level key.
-    pub fn new(version: &str, base_configs: &[CopConfig], args: &Args) -> Self {
+    pub fn new(
+        version: &str,
+        base_configs: &[CopConfig],
+        args: &Args,
+        custom_cop_digest: &str,
+    ) -> Self {
         let cache_root = cache_root_dir();
         let _ = std::fs::create_dir_all(&cache_root);
-        let session_hash = compute_session_hash(version, base_configs, args);
+        let session_hash = compute_session_hash(version, base_configs, args, custom_cop_digest);
         let index_path = cache_root.join(format!("{session_hash}.index"));
         let entries = load_index(&index_path);
         Self {
@@ -118,8 +123,14 @@ impl ResultCache {
     }
 
     /// Create a cache rooted at the given directory (for testing).
-    pub fn with_root(root: &Path, version: &str, base_configs: &[CopConfig], args: &Args) -> Self {
-        let session_hash = compute_session_hash(version, base_configs, args);
+    pub fn with_root(
+        root: &Path,
+        version: &str,
+        base_configs: &[CopConfig],
+        args: &Args,
+        custom_cop_digest: &str,
+    ) -> Self {
+        let session_hash = compute_session_hash(version, base_configs, args, custom_cop_digest);
         let index_path = root.join(format!("{session_hash}.index"));
         let entries = load_index(&index_path);
         Self {
@@ -359,14 +370,28 @@ pub(crate) fn cache_root_dir() -> PathBuf {
     PathBuf::from(".nitrocop-cache")
 }
 
-/// Compute the session hash from version + config + CLI args.
+/// Compute the session hash from version + config + CLI args + user cops.
 ///
 /// The config fingerprint must be deterministic across runs. Since CopConfig
 /// contains `HashMap<String, Value>` (non-deterministic iteration order), we
 /// sort keys before hashing rather than relying on serde_json serialization.
-fn compute_session_hash(version: &str, base_configs: &[CopConfig], args: &Args) -> String {
+///
+/// `custom_cop_digest` fingerprints the *contents* of every discovered
+/// `*.cop.yml` (`cop::ir::discover::UserCops::digest`). Without it, editing a
+/// user cop would leave every previously cached file result in place — the cop
+/// code is part of the analysis, exactly like the binary version is. It is the
+/// empty string when no user cops were discovered, which keeps the key
+/// identical to the pre-discovery one for projects that have none.
+fn compute_session_hash(
+    version: &str,
+    base_configs: &[CopConfig],
+    args: &Args,
+    custom_cop_digest: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"nitrocop-session-v3:");
+    hasher.update(custom_cop_digest.as_bytes());
+    hasher.update(b":");
     hasher.update(version.as_bytes());
     hasher.update(b":");
 
@@ -512,7 +537,8 @@ mod tests {
             verify: false,
             rubocop_cmd: "bundle exec rubocop".to_string(),
             corpus_check: None,
-            validate_ir: vec![],
+            validate_ir: None,
+            ignore_invalid_cops: false,
         }
     }
 
@@ -531,7 +557,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_args();
         let configs = vec![CopConfig::default()];
-        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
 
         // Create a real file so stat() works
         let rb_file = tmp.path().join("test.rb");
@@ -575,7 +601,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_args();
         let configs = vec![CopConfig::default()];
-        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
 
         let rb_file = tmp.path().join("mtime_test.rb");
         std::fs::write(&rb_file, b"y = 2\n").unwrap();
@@ -617,7 +643,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_args();
         let configs = vec![CopConfig::default()];
-        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
 
         let rb_file = tmp.path().join("changed.rb");
         std::fs::write(&rb_file, b"x = 1\n").unwrap();
@@ -645,7 +671,7 @@ mod tests {
         std::fs::write(&rb_file, b"x = 1\n").unwrap();
 
         let configs1 = vec![CopConfig::default()];
-        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args);
+        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args, "");
         cache1.put(&rb_file, b"x = 1\n", &[]);
 
         // Same config = cache hit (same in-memory instance)
@@ -656,7 +682,7 @@ mod tests {
 
         // Flush and reload — should still hit
         cache1.flush();
-        let cache1b = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args);
+        let cache1b = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args, "");
         assert!(matches!(
             cache1b.get_by_stat(&rb_file),
             CacheLookup::StatHit(_)
@@ -666,7 +692,7 @@ mod tests {
         let mut config2 = CopConfig::default();
         config2.enabled = crate::cop::EnabledState::False;
         let configs2 = vec![config2];
-        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs2, &args);
+        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs2, &args, "");
         assert!(matches!(cache2.get_by_stat(&rb_file), CacheLookup::Miss));
     }
 
@@ -680,7 +706,7 @@ mod tests {
         std::fs::write(&rb_file, b"z = 3\n").unwrap();
 
         // Populate and flush
-        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
         let diagnostics = vec![Diagnostic {
             path: rb_file.to_string_lossy().to_string(),
             location: Location { line: 1, column: 0 },
@@ -693,12 +719,20 @@ mod tests {
         cache1.flush();
 
         // Verify index file exists
-        let session_hash = compute_session_hash("0.1.0-test", &configs, &args);
+        let session_hash = compute_session_hash("0.1.0-test", &configs, &args, "");
         let index_path = tmp.path().join(format!("{session_hash}.index"));
         assert!(index_path.exists(), "index file should exist after flush");
 
+        // A different user-cop digest is a different session: editing a
+        // `.nitrocop/cops/*.cop.yml` must not reuse results computed without
+        // the edit.
+        assert_ne!(
+            session_hash,
+            compute_session_hash("0.1.0-test", &configs, &args, "abc123")
+        );
+
         // Reload from disk
-        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
         match cache2.get_by_stat(&rb_file) {
             CacheLookup::StatHit(cached) => {
                 assert_eq!(cached.len(), 1);
@@ -715,11 +749,11 @@ mod tests {
         let configs = vec![CopConfig::default()];
 
         // Create cache, don't put anything
-        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+        let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
         cache.flush();
 
         // No index file should be written
-        let session_hash = compute_session_hash("0.1.0-test", &configs, &args);
+        let session_hash = compute_session_hash("0.1.0-test", &configs, &args, "");
         let index_path = tmp.path().join(format!("{session_hash}.index"));
         assert!(
             !index_path.exists(),
@@ -734,7 +768,7 @@ mod tests {
 
         // Create session 1 and flush
         let configs1 = vec![CopConfig::default()];
-        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args);
+        let cache1 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs1, &args, "");
         let f = tmp.path().join("f0.rb");
         std::fs::write(&f, b"x0").unwrap();
         cache1.put(&f, b"x0", &[]);
@@ -747,7 +781,7 @@ mod tests {
         let mut config2 = CopConfig::default();
         config2.enabled = crate::cop::EnabledState::False;
         let configs2 = vec![config2];
-        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs2, &args);
+        let cache2 = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs2, &args, "");
         let g = tmp.path().join("g0.rb");
         std::fs::write(&g, b"y0").unwrap();
         cache2.put(&g, b"y0", &[]);

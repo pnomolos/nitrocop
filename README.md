@@ -20,6 +20,7 @@ Benchmark on the [rubygems.org repo](https://github.com/rubygems/rubygems.org) (
   - **907 of 915** match across all `EnforcedStyle` variants
   - Across **28.374M** offenses compared, **28.372M** (99.992%) match exactly with default config
 - **Autocorrect** (`-a`/`-A`) is partial — work in progress
+- **Custom cops** in declarative YAML, no fork required — experimental, see [docs/CUSTOM_COPS.md](docs/CUSTOM_COPS.md)
 - Reads your existing `.rubocop.yml` — no migration needed
 - Uses [Prism](https://github.com/ruby/prism) (Ruby's official parser) via `ruby-prism` crate
 - Parallel file processing with [rayon](https://github.com/rayon-rs/rayon)
@@ -46,7 +47,7 @@ nitrocop reads `.rubocop.yml` with full support for:
 - **`inherit_gem`** — resolves gem paths via `bundle info`
 - **`inherit_mode`** — merge/override for arrays
 - **Department-level config** — `RSpec:`, `Rails:` Include/Exclude/Enabled
-- **`AllCops`** — `NewCops`, `DisabledByDefault`, `Exclude`, `Include`
+- **`AllCops`** — `NewCops`, `DisabledByDefault`, `Exclude`, `Include`, `CustomCopPaths`
 - **`Enabled: pending`** tri-state
 - **Per-cop options** — `EnforcedStyle`, `Max`, `AllowedMethods`, `AllowedPatterns`, etc.
 
@@ -148,7 +149,9 @@ Options:
       --rubocop-only        Print cops NOT covered by nitrocop
       --stdin <PATH>        Read source from stdin, use PATH for display
       --debug               Print timing and debug info
-      --list-cops           List all registered cops
+      --list-cops           List all registered cops (custom cops marked)
+      --validate-ir [PATH]  Validate cop IR documents; no PATH checks this project's
+      --ignore-invalid-cops Warn instead of aborting on a bad custom cop
       --ignore-disable-comments  Ignore all # rubocop:disable inline comments
       --cache <true|false>  Enable/disable file-level result caching [default: true]
       --cache-clear         Clear the result cache and exit

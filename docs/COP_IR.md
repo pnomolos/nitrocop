@@ -1,13 +1,14 @@
 # Cop IR (schema v1) — reference
 
-> **Experimental.** IR cops shipped inside the binary run; user-supplied ones do
-> not yet. What exists today is the document schema (`src/cop/ir/schema.rs`), a
+> **Experimental.** What exists today is the document schema
+> (`src/cop/ir/schema.rs`), a
 > fail-closed loader (`src/cop/ir/load.rs`), the expression compiler
 > (`src/cop/ir/expr.rs`) and evaluator (`src/cop/ir/eval.rs`), the `Cop`
 > implementation (`src/cop/ir/cop.rs`), the embedded table
 > (`src/cop/ir/embedded.rs`), the JSON Schema (`scripts/shared/ir_schema.json`)
-> and `nitrocop --validate-ir`. Discovery of `.nitrocop/cops/**` and gem-shipped
-> packs (design §4.1 items 2-4) lands in a later PR.
+> `nitrocop --validate-ir`, and discovery of user-supplied cops
+> (`src/cop/ir/discover.rs`) — see [CUSTOM_COPS.md](CUSTOM_COPS.md). Gem-shipped
+> cop packs (design §4.1 item 3) land in a later PR.
 
 A cop IR document is one YAML file per cop, conventionally `<Name>.cop.yml`. It
 is `meta` + `config` declarations + named `matchers` (verbatim upstream
@@ -17,6 +18,8 @@ NodePattern strings) + `predicates` + `hooks`.
 
 ```bash
 nitrocop --validate-ir path/to/a.cop.yml path/to/b.cop.yml
+nitrocop --validate-ir src/resources/ir          # a directory expands
+nitrocop --validate-ir                           # this project's user cops
 ```
 
 Exit 0 if every document loads, 2 if any fails. Errors render as

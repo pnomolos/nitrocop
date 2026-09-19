@@ -703,6 +703,12 @@ pub struct ResolvedConfig {
     /// have ALL offenses suppressed (rubocop-rails' MigrationFileSkippable).
     /// Default sentinel from rubocop-rails: `'19700101000000'`.
     migrated_schema_version: Option<String>,
+    /// `AllCops.CustomCopPaths` — extra files/directories of user cop IR
+    /// documents, resolved against the config root. nitrocop-only; RuboCop
+    /// prints "AllCops does not support CustomCopPaths parameter" and carries
+    /// on, which is why this lives under `AllCops` rather than at the top
+    /// level (an unknown top-level key is a hard `ValidationError` there).
+    custom_cop_paths: Vec<String>,
 }
 
 impl ResolvedConfig {
@@ -729,6 +735,7 @@ impl ResolvedConfig {
             rack_version: None,
             base_dir: None,
             migrated_schema_version: None,
+            custom_cop_paths: Vec::new(),
         }
     }
 
@@ -780,6 +787,8 @@ struct ConfigLayer {
     /// When set, files whose basename contains a 14+ digit "timestamp" <= this value
     /// have ALL offenses suppressed (MigrationFileSkippable).
     migrated_schema_version: Option<String>,
+    /// `AllCops.CustomCopPaths` (see [`ResolvedConfig::custom_cop_paths`]).
+    custom_cop_paths: Vec<String>,
 }
 
 impl ConfigLayer {
@@ -801,6 +810,7 @@ impl ConfigLayer {
             target_rails_version: None,
             active_support_extensions_enabled: None,
             migrated_schema_version: None,
+            custom_cop_paths: Vec::new(),
         }
     }
 }
@@ -1288,6 +1298,7 @@ pub fn load_config(
         rack_version,
         base_dir: Some(base_dir),
         migrated_schema_version: base.migrated_schema_version,
+        custom_cop_paths: base.custom_cop_paths,
     })
 }
 
@@ -1790,6 +1801,7 @@ fn parse_config_layer(raw: &Value) -> ConfigLayer {
     let mut target_rails_version = None;
     let mut active_support_extensions_enabled = None;
     let mut migrated_schema_version: Option<String> = None;
+    let mut custom_cop_paths: Vec<String> = Vec::new();
 
     if let Value::Mapping(map) = raw {
         for (key, value) in map {
@@ -1839,6 +1851,9 @@ fn parse_config_layer(raw: &Value) -> ConfigLayer {
                         {
                             active_support_extensions_enabled = ase.as_bool();
                         }
+                        if let Some(paths) = extract_string_list(value, "CustomCopPaths") {
+                            custom_cop_paths = paths;
+                        }
                         if let Some(msv) =
                             ac_map.get(Value::String("MigratedSchemaVersion".to_string()))
                         {
@@ -1883,6 +1898,7 @@ fn parse_config_layer(raw: &Value) -> ConfigLayer {
         target_rails_version,
         active_support_extensions_enabled,
         migrated_schema_version,
+        custom_cop_paths,
     }
 }
 
@@ -1945,6 +1961,9 @@ fn merge_layer_into(
     }
 
     // MigratedSchemaVersion: last writer wins
+    if !overlay.custom_cop_paths.is_empty() {
+        base.custom_cop_paths.clone_from(&overlay.custom_cop_paths);
+    }
     if overlay.migrated_schema_version.is_some() {
         base.migrated_schema_version
             .clone_from(&overlay.migrated_schema_version);
@@ -2603,6 +2622,9 @@ impl ResolvedConfig {
             target_rails_version: effective.target_rails_version,
             active_support_extensions_enabled: Some(effective.active_support_extensions_enabled),
             migrated_schema_version: effective.migrated_schema_version.clone(),
+            // Discovery is a whole-run concern; a nested `.rubocop.yml` does
+            // not get its own cop set.
+            custom_cop_paths: Vec::new(),
         };
         merge_layer_into(&mut merged, layer, Some(&layer.inherit_mode));
 
@@ -2699,6 +2721,12 @@ impl ResolvedConfig {
     /// Directory containing the resolved config file.
     pub fn config_dir(&self) -> Option<&Path> {
         self.config_dir.as_deref()
+    }
+
+    /// `AllCops.CustomCopPaths`: extra user-cop files/directories, resolved
+    /// against the config root by [`crate::cop::ir::discover::roots`].
+    pub fn custom_cop_paths(&self) -> &[String] {
+        &self.custom_cop_paths
     }
 
     /// Base directory for resolving Include/Exclude path patterns.
@@ -2835,10 +2863,13 @@ impl ResolvedConfig {
                 // and this cop is from a core department but NOT mentioned in that
                 // config, the cop doesn't exist in the project's rubocop version.
                 // Disable it unless the user explicitly configured it.
+                // User cops are exempt: they are not in any gem's default.yml
+                // by construction, and they exist because their file exists.
                 if enabled
                     && !self.rubocop_known_cops.is_empty()
                     && !is_plugin_department(dept)
                     && !self.rubocop_known_cops.contains(name)
+                    && !tier_map.is_custom(name)
                     && config.is_none_or(|c| c.enabled != EnabledState::True)
                 {
                     enabled = false;
@@ -2984,7 +3015,10 @@ impl ResolvedConfig {
         let mut summary = crate::cop::tiers::SkipSummary::default();
 
         for name in self.enabled_cop_names() {
-            if registry_names.contains(name.as_str()) {
+            if tier_map.is_custom(&name) {
+                // Neither unimplemented nor outside the baseline: it is a cop
+                // the user wrote, and it runs.
+            } else if registry_names.contains(name.as_str()) {
                 // Implemented — check if preview-gated
                 if !preview && tier_map.tier_for(&name) == crate::cop::tiers::Tier::Preview {
                     summary.preview_gated.push(name);

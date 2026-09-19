@@ -82,7 +82,8 @@ fn default_args() -> Args {
         verify: false,
         rubocop_cmd: "bundle exec rubocop".to_string(),
         corpus_check: None,
-        validate_ir: vec![],
+        validate_ir: None,
+        ignore_invalid_cops: false,
     }
 }
 
@@ -4477,7 +4478,7 @@ fn cache_preserves_all_severity_types() {
     let tmp = tempfile::tempdir().unwrap();
     let configs = vec![nitrocop::cop::CopConfig::default()];
     let args = default_args();
-    let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args);
+    let cache = ResultCache::with_root(tmp.path(), "0.1.0-test", &configs, &args, "");
 
     // Create a real file so stat() works
     let rb_file = tmp.path().join("severity_test.rb");

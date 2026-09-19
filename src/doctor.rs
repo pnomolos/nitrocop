@@ -186,7 +186,24 @@ pub fn run_doctor(
         }
     }
 
-    // 5. Registry info
+    // 5. User cops (design §4.1)
+    let custom: Vec<&str> = registry
+        .cops()
+        .iter()
+        .map(|c| c.name())
+        .filter(|n| tier_map.is_custom(n))
+        .collect();
+    println!();
+    if custom.is_empty() {
+        println!("Custom cops: none (.nitrocop/cops)");
+    } else {
+        println!("Custom cops: {} loaded", custom.len());
+        for name in &custom {
+            println!("  {name}");
+        }
+    }
+
+    // 6. Registry info
     println!();
     println!("Registry: {} cops registered", registry.len());
     let autocorrectable = registry

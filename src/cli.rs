@@ -182,9 +182,14 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub corpus_check: Option<PathBuf>,
 
-    /// Validate cop IR definitions (*.cop.yml) and exit (2 if any fail)
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub validate_ir: Vec<PathBuf>,
+    /// Validate cop IR definitions (*.cop.yml) and exit (2 if any fail).
+    /// With no PATH, validates the user cops discovered for this project.
+    #[arg(long, value_name = "PATH", num_args = 0..)]
+    pub validate_ir: Option<Vec<PathBuf>>,
+
+    /// Warn instead of aborting when a user cop definition fails to load
+    #[arg(long)]
+    pub ignore_invalid_cops: bool,
 }
 
 impl Args {
@@ -254,7 +259,8 @@ mod tests {
             verify: false,
             rubocop_cmd: "bundle exec rubocop".to_string(),
             corpus_check: None,
-            validate_ir: vec![],
+            validate_ir: None,
+            ignore_invalid_cops: false,
         }
     }
 

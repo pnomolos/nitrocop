@@ -1,5 +1,17 @@
 # Lua Custom Cops
 
+> **Status: not implemented, and not the shipped custom-cop story.** Custom cops
+> exist today as declarative YAML documents, not Lua scripts — see
+> [CUSTOM_COPS.md](CUSTOM_COPS.md) for how to write, place, configure and
+> validate one, and [COP_IR.md](COP_IR.md) for the schema. Two things in this
+> document did survive into the shipped design and are load-bearing there: the
+> `.nitrocop/cops/` discovery directory and the `Custom/` department convention.
+> Everything below — the Lua runtime, the `check_node`/`check_lines` callback
+> API, the node and source wrappers, gem distribution of cop packs — is a
+> deferred design, kept because a scripting backend remains the answer if the
+> IR's expression layer ever hits its ceiling (design §7 risk 12). It describes
+> nothing that runs.
+
 nitrocop supports user-defined cops written in Lua. This lets organizations enforce custom rules — ban specific API patterns, require certain code structures, enforce naming conventions — without forking nitrocop or writing Rust.
 
 ## Why Lua

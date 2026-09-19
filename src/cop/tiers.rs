@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,9 +20,19 @@ struct TiersFile {
 }
 
 /// Compiled tier map: cop name → tier.
+///
+/// Also carries the set of user-supplied cops discovered for this run, because
+/// every consumer of a tier (`build_cop_filters`, `compute_skip_summary`,
+/// `--rules`, `--migrate`, `--doctor`) needs the same exemption and already has
+/// a `TierMap` in hand.
 pub struct TierMap {
     default_tier: Tier,
     overrides: HashMap<String, Tier>,
+    /// Names of cops loaded from `.nitrocop/cops/**` or `AllCops.CustomCopPaths`.
+    custom: HashSet<String>,
+    /// Fingerprint of those cops' documents; folded into the result cache's
+    /// session key so editing a cop invalidates cached results.
+    custom_digest: String,
 }
 
 impl TierMap {
@@ -37,11 +47,37 @@ impl TierMap {
         Self {
             default_tier: data.default_tier,
             overrides: data.overrides,
+            custom: HashSet::new(),
+            custom_digest: String::new(),
         }
+    }
+
+    /// Record the user cops discovered for this run and their document digest.
+    ///
+    /// Design §4.3: tiers express nitrocop-vs-RuboCop parity confidence, which
+    /// is meaningless for a cop RuboCop has never heard of. A user cop is opt-in
+    /// by the existence of its file, so it is never preview-gated.
+    pub fn set_custom_cops(&mut self, names: &[String], digest: &str) {
+        self.custom = names.iter().cloned().collect();
+        self.custom_digest = digest.to_string();
+    }
+
+    /// Whether `cop_name` came from a user cop document.
+    pub fn is_custom(&self, cop_name: &str) -> bool {
+        self.custom.contains(cop_name)
+    }
+
+    /// Fingerprint of the user cop documents loaded for this run; empty when
+    /// there are none.
+    pub fn custom_digest(&self) -> &str {
+        &self.custom_digest
     }
 
     /// Get the tier for a cop by name.
     pub fn tier_for(&self, cop_name: &str) -> Tier {
+        if self.is_custom(cop_name) {
+            return Tier::Stable;
+        }
         self.overrides
             .get(cop_name)
             .copied()
@@ -113,6 +149,17 @@ mod tests {
         let map = TierMap::load();
         // New/unknown cops default to preview (must earn stable via corpus)
         assert_eq!(map.tier_for("Custom/MyCop"), Tier::Preview);
+    }
+
+    #[test]
+    fn custom_cops_are_stable_regardless_of_the_default_tier() {
+        let mut map = TierMap::load();
+        assert_eq!(map.tier_for("Custom/MyCop"), Tier::Preview);
+        map.set_custom_cops(&["Custom/MyCop".to_string()], "deadbeef");
+        assert_eq!(map.tier_for("Custom/MyCop"), Tier::Stable);
+        assert!(map.is_custom("Custom/MyCop"));
+        assert!(!map.is_custom("Custom/Other"));
+        assert_eq!(map.custom_digest(), "deadbeef");
     }
 
     #[test]
