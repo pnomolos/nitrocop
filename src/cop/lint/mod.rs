@@ -132,6 +132,7 @@ pub mod unified_integer;
 pub mod unmodified_reduce_accumulator;
 pub mod unreachable_code;
 pub mod unreachable_loop;
+pub mod unreachable_pattern_branch;
 pub mod unused_block_argument;
 pub mod unused_method_argument;
 pub mod uri_escape_unescape;
@@ -368,6 +369,9 @@ pub fn register_all(registry: &mut CopRegistry) {
     ));
     registry.register(Box::new(unreachable_code::UnreachableCode));
     registry.register(Box::new(unreachable_loop::UnreachableLoop));
+    registry.register(Box::new(
+        unreachable_pattern_branch::UnreachablePatternBranch,
+    ));
     registry.register(Box::new(unused_block_argument::UnusedBlockArgument));
     registry.register(Box::new(unused_method_argument::UnusedMethodArgument::new()));
     registry.register(Box::new(uri_escape_unescape::UriEscapeUnescape));

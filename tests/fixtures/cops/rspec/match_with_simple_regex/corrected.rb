@@ -1,0 +1,7 @@
+expect('foobar').to include('foo')
+expect(response.body).to include('http://example.com')
+expect(response).to include("it's \"working\"")
+expect(response).to include('a/b')
+expect(response).to include('closing ] and } are literal')
+expect(response).to include('a-b#c@d')
+expect(response).not_to include('bar')

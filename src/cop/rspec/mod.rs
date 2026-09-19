@@ -19,6 +19,7 @@ pub mod describe_symbol;
 pub mod described_class;
 pub mod described_class_module_wrapping;
 pub mod dialect;
+pub mod discarded_matcher;
 pub mod duplicated_metadata;
 pub mod empty_example_group;
 pub mod empty_hook;
@@ -59,6 +60,7 @@ pub mod leaky_local_variable;
 pub mod let_before_examples;
 pub mod let_setup;
 pub mod match_array;
+pub mod match_with_simple_regex;
 pub mod message_chain;
 pub mod message_expectation;
 pub mod message_spies;
@@ -138,6 +140,7 @@ pub fn register_all(registry: &mut CopRegistry) {
         described_class_module_wrapping::DescribedClassModuleWrapping,
     ));
     registry.register(Box::new(dialect::Dialect));
+    registry.register(Box::new(discarded_matcher::DiscardedMatcher));
     registry.register(Box::new(duplicated_metadata::DuplicatedMetadata));
     registry.register(Box::new(empty_example_group::EmptyExampleGroup));
     registry.register(Box::new(empty_hook::EmptyHook));
@@ -190,6 +193,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(let_before_examples::LetBeforeExamples));
     registry.register(Box::new(let_setup::LetSetup));
     registry.register(Box::new(match_array::MatchArray));
+    registry.register(Box::new(match_with_simple_regex::MatchWithSimpleRegex));
     registry.register(Box::new(message_chain::MessageChain));
     registry.register(Box::new(message_expectation::MessageExpectation));
     registry.register(Box::new(message_spies::MessageSpies));

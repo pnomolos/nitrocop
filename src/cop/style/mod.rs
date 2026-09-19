@@ -170,6 +170,7 @@ pub mod numeric_literal_prefix;
 pub mod numeric_literals;
 pub mod numeric_predicate;
 pub mod object_then;
+pub mod one_class_per_file;
 pub mod one_line_conditional;
 pub mod open_struct_use;
 pub mod operator_method_call;
@@ -233,6 +234,7 @@ pub mod reverse_find;
 pub mod safe_navigation;
 pub mod safe_navigation_chain_length;
 pub mod sample;
+pub mod select_by_range;
 pub mod select_by_regexp;
 pub mod self_assignment;
 pub mod semicolon;
@@ -378,6 +380,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(slicing_with_range::SlicingWithRange));
     registry.register(Box::new(string_concatenation::StringConcatenation));
     registry.register(Box::new(single_argument_dig::SingleArgumentDig));
+    registry.register(Box::new(select_by_range::SelectByRange));
     registry.register(Box::new(select_by_regexp::SelectByRegexp));
     registry.register(Box::new(
         redundant_file_extension_in_require::RedundantFileExtensionInRequire,
@@ -447,6 +450,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(
         trailing_method_end_statement::TrailingMethodEndStatement,
     ));
+    registry.register(Box::new(one_class_per_file::OneClassPerFile));
     registry.register(Box::new(one_line_conditional::OneLineConditional));
     registry.register(Box::new(
         if_unless_modifier_of_if_unless::IfUnlessModifierOfIfUnless,
