@@ -2,6 +2,13 @@
 //!
 //! Maps NodePattern DSL type names (e.g. `send`, `block`, `if`) to their
 //! corresponding Prism node types and child accessors.
+//!
+//! This table is the documentation/codegen view of the mapping; the
+//! interpreter's `parser_type_for_node` and `get_children`
+//! (`src/node_pattern/interpreter.rs`) are the executable one, and are the
+//! place to look for the approximations each type carries. Types whose Parser
+//! children Prism does not materialize at all (`regopt`, and the `int` child of
+//! `numblock`) are synthesized there and have no accessor here.
 
 use std::collections::HashMap;
 
@@ -84,9 +91,9 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
         },
         NodeMapping {
             parser_type: "begin",
-            prism_type: "BeginNode",
-            cast_method: "as_begin_node",
-            child_accessors: &[("body", "statements()")],
+            prism_type: "StatementsNode",
+            cast_method: "as_statements_node",
+            child_accessors: &[("body", "body()")],
         },
         NodeMapping {
             parser_type: "pair",
@@ -308,11 +315,13 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
             cast_method: "as_forwarding_super_node",
             child_accessors: &[],
         },
+        // Parser's `lambda` node is the bare `->`; `-> { }` as a whole is
+        // `(block (lambda) (args) body)`.
         NodeMapping {
             parser_type: "lambda",
             prism_type: "LambdaNode",
             cast_method: "as_lambda_node",
-            child_accessors: &[("params", "parameters()"), ("body", "body()")],
+            child_accessors: &[],
         },
         NodeMapping {
             parser_type: "dstr",
@@ -342,6 +351,170 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
                 ("body", "body()"),
             ],
         },
+        // `numblock` / `itblock` are virtual: Prism has one `BlockNode` and
+        // varies its parameters node.
+        NodeMapping {
+            parser_type: "numblock",
+            prism_type: "BlockNode",
+            cast_method: "as_block_node",
+            child_accessors: &[
+                ("call", "call()"),
+                ("max_numparam", "parameters().maximum()"),
+                ("body", "body()"),
+            ],
+        },
+        NodeMapping {
+            parser_type: "itblock",
+            prism_type: "BlockNode",
+            cast_method: "as_block_node",
+            child_accessors: &[("call", "call()"), ("body", "body()")],
+        },
+        NodeMapping {
+            parser_type: "kwbegin",
+            prism_type: "BeginNode",
+            cast_method: "as_begin_node",
+            child_accessors: &[("body", "statements().body()")],
+        },
+        NodeMapping {
+            parser_type: "block_pass",
+            prism_type: "BlockArgumentNode",
+            cast_method: "as_block_argument_node",
+            child_accessors: &[("expr", "expression()")],
+        },
+        NodeMapping {
+            parser_type: "arg",
+            prism_type: "RequiredParameterNode",
+            cast_method: "as_required_parameter_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "optarg",
+            prism_type: "OptionalParameterNode",
+            cast_method: "as_optional_parameter_node",
+            child_accessors: &[("name", "name()"), ("default", "value()")],
+        },
+        NodeMapping {
+            parser_type: "restarg",
+            prism_type: "RestParameterNode",
+            cast_method: "as_rest_parameter_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "kwarg",
+            prism_type: "RequiredKeywordParameterNode",
+            cast_method: "as_required_keyword_parameter_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "kwoptarg",
+            prism_type: "OptionalKeywordParameterNode",
+            cast_method: "as_optional_keyword_parameter_node",
+            child_accessors: &[("name", "name()"), ("default", "value()")],
+        },
+        NodeMapping {
+            parser_type: "kwrestarg",
+            prism_type: "KeywordRestParameterNode",
+            cast_method: "as_keyword_rest_parameter_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "blockarg",
+            prism_type: "BlockParameterNode",
+            cast_method: "as_block_parameter_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "forward_arg",
+            prism_type: "ForwardingParameterNode",
+            cast_method: "as_forwarding_parameter_node",
+            child_accessors: &[],
+        },
+        NodeMapping {
+            parser_type: "shadowarg",
+            prism_type: "BlockLocalVariableNode",
+            cast_method: "as_block_local_variable_node",
+            child_accessors: &[("name", "name()")],
+        },
+        NodeMapping {
+            parser_type: "case_match",
+            prism_type: "CaseMatchNode",
+            cast_method: "as_case_match_node",
+            child_accessors: &[
+                ("expr", "predicate()"),
+                ("in_patterns", "conditions()"),
+                ("else", "else_clause()"),
+            ],
+        },
+        NodeMapping {
+            parser_type: "in_pattern",
+            prism_type: "InNode",
+            cast_method: "as_in_node",
+            child_accessors: &[("pattern", "pattern()"), ("body", "statements()")],
+        },
+        NodeMapping {
+            parser_type: "xstr",
+            prism_type: "XStringNode",
+            cast_method: "as_x_string_node",
+            child_accessors: &[("content", "content_loc()")],
+        },
+        NodeMapping {
+            parser_type: "irange",
+            prism_type: "RangeNode",
+            cast_method: "as_range_node",
+            child_accessors: &[("from", "left()"), ("to", "right()")],
+        },
+        NodeMapping {
+            parser_type: "erange",
+            prism_type: "RangeNode",
+            cast_method: "as_range_node",
+            child_accessors: &[("from", "left()"), ("to", "right()")],
+        },
+        NodeMapping {
+            parser_type: "masgn",
+            prism_type: "MultiWriteNode",
+            cast_method: "as_multi_write_node",
+            child_accessors: &[("value", "value()")],
+        },
+        NodeMapping {
+            parser_type: "mlhs",
+            prism_type: "MultiTargetNode",
+            cast_method: "as_multi_target_node",
+            child_accessors: &[
+                ("lefts", "lefts()"),
+                ("rest", "rest()"),
+                ("rights", "rights()"),
+            ],
+        },
+        NodeMapping {
+            parser_type: "or_asgn",
+            prism_type: "LocalVariableOrWriteNode",
+            cast_method: "as_local_variable_or_write_node",
+            child_accessors: &[("value", "value()")],
+        },
+        NodeMapping {
+            parser_type: "and_asgn",
+            prism_type: "LocalVariableAndWriteNode",
+            cast_method: "as_local_variable_and_write_node",
+            child_accessors: &[("value", "value()")],
+        },
+        NodeMapping {
+            parser_type: "sclass",
+            prism_type: "SingletonClassNode",
+            cast_method: "as_singleton_class_node",
+            child_accessors: &[("expr", "expression()"), ("body", "body()")],
+        },
+        NodeMapping {
+            parser_type: "kwsplat",
+            prism_type: "AssocSplatNode",
+            cast_method: "as_assoc_splat_node",
+            child_accessors: &[("value", "value()")],
+        },
+        NodeMapping {
+            parser_type: "resbody",
+            prism_type: "RescueNode",
+            cast_method: "as_rescue_node",
+            child_accessors: &[("var", "reference()"), ("body", "statements()")],
+        },
         NodeMapping {
             parser_type: "cbase",
             prism_type: "ConstantPathNode",
@@ -349,7 +522,7 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
             child_accessors: &[],
         },
         NodeMapping {
-            parser_type: "op-asgn",
+            parser_type: "op_asgn",
             prism_type: "OperatorWriteNode",
             cast_method: "as_operator_write_node",
             child_accessors: &[
@@ -379,11 +552,71 @@ mod tests {
     fn test_mapping_table_completeness() {
         let table = build_mapping_table();
         for expected in &[
-            "send", "csend", "block", "def", "defs", "const", "begin", "pair", "hash", "lvar",
-            "ivar", "sym", "str", "int", "float", "true", "false", "nil", "self", "array", "if",
-            "case", "when", "while", "until", "for", "return", "yield", "and", "or", "regexp",
-            "class", "module", "lvasgn", "ivasgn", "casgn", "splat", "super", "zsuper", "lambda",
-            "dstr", "dsym",
+            "send",
+            "csend",
+            "block",
+            "def",
+            "defs",
+            "const",
+            "begin",
+            "pair",
+            "hash",
+            "lvar",
+            "ivar",
+            "sym",
+            "str",
+            "int",
+            "float",
+            "true",
+            "false",
+            "nil",
+            "self",
+            "array",
+            "if",
+            "case",
+            "when",
+            "while",
+            "until",
+            "for",
+            "return",
+            "yield",
+            "and",
+            "or",
+            "regexp",
+            "class",
+            "module",
+            "lvasgn",
+            "ivasgn",
+            "casgn",
+            "splat",
+            "super",
+            "zsuper",
+            "lambda",
+            "dstr",
+            "dsym",
+            "numblock",
+            "itblock",
+            "any_block",
+            "kwbegin",
+            "block_pass",
+            "arg",
+            "optarg",
+            "restarg",
+            "kwarg",
+            "kwoptarg",
+            "kwrestarg",
+            "blockarg",
+            "case_match",
+            "in_pattern",
+            "xstr",
+            "irange",
+            "erange",
+            "masgn",
+            "mlhs",
+            "op_asgn",
+            "or_asgn",
+            "and_asgn",
+            "sclass",
         ] {
             assert!(
                 table.contains_key(expected),

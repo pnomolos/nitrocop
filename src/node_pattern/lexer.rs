@@ -268,9 +268,12 @@ impl<'a> Lexer<'a> {
                         _ if word.ends_with("_type?") => {
                             // Generic _type? predicate: strip `_type?` suffix
                             let stem = &word[..word.len() - 6]; // strip "_type?"
-                            tokens.push(Token::TypePredicate(stem.to_string()));
+                            tokens.push(Token::TypePredicate(stem.replace('-', "_")));
                         }
-                        _ => tokens.push(Token::Ident(word)),
+                        // RuboCop compiles a node type to `#{type.tr('-', '_')}_type?`
+                        // (`node_pattern_subcompiler.rb:88-90`), so `block-pass`
+                        // and `block_pass` are the same type.
+                        _ => tokens.push(Token::Ident(word.replace('-', "_"))),
                     }
                 }
                 _ => {
@@ -390,6 +393,17 @@ mod tests {
                 "Failed for input: {input}"
             );
         }
+    }
+
+    #[test]
+    fn test_lexer_hyphenated_node_types_are_normalized() {
+        let mut lexer = Lexer::new("(block-pass (sym :foo))");
+        assert_eq!(lexer.tokenize()[1], Token::Ident("block_pass".to_string()));
+        let mut lexer = Lexer::new("op-asgn_type?");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::TypePredicate("op_asgn".to_string())]
+        );
     }
 
     #[test]
