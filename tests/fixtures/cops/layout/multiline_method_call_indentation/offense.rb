@@ -311,3 +311,20 @@ def rows(bid)
     }
   ]
 end
+
+# A block-bearing continuation after a multiline-block receiver falls through
+# `find_continuation_node` to `first_call_alignment_node`, which walks past the
+# block to the chain's first dotted call.
+def actions
+  RSpec::Sequencing.run("quit after a short time") do
+    File.open(file_path, "wb") { |file| file.write("line1") }
+  end
+  .then("watch") do
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 262.
+    reading.watch_this(watch_dir)
+  end
+  .then("wait") do
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 262.
+    wait(2)
+  end
+end
