@@ -1183,7 +1183,7 @@ fn parser_type_tags(name: &str) -> &'static [u8] {
         "kwbegin" => &[BEGIN_NODE],
         "pair" => &[ASSOC_NODE],
         "hash" => &[HASH_NODE, KEYWORD_HASH_NODE],
-        "lvar" => &[LOCAL_VARIABLE_READ_NODE],
+        "lvar" => &[LOCAL_VARIABLE_READ_NODE, IT_LOCAL_VARIABLE_READ_NODE],
         "ivar" => &[INSTANCE_VARIABLE_READ_NODE],
         "cvar" => &[CLASS_VARIABLE_READ_NODE],
         "gvar" => &[GLOBAL_VARIABLE_READ_NODE],
