@@ -81,6 +81,16 @@ use crate::diagnostic::Severity;
 /// marking directives used — that would be wrong for real repos, where the
 /// config sits at the repo root and the cops do run.
 ///
+/// The same relativization hits cop-level `Exclude` and is the only remaining
+/// FP cluster: `is_directive_redundant` reports a directive as redundant when
+/// `is_cop_excluded` matches, but RuboCop absolutizes `Exclude` against the
+/// config file's directory. In the corpus that turns rubocop-rails'
+/// `Lint/UselessMethodDefinition: Exclude: ['**/app/controllers/**/*.rb']`
+/// into `<bench/corpus>/**/app/controllers/**/*.rb`, which matches nothing, so
+/// RuboCop runs the cop, its (disabled) offense keeps the directive alive, and
+/// nitrocop's exclusion-based flag is an FP (2 in openproject). Verified with a
+/// `Cop::Team#roundup_relevant_cops` probe printing the absolutized patterns.
+///
 /// ## Fixed (2026-09-18): Layout/LineLength self-suppression — 740 corpus FPs
 ///
 /// `Layout/LineLength` parsed `rubocop:disable` directives itself (a private
