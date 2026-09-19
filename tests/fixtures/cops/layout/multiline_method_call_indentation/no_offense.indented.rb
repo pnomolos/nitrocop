@@ -22,3 +22,13 @@ def link(result, record, record_id_to_repo_ids, repositories)
     .map { |repo_ids| repositories.fetch(repo_ids) }
     .flatten
 end
+
+# `indentation(lhs)` is the line `left_hand_side` starts on — the `.to` line
+# here, because the climb stops at the block-bearing `.with`.
+it "fetches entity" do
+  expect(DiasporaFederation::Federation::Fetcher)
+    .to receive(:fetch_public)
+      .with(remote_person.diaspora_handle, "post", guid) {
+        FactoryBot.create(:status_message, author: remote_person, guid: guid)
+      }
+end
