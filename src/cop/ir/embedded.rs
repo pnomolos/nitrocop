@@ -22,7 +22,12 @@ use super::cop::IrCopRunner;
 use super::load::{LoadMode, load_str_with};
 
 /// `(path relative to the repo root, contents)` for every embedded IR cop.
-pub static FILES: &[(&str, &str)] = &[];
+pub static FILES: &[(&str, &str)] = &[(
+    "src/resources/ir/style/time_now.cop.yml",
+    include_str!("../../resources/ir/style/time_now.cop.yml"),
+)];
+
+crate::ir_cop_fixture_tests!(style_time_now, "Style/TimeNow", "cops/style/time_now");
 
 /// Load and compile every embedded document.
 ///

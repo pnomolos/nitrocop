@@ -731,8 +731,11 @@ fn all_registered_cops_can_fire() {
 #[test]
 fn registry_has_expected_cop_count() {
     let registry = CopRegistry::default_registry();
-    // 915 supported + 5 no-ops (obsolete on Ruby 3.4+)
-    assert_eq!(registry.len(), 915 + 5);
+    // 915 supported + 5 no-ops (obsolete on Ruby 3.4+) + declarative IR cops
+    assert_eq!(
+        registry.len(),
+        915 + 5 + nitrocop::cop::ir::embedded::FILES.len()
+    );
 
     let names = registry.names();
     let expected = [
@@ -2562,10 +2565,11 @@ fn list_cops_prints_all_registered_cops() {
     );
 
     let lines: Vec<&str> = stdout.lines().collect();
+    let expected_count = 920 + nitrocop::cop::ir::embedded::FILES.len();
     assert_eq!(
         lines.len(),
-        920,
-        "Expected 920 cop names, got {}",
+        expected_count,
+        "Expected {expected_count} cop names, got {}",
         lines.len()
     );
 
