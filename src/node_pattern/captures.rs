@@ -24,7 +24,7 @@
 
 use std::ops::Index;
 
-use super::predicates::Arg;
+use super::predicates::{Arg, NodeId};
 use super::resolve::{NO_RESOLVER, Params, Resolver};
 
 // A duplicated `Node` handle must not imply duplicated ownership; this fails the
@@ -63,6 +63,21 @@ pub enum CaptureValue<'pr> {
     Absent,
     /// A captured variable-length run of children (`$...`).
     List(Vec<CaptureValue<'pr>>),
+}
+
+impl<'pr> Clone for CaptureValue<'pr> {
+    /// Duplicating a capture duplicates a node *handle*, not a node: the
+    /// arena the handle points into is the parse result, which outlives every
+    /// `MatchEnv`. A repetition needs this to accumulate one value per pass
+    /// while the slot is overwritten by the next (`sequence_subcompiler.rb:185-200`).
+    fn clone(&self) -> Self {
+        match self {
+            CaptureValue::Node(node) => CaptureValue::Node(dup_node(node)),
+            CaptureValue::Name(bytes) => CaptureValue::Name(bytes),
+            CaptureValue::Absent => CaptureValue::Absent,
+            CaptureValue::List(items) => CaptureValue::List(items.clone()),
+        }
+    }
 }
 
 impl<'pr> CaptureValue<'pr> {
@@ -173,6 +188,15 @@ pub struct MatchEnv<'pr, 'r> {
     trail: Vec<(usize, Option<CaptureValue<'pr>>)>,
     params: &'r Params,
     resolver: &'r dyn Resolver,
+    /// Enclosing nodes of whatever the matcher is currently looking at,
+    /// outermost first: the walker's stack, extended as the matcher descends
+    /// into a sequence and truncated by `^`. Normalized to Parser-gem ancestry
+    /// by [`super::ancestors`], not here.
+    chain: Vec<ruby_prism::Node<'pr>>,
+    /// `%0` — the node the matcher was invoked on
+    /// (`method_definer.rb:10-17`, `param0 = self`). Identity only: the one
+    /// predicate that reads it, `equal?`, compares identity.
+    root: Option<NodeId>,
 }
 
 impl std::fmt::Debug for MatchEnv<'_, '_> {
@@ -181,6 +205,8 @@ impl std::fmt::Debug for MatchEnv<'_, '_> {
             .field("slots", &self.slots)
             .field("trail", &self.trail)
             .field("params", &self.params)
+            .field("chain_depth", &self.chain.len())
+            .field("root", &self.root)
             .finish_non_exhaustive()
     }
 }
@@ -193,15 +219,21 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
     /// bindings and the empty resolver.
     #[must_use]
     pub fn new(capture_count: usize) -> Self {
-        Self::with_inputs(capture_count, &NO_PARAMS, &NO_RESOLVER)
+        Self::with_inputs(capture_count, &NO_PARAMS, &NO_RESOLVER, &[])
     }
 
-    /// Create an environment carrying `params` and `resolver`.
+    /// Create an environment carrying `params`, `resolver` and the ancestor
+    /// chain of the node about to be matched (outermost first).
+    ///
+    /// The chain is copied, because `^` truncates it and descending into a
+    /// sequence extends it. An empty `ancestors` — every caller that is not an
+    /// ancestor-aware cop — allocates nothing.
     #[must_use]
     pub fn with_inputs(
         capture_count: usize,
         params: &'r Params,
         resolver: &'r dyn Resolver,
+        ancestors: &[ruby_prism::Node<'pr>],
     ) -> Self {
         let mut slots = Vec::new();
         slots.resize_with(capture_count, || None);
@@ -210,7 +242,51 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
             trail: Vec::new(),
             params,
             resolver,
+            chain: ancestors.iter().map(dup_node).collect(),
+            root: None,
         }
+    }
+
+    /// Bind `%0` to `node` — the node the matcher was invoked on.
+    #[must_use]
+    pub fn with_root(mut self, node: &ruby_prism::Node<'pr>) -> Self {
+        self.root = Some(NodeId::of(node));
+        self
+    }
+
+    /// `%0`, if this match was entered through a node.
+    #[must_use]
+    pub fn root(&self) -> Option<NodeId> {
+        self.root
+    }
+
+    /// The ancestors of whatever is currently being matched, outermost first.
+    #[must_use]
+    pub fn chain(&self) -> &[ruby_prism::Node<'pr>] {
+        &self.chain
+    }
+
+    /// Enter `node`: everything matched until the paired [`Self::leave`] is
+    /// one level below it.
+    pub fn enter(&mut self, node: &ruby_prism::Node<'pr>) {
+        self.chain.push(dup_node(node));
+    }
+
+    /// Undo the most recent [`Self::enter`].
+    pub fn leave(&mut self) {
+        self.chain.pop();
+    }
+
+    /// Replace the chain wholesale, returning what was there.
+    ///
+    /// `^` uses this: the ancestors of the node it ascends to are a *prefix*
+    /// of the current chain, and the tail has to come back when the ascended
+    /// term is done.
+    pub fn replace_chain(
+        &mut self,
+        chain: Vec<ruby_prism::Node<'pr>>,
+    ) -> Vec<ruby_prism::Node<'pr>> {
+        std::mem::replace(&mut self.chain, chain)
     }
 
     /// The `%param` bindings this match was invoked with.
@@ -228,6 +304,12 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
     /// The value of a `%param`, or [`Arg::Unresolved`] when it is unbound.
     #[must_use]
     pub fn positional_param(&self, number: usize) -> Arg {
+        if number == 0 {
+            // `%0` is not a value upstream either: `def_node_matcher` compiles
+            // to `def name(param0 = self)`, so it is the node the matcher was
+            // called on.
+            return self.root.map_or(Arg::Unresolved, Arg::Node);
+        }
         self.params.get(number).cloned().unwrap_or(Arg::Unresolved)
     }
 
@@ -252,6 +334,12 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
             let (slot, previous) = self.trail.pop().expect("trail is non-empty above the mark");
             self.slots[slot] = previous;
         }
+    }
+
+    /// The value currently bound to `slot`, if any.
+    #[must_use]
+    pub fn get(&self, slot: usize) -> Option<&CaptureValue<'pr>> {
+        self.slots.get(slot)?.as_ref()
     }
 
     /// Bind `slot`, journaling the previous value so the write can be undone.

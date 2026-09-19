@@ -376,6 +376,40 @@ pub trait Cop: Send + Sync {
     ) {
     }
 
+    /// Whether this cop reads the enclosing-node stack in
+    /// [`Cop::check_node_with_ancestors`].
+    ///
+    /// Prism nodes carry no parent pointer, so the walker has to maintain the
+    /// stack itself. It does that only when at least one active cop returns
+    /// `true` here, which keeps the cost at exactly zero for the cops that do
+    /// not need it (design §3.3).
+    fn wants_ancestors(&self) -> bool {
+        false
+    }
+
+    /// [`Cop::check_node`] with the chain of enclosing nodes, outermost first.
+    ///
+    /// The walker calls this instead of [`Cop::check_node`] for every cop once
+    /// any active cop declares [`Cop::wants_ancestors`]; the default delegates,
+    /// so a cop that does not care sees no behavior change. `ancestors` is the
+    /// raw Prism stack — Parser-gem ancestry differs (Prism materializes
+    /// `StatementsNode`, `ArgumentsNode` and `BlockNode` where the Parser gem
+    /// does not), and `node_pattern::ancestors` does that normalization.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unused_variables)]
+    fn check_node_with_ancestors(
+        &self,
+        source: &SourceFile,
+        node: &ruby_prism::Node<'_>,
+        ancestors: &[ruby_prism::Node<'_>],
+        parse_result: &ruby_prism::ParseResult<'_>,
+        config: &CopConfig,
+        diagnostics: &mut Vec<Diagnostic>,
+        corrections: Option<&mut Vec<crate::correction::Correction>>,
+    ) {
+        self.check_node(source, node, parse_result, config, diagnostics, corrections);
+    }
+
     /// Return `Some(self)` if this cop consumes VariableForce analysis.
     /// Override this to opt into the shared variable dataflow engine instead
     /// of implementing your own AST visitor for variable tracking.
