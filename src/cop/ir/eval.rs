@@ -483,23 +483,56 @@ fn intrinsic(value: &Value<'_>, which: &Intrinsic, ctx: &EvalCtx<'_, '_>) -> boo
             .iter()
             .any(|ty| crate::node_pattern::node_answers_to_type(node, ty)),
         Intrinsic::Root => ctx.ancestors.is_empty(),
-        // Conservative approximation of `node.rb:704-721`: a statement that is
-        // not the last of its `StatementsNode` has its value discarded;
-        // anything else is assumed used. With no ancestor chain there is no
-        // parent, and upstream answers `false` for a parentless node.
-        Intrinsic::ValueUsed => match ctx.parent() {
-            None => false,
-            Some(parent) => parent.as_statements_node().is_none_or(|statements| {
-                statements
-                    .body()
-                    .iter()
-                    .last()
-                    .is_some_and(|last: ruby_prism::Node<'_>| {
-                        last.location().start_offset() == node.location().start_offset()
-                    })
-            }),
-        },
+        Intrinsic::ValueUsed => value_used(node, ctx.ancestors),
     }
+}
+
+/// `RuboCop::AST::Node#value_used?` (`rubocop-ast` `node.rb:647-667`, with
+/// `begin_value_used?` at `704-707`), read off the enclosing-node chain.
+///
+/// Upstream is **recursive**: a statement that is not the last of its `begin`
+/// has its value discarded, and the last one inherits the `begin`'s own answer.
+/// A top-level statement list has no parent, so upstream's `return false if
+/// parent.nil?` makes even the *trailing* top-level statement unused — which is
+/// why `File.open('f')` on a line by itself is a `Style/FileOpen` offense.
+///
+/// Prism's extra levels are walked through rather than answered at:
+///
+/// * `StatementsNode` is the `begin` level, whether or not it is Parser-visible
+///   (a one-statement list is trivially "last", so the rule degenerates
+///   correctly);
+/// * `ParenthesesNode` / `BeginNode` / `EmbeddedStatementsNode` are the
+///   `begin` / `kwbegin` / `dstr` *spelling* of a list whose statements level
+///   was just checked, so they carry the question one level further up, exactly
+///   as upstream's `parent.value_used?` does;
+/// * `ProgramNode` is the parentless root: upstream has no node there at all.
+///
+/// Everything else falls into upstream's `else` branch and is assumed used.
+/// That keeps the reading conservative in the same direction as before for the
+/// container types (`array`, `if`, `while`, …) upstream resolves recursively.
+fn value_used(node: &ruby_prism::Node<'_>, ancestors: &[ruby_prism::Node<'_>]) -> bool {
+    let mut start = node.location().start_offset();
+    for parent in ancestors.iter().rev() {
+        if let Some(statements) = parent.as_statements_node() {
+            let is_last = statements
+                .body()
+                .iter()
+                .last()
+                .is_some_and(|last: ruby_prism::Node<'_>| last.location().start_offset() == start);
+            if !is_last {
+                return false;
+            }
+        } else if parent.as_program_node().is_some() {
+            return false;
+        } else if parent.as_parentheses_node().is_none()
+            && parent.as_begin_node().is_none()
+            && parent.as_embedded_statements_node().is_none()
+        {
+            return true;
+        }
+        start = parent.location().start_offset();
+    }
+    false
 }
 
 fn matches<'pr>(value: &Value<'pr>, matcher: MatcherRef, ctx: &EvalCtx<'_, 'pr>) -> bool {
@@ -757,6 +790,8 @@ mod tests {
     fn operators_evaluate() {
         const TIME_NEW: &str = "(send (const nil? :Time) :new)";
         const FOO_2: &str = "(send nil? :foo ...)";
+        const FILE_OPEN: &str = "(send (const nil? :File) :open ...)";
+        const VALUE_USED: &str = "{ pred: [node, \"value_used?\"] }";
         let cases = [
             // --- logic ---------------------------------------------------
             Case::new("Time.new", TIME_NEW, "{ all: [true, true] }"),
@@ -811,6 +846,21 @@ mod tests {
             Case::new("Time.new", TIME_NEW, "{ pred: [node, \"send_type?\"] }"),
             Case::new("Time.new", TIME_NEW, "{ pred: [node, \"type?\", \"send\", \"csend\"] }"),
             Case::new("Time.new", TIME_NEW, "{ pred: [node, \"root?\"] }").falsey(),
+            // `value_used?` mirrors `begin_value_used?`'s recursion: a
+            // statement list has no parent at the top level, so even its
+            // *last* statement is unused.
+            Case::new("File.open('f')", FILE_OPEN, VALUE_USED).falsey(),
+            Case::new("File.open('f')\n1\n", FILE_OPEN, VALUE_USED).falsey(),
+            Case::new("1\nFile.open('f')\n", FILE_OPEN, VALUE_USED).falsey(),
+            Case::new("x = File.open('f')", FILE_OPEN, VALUE_USED),
+            Case::new("foo(File.open('f'))", FILE_OPEN, VALUE_USED),
+            Case::new("def m; File.open('f'); end", FILE_OPEN, VALUE_USED),
+            Case::new("def m; 1; File.open('f'); end", FILE_OPEN, VALUE_USED),
+            Case::new("def m; File.open('f'); 1; end", FILE_OPEN, VALUE_USED).falsey(),
+            // `(a; b)` spells one Parser `begin`; the statements level inside
+            // it still decides, and the parentheses carry the question up.
+            Case::new("x = (File.open('f'); 1)", FILE_OPEN, VALUE_USED).falsey(),
+            Case::new("x = (1; File.open('f'))", FILE_OPEN, VALUE_USED),
             Case::new(
                 "Time.new",
                 TIME_NEW,
