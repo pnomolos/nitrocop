@@ -32,6 +32,11 @@ corpus-results.md
 .check-cop-cache/
 local-collect/
 
+# Cop IR translation pipeline scratch artifacts (design §5's artifacts table:
+# extract.json/synth.cop.yml/synth.raw.txt/verify reports — not committed;
+# only src/resources/ir/*.cop.yml and tests/fixtures/cops/** are).
+/build/
+
 # Ruby / Gems
 *.gem
 Gemfile.lock

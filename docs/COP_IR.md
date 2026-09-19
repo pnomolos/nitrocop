@@ -404,3 +404,115 @@ a Ruby snippet, a matcher, a `when:` guard and the boolean it must produce, one
 row per operator and per attribute, plus the §1.6 `Style/FileOpen` guard lifted
 byte-identically out of `tests/fixtures/ir/valid/file_open.cop.yml` and
 evaluated against a real NodePattern match.
+
+## Pipeline
+
+The translation pipeline (design §5) turns one upstream RuboCop cop into one
+`.cop.yml` document plus fixtures, in five stages. Stages 1, 2 and 4 are
+Python and deterministic (no LLM); stage 3 is the only place a model is
+called, and stage 5 is the gate nothing skips.
+
+```
+ir_extract.py  ─▶  ir_classify.py  ─▶  ir_synth.py  ─▶  spec_to_fixture.py  ─▶  ir_verify.py
+  (Stage 1)          (Stage 2)          (Stage 3)          (Stage 4)              (Stage 5)
+ extract.json      A/B/C bucket      synth.cop.yml      tests/fixtures/…       pass/fail + report
+```
+
+### Commands
+
+```bash
+# Stage 1: pull matchers/constants/config/messages/hooks out of the upstream
+# Ruby source, verbatim where possible. Produces extract.json + a skeleton
+# .cop.yml with hooks[].offense deliberately left out.
+python3 scripts/workflows/ir_extract.py Style/TimeNow \
+    --rubocop-root vendor/rubocop --out-dir build/ir
+
+# Stage 2: bucket A (translate directly), B (translate with care), or C (stays
+# hand-written Rust) — prints the rationale.
+python3 scripts/workflows/ir_classify.py Style/TimeNow
+
+# Stage 3: call the model to fill hooks[].when/bind/offense (never
+# matchers:/config:/constants:, which are copied verbatim by the script, not
+# the model — see ir_synth.py's module docstring for the enforcement). Needs
+# ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN); exits 2 with a clear message
+# if neither is set.
+export ANTHROPIC_API_KEY=...
+python3 scripts/workflows/ir_synth.py Style/TimeNow \
+    --extract-dir build/ir \
+    --spec vendor/rubocop/spec/rubocop/cop/style/time_now_spec.rb
+# --dry-run prints the exact prompt without calling the API.
+python3 scripts/workflows/ir_synth.py Style/TimeNow --dry-run
+
+# Stage 4: convert the upstream RuboCop spec's expect_offense/
+# expect_no_offenses/expect_correction blocks into nitrocop fixtures.
+python3 scripts/spec_to_fixture.py \
+    vendor/rubocop/spec/rubocop/cop/style/time_now_spec.rb
+
+# Stage 5: the gate. validate-ir, matcher byte-equality, a differential run
+# against real RuboCop at the pinned upstream version (harvesting inputs from
+# the spec, but trusting only real `rubocop --format json` for the expected
+# offenses — see "Honest limitations" below), cargo test, -A convergence,
+# no_offense silence, and a fixture coverage floor.
+mise exec -- gem install rubocop -v 1.91.0 --install-dir /tmp/rubocop-1.91.0 --no-document
+python3 scripts/ir_verify.py Style/TimeNow src/resources/ir/style/time_now.cop.yml \
+    --rubocop-root vendor/rubocop --rubocop-gem-dir /tmp/rubocop-1.91.0
+```
+
+A human step sits between stages 3 and 5 for any cop that is not already
+shipped: copy the synthesized `build/ir/<Dept>/<snake>/synth.cop.yml` to
+`src/resources/ir/<dept>/<snake>.cop.yml`, add it to `FILES` +
+an `ir_cop_fixture_tests!` line in `src/cop/ir/embedded.rs`, add fixtures
+under `tests/fixtures/cops/<dept>/<snake>/` (stage 4's output, reviewed), and
+rebuild. `ir_verify.py`'s `embedded_freshness` check exists specifically to
+catch a stale binary in this handoff — see below.
+
+### Honest limitations (from the pilot batch's friction log — PRs #19, #23)
+
+- **A stale binary looks green.** `nitrocop`'s runtime only ever executes
+  cops `include_str!`'d into `src/cop/ir/embedded.rs` at build time — there is
+  no dynamic-loading path yet for an arbitrary `.cop.yml`. `ir_verify.py`'s
+  differential/-A-convergence/no_offense checks run the compiled binary
+  end to end, so they can only mean anything for a document that IS the
+  currently embedded one (`embedded_freshness` hard-fails otherwise, with
+  the exact steps to fix it). Pointing `ir_verify.py` at
+  `build/ir/.../synth.cop.yml` before promoting it will not silently pass —
+  it fails loudly and tells you why.
+- **Captures and `%param`s are not extracted, and the model must not name
+  them either.** `ir_extract.py`'s skeleton leaves `captures: []`; naming
+  them is matcher metadata, which the model is forbidden from touching. Stage
+  3 fills them in mechanically instead (`ir_synth.normalize_matchers`):
+  synthetic, positional names (`capture_1`, `capture_2`, ...) when none were
+  given, real ones if a human already edited the extraction record. Rename
+  them for readability before shipping — the pilot batch's own examples
+  (`redundant_min_max_by.cop.yml`) use `send`/`var`, not `capture_1`/`capture_2`.
+- **The predicate whitelist is vendored, not queried.** Design §2.2 calls for
+  `nitrocop --list-ir-predicates`; it does not exist yet. `ir_synth.py` and
+  `ir_verify.py` both hardcode the ~80 names from
+  `src/node_pattern/predicates.rs`, checked against a live grep of that file
+  in `tests/python/workflows/test_ir_synth.py`. A new predicate added to the
+  Rust registry needs a matching addition here until the flag exists.
+- **The differential check needs the exact pinned upstream RuboCop version,
+  not the corpus bundle's.** `bench/corpus/vendor/bundle` is pinned to
+  RuboCop 1.84.2; cops translated from newer upstream releases (all the
+  pilot batch, from 1.91.0) need their own scratch `gem install`, per AGENTS.md.
+  `Style/TimeNow` and its pilot siblings do not exist at 1.84.2 at all.
+- **One upstream version per document, for now.** CI's `ir-verify` job
+  hardcodes `1.91.0` because every shipped IR cop happens to come from it.
+  The first cop pinned to a different upstream release needs this
+  generalized to read per-document (e.g. from `version_added:`).
+- **`it`-block diffs at an older `TargetRubyVersion` are informational, not
+  proof of correctness.** `ir_verify.py` only hard-fails a differential
+  mismatch at the newest requested `TargetRubyVersion` (3.4 by default); a
+  mismatch that disappears there is logged but does not fail the gate — it
+  usually means RuboCop's parser gem needs 3.4 to parse `it`/numbered-param
+  blocks at all, not that nitrocop is wrong (friction log item 12/13 in PR
+  #19/#23).
+- **A RuboCop spec's own asserted message can be wrong.** PR #23's friction
+  log documents exactly this (`redundant_min_max_by_spec.rb`). This is why
+  Stage 5's differential trusts only real `rubocop --format json` output for
+  expected offenses, never the spec's inline `^^^` annotation text, even
+  though Stage 4 harvests the spec's *input* source from the same file.
+- **The corpus oracle gate (design §5 Stage 5 item 4, `check_cop.py`) is a
+  separate, CI-only, future step** — `ir_verify.py` is the mechanical gate
+  only. A cop is not `stable` without a clean corpus run too, same as any
+  hand-written cop (AGENTS.md).

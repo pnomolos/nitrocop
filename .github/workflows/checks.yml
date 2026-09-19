@@ -291,6 +291,102 @@ jobs:
             --result "${{ steps.gate.outputs.result }}" \
             --check-variant-regressions > /dev/null
 
+  # Cop IR verify: for any changed IR document (or engine change under
+  # src/cop/ir/), re-run scripts/ir_verify.py — the mechanical gate for
+  # translated cops (docs/planning/04-cop-ir-design.md §5 Stage 5). Catches
+  # matcher-fidelity, differential, autocorrect-convergence, and no_offense
+  # regressions before they reach the (separate, future) per-cop corpus gate.
+  ir-verify-detect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      has_ir_changes: ${{ steps.detect.outputs.has_ir_changes }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect IR cop / engine changes
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          else
+            BASE="HEAD~1"
+          fi
+          CHANGED=$(git diff --name-only "$BASE...HEAD" -- 'src/resources/ir/' 'src/cop/ir/')
+          echo "Changed IR paths:"
+          echo "$CHANGED"
+          if [ -n "$CHANGED" ]; then
+            echo "has_ir_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ir_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  ir-verify:
+    needs: [ir-verify-detect, build-linux]
+    if: needs.ir-verify-detect.outputs.has_ir_changes == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # All IR cops shipped so far are sourced from rubocop v1.91.0 (PR #19 /
+      # #23). Once a cop pins a different upstream version, this needs to
+      # become per-cop (e.g. read from each document's `version_added:`) —
+      # tracked as a known limitation, not solved here.
+      IR_VERIFY_RUBOCOP_PIN: "1.91.0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: nitrocop-linux
+          path: target/release
+      - run: chmod +x target/release/nitrocop
+
+      - uses: astral-sh/setup-uv@v7
+      - uses: ruby/setup-ruby@v1
+
+      - name: Fetch pinned upstream rubocop source
+        run: |
+          git -C vendor/rubocop fetch --tags --quiet origin "refs/tags/v${IR_VERIFY_RUBOCOP_PIN}:refs/tags/v${IR_VERIFY_RUBOCOP_PIN}"
+          git -C vendor/rubocop checkout "v${IR_VERIFY_RUBOCOP_PIN}" --quiet
+
+      - name: Install pinned rubocop into a scratch gem dir
+        run: gem install rubocop -v "${IR_VERIFY_RUBOCOP_PIN}" --install-dir /tmp/rubocop-pin --no-document
+
+      - name: Run ir_verify.py for every IR document
+        env:
+          NITROCOP_BIN: ${{ github.workspace }}/target/release/nitrocop
+        run: |
+          set -e
+          failed=0
+          for yml in src/resources/ir/*/*.cop.yml; do
+            cop=$(uv run python3 -c "import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))['cop'])" "$yml")
+            echo ""
+            echo "=============================="
+            echo "Verifying: $cop ($yml)"
+            echo "=============================="
+            uv run python3 scripts/ir_verify.py "$cop" "$yml" \
+              --rubocop-root vendor/rubocop \
+              --rubocop-gem-dir /tmp/rubocop-pin \
+              || failed=1
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "FAILED: one or more IR cops failed ir_verify.py"
+            exit 1
+          fi
+
+      - name: Upload ir_verify reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ir-verify-reports
+          path: build/ir/**/verify/
+          retention-days: 7
+
   # Perf smoke test: time nitrocop on vendor/rubocop (small, fast) and forem
   # (large, catches scale regressions). Logs timing to step summary.
   # Never fails — just records data for bisecting when the nightly catches an issue.
