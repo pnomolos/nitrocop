@@ -270,3 +270,28 @@ foo(
       .map { |k, v| { id: v, name: ReviewableScore.type_title(k) } },
       ^^^^ Layout/MultilineMethodCallIndentation: Align `.map` with `ReviewableScore` on line 216.
 )
+
+# `case` is not in RuboCop's UNALIGNED_RHS_TYPES, so a chain inside a `when`
+# branch of an assigned `case` aligns with the `case` keyword expression.
+def members(key, value)
+  base_members = case key
+  when :basket_size_id
+    Member
+      .joins(:current_or_future_membership)
+      ^^^^^^ Layout/MultilineMethodCallIndentation: Align `.joins` with `case key` on line 225.
+      .distinct
+      ^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.distinct` with `case key` on line 225.
+  else
+    Member.where(id: value)
+  end
+end
+
+# `if` IS in UNALIGNED_RHS_TYPES, so a chain inside a branch of an assigned
+# `if` keeps its branch-local alignment instead of the assignment RHS column.
+def branchy(key, value)
+  result = if key
+    Member
+      .joins(:current_or_future_membership)
+      .distinct
+  end
+end

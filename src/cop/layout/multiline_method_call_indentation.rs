@@ -1241,19 +1241,19 @@ fn find_assignment_rhs_base<'a>(
         if ancestor.as_block_node().is_some() || ancestor.as_begin_node().is_some() {
             break;
         }
-        // Conditional/loop branches reset the alignment base — RuboCop does
-        // not pull the assignment RHS through into a branch body, even when
-        // the assignment value is `if cond ... end.method`.
-        if is_control_flow_expression(ancestor) {
+        // Mirrors RuboCop's `disqualified_rhs?` / `UNALIGNED_RHS_TYPES`: an
+        // `if`/`unless`/`while`/`until`/`for`/`return`/array/`begin` ancestor
+        // resets the alignment base, so a chain in a conditional branch keeps
+        // its branch-local alignment even when the branch is an assignment
+        // value. `case`/`case ... in` are deliberately absent from that list,
+        // so `x = case k ... when ... Foo\n  .bar` still aligns with `case k`.
+        if is_unaligned_rhs_type(ancestor) {
             break;
         }
 
         let Some(value) = assignment_rhs_node(ancestor) else {
             continue;
         };
-        if is_control_flow_expression(&value) {
-            continue;
-        }
         if node_within_node(current, &value) {
             return Some(value);
         }
@@ -1370,14 +1370,19 @@ fn assignment_rhs_node<'a>(node: &ruby_prism::Node<'a>) -> Option<ruby_prism::No
     None
 }
 
-fn is_control_flow_expression(node: &ruby_prism::Node<'_>) -> bool {
+/// Mirrors RuboCop's `MultilineExpressionIndentation::UNALIGNED_RHS_TYPES`
+/// (`if while until for return array kwbegin`). `unless` is an `if` node in
+/// the parser gem, and `kwbegin` is Prism's `BeginNode`. `case` / `case ... in`
+/// are intentionally *not* members: RuboCop happily pulls the assignment RHS
+/// base through a `case` into its `when` branches.
+fn is_unaligned_rhs_type(node: &ruby_prism::Node<'_>) -> bool {
     node.as_if_node().is_some()
         || node.as_unless_node().is_some()
-        || node.as_case_node().is_some()
-        || node.as_case_match_node().is_some()
         || node.as_while_node().is_some()
         || node.as_until_node().is_some()
         || node.as_for_node().is_some()
+        || node.as_return_node().is_some()
+        || node.as_array_node().is_some()
 }
 
 fn find_keyword_expression_base<'a>(
