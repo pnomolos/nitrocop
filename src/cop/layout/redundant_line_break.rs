@@ -411,6 +411,21 @@ use crate::parse::source::SourceFile;
 ///   checks) whose only purpose was damage control.
 ///
 ///   Sampled corpus effect: FP 33 → 13, FN unchanged.
+/// - **`%x` executable strings**: Parser models `%x{...}` as an `xstr` whose
+///   children are `str` nodes, so `safe_to_split?`'s
+///   `each_descendant(:dstr, :str)` sees a newline in the value. Prism has a
+///   single `XStringNode`/`InterpolatedXStringNode`, so the unsafe-range
+///   collector now checks those explicitly (zhaocai/alfred-workflow,
+///   opal `spec/opal/stdlib/native/hash_spec.rb`).
+/// - **Heredoc interpolations**: the collector used to stop descending once it
+///   pushed a heredoc's range, so strings inside a heredoc's `#{...}` code were
+///   never collected. The interpolated code is checked independently (Parser's
+///   `begin` around an interpolation stops `on_send`'s walk-up), and its own
+///   `safe_to_split?` looks at those strings — `#{matter.gsub(%r!\n!, "\n    ")}`
+///   split over three lines is not reportable because `"\n    "` holds a
+///   newline (xcatliu/jekyllcn `features/support/helpers.rb`).
+///
+///   Sampled corpus effect: FP 10 → 5, FN unchanged at 4.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -610,6 +625,12 @@ impl<'pr> Visit<'pr> for UnsafeRangeCollector {
             if open.as_slice().starts_with(b"<<") {
                 let loc = node.location();
                 self.ranges.push((loc.start_offset(), loc.end_offset()));
+                // Keep descending: a heredoc body can hold `#{...}`
+                // interpolations whose code is checked independently (the
+                // interpolation is a `begin` node in Parser, which stops
+                // `on_send`'s walk-up), and the strings inside that code are
+                // `:str` descendants for its own `safe_to_split?`.
+                ruby_prism::visit_interpolated_string_node(self, node);
                 return;
             }
 
@@ -635,6 +656,30 @@ impl<'pr> Visit<'pr> for UnsafeRangeCollector {
             self.ranges.push((loc.start_offset(), loc.end_offset()));
         }
         ruby_prism::visit_interpolated_string_node(self, node);
+    }
+
+    /// Parser models `%x{...}` as an `xstr` whose children are `str` nodes, so
+    /// `safe_to_split?`'s `each_descendant(:dstr, :str)` sees them and a
+    /// newline in the value makes the enclosing expression unsafe. Prism has a
+    /// single `XStringNode`, so the check has to be made here.
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        if node.opening_loc().as_slice().starts_with(b"<<") || node.unescaped().contains(&b'\n') {
+            let loc = node.location();
+            self.ranges.push((loc.start_offset(), loc.end_offset()));
+        }
+    }
+
+    fn visit_interpolated_x_string_node(
+        &mut self,
+        node: &ruby_prism::InterpolatedXStringNode<'pr>,
+    ) {
+        if node.opening_loc().as_slice().starts_with(b"<<")
+            || contains_non_continuation_newline(node.location().as_slice())
+        {
+            let loc = node.location();
+            self.ranges.push((loc.start_offset(), loc.end_offset()));
+        }
+        ruby_prism::visit_interpolated_x_string_node(self, node);
     }
 
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {

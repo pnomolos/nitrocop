@@ -554,3 +554,33 @@ def no_backslash?
   to_idl_type.kind == :bits &&
     @schema_hash.key?("const")
 end
+
+# Parser models `%x{...}` as an `xstr` whose children are `str` nodes, so a
+# newline in the executed string makes the enclosing expression unsafe to split.
+def front_appname
+  %x{osascript <<__APPLESCRIPT__
+  name of application (path to frontmost application as text)
+__APPLESCRIPT__}.chop
+end
+
+obj = %x{
+  {
+    a: 1,
+    b: "two"
+  }
+}
+
+# A heredoc body is unsafe to split, but the code inside its `#{...}`
+# interpolations is checked independently (the interpolation is a `begin` node
+# in Parser, which stops `on_send`'s walk-up). The `"\n    "` argument is a
+# `:str` descendant of that call, so the call is not safe to split either.
+def front_matter(matter, content)
+  Jekyll::Utils.strip_heredoc(<<-EOF)
+    ---
+    #{matter.gsub(
+      %r!\n!, "\n    "
+    )}
+    ---
+    #{content}
+  EOF
+end
