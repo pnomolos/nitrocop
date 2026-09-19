@@ -29,8 +29,6 @@
 //! Known divergences from RuboCop's compiler, in addition to the stubs below:
 //!
 //! - `(int $_)` / `(float $_)` bind the literal node, not the numeric value.
-//! - A pattern list without `...` still tolerates extra trailing children,
-//!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
 //! ## Resolution
 //!
@@ -1788,9 +1786,11 @@ fn matches_child<'pr>(
 /// Match a pattern against a synthesized Parser-gem child
 /// ([`MatchChild::Synthetic`]).
 ///
-/// The synthesized node has exactly one child — its value — so `(str $_)`,
-/// `(regopt)` and the bare literal forms (`:it`, `1`) all work; anything that
-/// addresses a deeper structure does not.
+/// The synthesized node has one child — its value — so `(str $_)`, `(regopt :i)`
+/// and the bare literal forms (`:it`, `1`) all work; anything that addresses a
+/// deeper structure does not. An **empty** value stands for no children at all,
+/// which is what Parser's `(lambda)` and an option-less `(regopt)` are, and
+/// what the exact-arity rule in [`matches_children_list`] needs them to be.
 fn matches_synthetic<'pr>(
     pattern: &PatternNode,
     parser_type: &'static str,
@@ -1819,7 +1819,12 @@ fn matches_synthetic<'pr>(
                 return false;
             }
             let mark = env.mark();
-            if matches_children_list(children, &[MatchChild::Name(value)], env) {
+            let actuals: &[MatchChild<'pr>] = if value.is_empty() {
+                &[]
+            } else {
+                &[MatchChild::Name(value)]
+            };
+            if matches_children_list(children, actuals, env) {
                 return true;
             }
             env.rollback(mark);
@@ -2294,25 +2299,6 @@ fn is_variadic_term(pattern: &PatternNode) -> bool {
     }
 }
 
-/// Whether a term can consume an unbounded number of children.
-fn contains_rest(pattern: &PatternNode) -> bool {
-    match pattern {
-        // `x*` / `x+` have no upper bound, so the enclosing list's arity is
-        // `n..∞` and every child has to be accounted for, exactly as with
-        // `...`. `x?` is bounded and leaves the list's permissive tail rule
-        // alone.
-        PatternNode::Repetition { kind, .. } => kind.is_unbounded(),
-        PatternNode::Alternatives(items)
-        | PatternNode::Subsequence(items)
-        | PatternNode::AnyOrder(items) => items.iter().any(contains_rest),
-        // `$<a ...>` is unbounded exactly when the group it wraps is.
-        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => {
-            contains_rest(inner)
-        }
-        _ => as_rest_term(pattern).is_some(),
-    }
-}
-
 /// `Some((capture_slot, children))` if `pattern` is a `<>` any-order group,
 /// optionally wrapped in a `$`.
 fn as_any_order_term(pattern: &PatternNode) -> Option<(Option<usize>, &[PatternNode])> {
@@ -2555,17 +2541,25 @@ fn match_repetition<'pr>(
 ///
 /// A rest term (`...`, `$...`) matches a variable-length run, so the walk
 /// backtracks over every split point and rewinds the captures written by a
-/// rejected split. With a rest term present the arity is exact — the rest
-/// absorbs the slack, as in RuboCop's sequence compiler. Without one, extra
-/// trailing children are still tolerated (pre-existing permissive behaviour).
+/// rejected split.
+///
+/// **Arity is always exact**: every child has to be accounted for, whether or
+/// not the list has a rest term. That is `compile_child_nb_guard`
+/// (`compiler/sequence_subcompiler.rb:243-255`), which emits `==` for a fixed
+/// list and `>=`/a range for a variadic one — in both cases a guard that no
+/// unconsumed child survives.
+///
+/// This used to tolerate unconsumed trailing children when the list had no rest
+/// term. The first cop to notice was `Style/TimeNow`, whose
+/// `(call (const {nil? cbase} :Time) :new)` is upstream's spelling of
+/// "`Time.new` with *no* arguments" and matched `Time.new(2026, 8, 19)` here.
 fn matches_children_list<'pr>(
     patterns: &[PatternNode],
     actuals: &[MatchChild<'pr>],
     env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     let terms: Vec<&PatternNode> = patterns.iter().collect();
-    let exact = patterns.iter().any(contains_rest);
-    match_sequence(&terms, actuals, env, exact)
+    match_sequence(&terms, actuals, env, true)
 }
 
 /// Splice `head` (a union branch or subsequence body) in front of `tail`.
