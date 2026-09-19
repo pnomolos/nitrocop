@@ -397,6 +397,20 @@ use crate::parse::source::SourceFile;
 ///   sampled FNs are all in non-`.rb` or deliberately-unparseable corpus files
 ///   (`Gemfile`, `*.gemspec`, `bad_syntax.rb`, `not-ruby.rb`), i.e. file
 ///   discovery/parsing, not cop logic.
+/// - **Phase 2 removed**: the text-based backslash-continuation scan is gone.
+///   RuboCop only ever registers this cop's offenses from `on_send` /
+///   `on_csend` (walked up through sends, convertible blocks and `and`/`or`)
+///   and from `CheckAssignment`. A backslash is never itself a reason to
+///   report — it only affects `require_backslash?` and the joined length. With
+///   the operator walk-up now modelled in the AST phase, Phase 2 had no shape
+///   left to cover, and all its remaining output was noise: over a 72-repo
+///   sample (~50k offenses, including six repos with >1000 offenses each) it
+///   produced 20 offenses RuboCop does not, and zero that the AST phase did
+///   not already produce. Deleting it removes ~560 lines of heuristics
+///   (group spans, ternary/branch-tail/keyword guards, enclosing-expression
+///   checks) whose only purpose was damage control.
+///
+///   Sampled corpus effect: FP 33 → 13, FN unchanged.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -412,7 +426,7 @@ impl Cop for RedundantLineBreak {
         &self,
         source: &SourceFile,
         parse_result: &ruby_prism::ParseResult<'_>,
-        code_map: &CodeMap,
+        _code_map: &CodeMap,
         config: &CopConfig,
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
@@ -439,8 +453,6 @@ impl Cop for RedundantLineBreak {
         };
         unsafe_collector.visit(&parse_result.node());
         let unsafe_ranges = unsafe_collector.ranges;
-        let group_blocking_ranges = unsafe_collector.group_blocking_ranges;
-        let ternary_ranges = unsafe_collector.ternary_ranges;
 
         // Pre-collect block ranges (for InspectBlocks: false check)
         let mut block_collector = BlockRangeCollector {
@@ -478,32 +490,7 @@ impl Cop for RedundantLineBreak {
         };
         visitor.visit(&parse_result.node());
 
-        let RedundantLineBreakVisitor {
-            reported_starts,
-            ast_diagnostics,
-            checked_chain_ranges,
-            reported_ranges,
-            ..
-        } = visitor;
-        diagnostics.extend(ast_diagnostics);
-
-        // Phase 2: Backslash continuation detection (existing text-based approach)
-        check_backslash_continuations(
-            self,
-            source,
-            code_map,
-            max_line_length,
-            inspect_blocks,
-            diagnostics,
-            &reported_starts,
-            &reported_ranges,
-            &unsafe_ranges,
-            &group_blocking_ranges,
-            &ternary_ranges,
-            &checked_chain_ranges,
-            &block_ranges,
-            &comment_lines,
-        );
+        diagnostics.extend(visitor.ast_diagnostics);
     }
 }
 
@@ -1707,527 +1694,7 @@ impl RedundantLineBreakVisitor<'_, '_> {
     }
 }
 
-/// Phase 2: backslash continuation detection (text-based).
-#[allow(clippy::too_many_arguments)]
-fn check_backslash_continuations(
-    cop: &RedundantLineBreak,
-    source: &SourceFile,
-    code_map: &CodeMap,
-    max_line_length: usize,
-    inspect_blocks: bool,
-    diagnostics: &mut Vec<Diagnostic>,
-    already_reported: &HashSet<usize>,
-    ast_reported_ranges: &[(usize, usize)],
-    unsafe_ranges: &[(usize, usize)],
-    group_blocking_ranges: &[(usize, usize)],
-    ternary_ranges: &[(usize, usize)],
-    checked_chain_ranges: &[(usize, usize)],
-    block_ranges: &[(usize, usize, bool)],
-    comment_lines: &HashSet<usize>,
-) {
-    let content = source.as_bytes();
-    let lines: Vec<&[u8]> = source.lines().collect();
-
-    let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len());
-    let mut offset = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        line_starts.push(offset);
-        offset += line.len();
-        if i < lines.len() - 1 || (offset < content.len() && content[offset] == b'\n') {
-            offset += 1;
-        }
-    }
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = trim_trailing_whitespace(line);
-
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        if !trimmed.ends_with(b"\\") || i + 1 >= lines.len() {
-            i += 1;
-            continue;
-        }
-
-        let trimmed_content = trim_leading_whitespace(trimmed);
-        if trimmed_content.starts_with(b"#") {
-            i += 1;
-            continue;
-        }
-        if ends_with_special_global_backslash(trimmed_content)
-            || is_keyword_only_continuation(trimmed_content)
-        {
-            i += 1;
-            continue;
-        }
-
-        // RuboCop never reports `class Foo < \` superclass header breaks here.
-        if trimmed_content.starts_with(b"class ") && trimmed_content.contains(&b'<') {
-            i += 1;
-            continue;
-        }
-
-        // A backslash on an already-dotted chain segment (e.g. `.replace(...) \`)
-        // belongs to the larger multiline chain, which RuboCop judges as a whole.
-        if starts_with_method_chain_dot(trimmed_content) {
-            i += 1;
-            continue;
-        }
-
-        let backslash_offset = line_starts[i] + trimmed.len() - 1;
-        let is_elsif_line = starts_with_keyword(trimmed_content, b"elsif")
-            || trimmed_content.starts_with(b"elsif(");
-        if !code_map.is_code(backslash_offset) && !is_elsif_line {
-            i += 1;
-            continue;
-        }
-
-        let group_start = i;
-        let mut group_end = i;
-        while group_end + 1 < lines.len() {
-            let t = trim_trailing_whitespace(lines[group_end]);
-            if !t.ends_with(b"\\") {
-                break;
-            }
-            let next_trimmed_content =
-                trim_leading_whitespace(trim_trailing_whitespace(lines[group_end + 1]));
-            if next_trimmed_content.starts_with(b"#") {
-                break;
-            }
-            group_end += 1;
-        }
-        let final_line_idx = group_end + 1;
-        if final_line_idx >= lines.len() {
-            i = final_line_idx;
-            continue;
-        }
-
-        let ternary_then_idx = (group_start + 1..=final_line_idx).find(|&idx| {
-            let trimmed = trim_leading_whitespace(trim_trailing_whitespace(lines[idx]));
-            trimmed.starts_with(b"?")
-        });
-        if ternary_then_idx == Some(group_start + 1) {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // Phase 2 starts from explicit backslash continuations, but the Ruby
-        // expression can keep going across later comma-terminated lines:
-        //
-        //   attr_reader \
-        //     :foo,
-        //     :bar,
-        //     :baz
-        //
-        // RuboCop measures the full continued call here, not just `attr_reader :foo,`.
-        let mut expression_end_idx = ternary_then_idx.map_or(final_line_idx, |idx| idx - 1);
-        while expression_end_idx + 1 < lines.len() {
-            let current = trim_trailing_whitespace(lines[expression_end_idx]);
-            if current.is_empty() || !current.ends_with(b",") {
-                break;
-            }
-
-            let next_trimmed_content =
-                trim_leading_whitespace(trim_trailing_whitespace(lines[expression_end_idx + 1]));
-            if next_trimmed_content.starts_with(b"#") {
-                break;
-            }
-
-            expression_end_idx += 1;
-        }
-
-        let group_trimmed_start =
-            trim_leading_whitespace(trim_trailing_whitespace(lines[group_start]));
-        let leading_ws = leading_whitespace_len(lines[group_start]);
-        let group_starts_with_elsif = starts_with_keyword(group_trimmed_start, b"elsif")
-            || group_trimmed_start.starts_with(b"elsif(");
-        let group_starts_with_paren = group_trimmed_start.starts_with(b"(");
-        let modifier_prefix_len = modifier_condition_prefix_len(group_trimmed_start);
-        let keyword_prefix_len =
-            if group_trimmed_start.starts_with(b"if ") || group_trimmed_start.starts_with(b"if(") {
-                3
-            } else if group_trimmed_start.starts_with(b"unless ")
-                || group_trimmed_start.starts_with(b"unless(")
-            {
-                7
-            } else if group_starts_with_elsif {
-                6
-            } else if group_starts_with_paren {
-                1
-            } else if modifier_prefix_len > 0 {
-                modifier_prefix_len
-            } else {
-                0
-            };
-        let report_line = group_start + 1; // 1-indexed
-        let report_col = leading_ws + keyword_prefix_len;
-        let group_statement_start = line_starts[group_start] + leading_ws;
-        if already_reported.contains(&report_line) {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // Check if the backslash group's byte range overlaps with any unsafe
-        // construct (if/case/begin/def/heredoc/multiline-string) or block.
-        // This matches RuboCop's AST-level checks that prevent collapsing
-        // expressions containing these constructs.
-        let group_byte_start = line_starts[group_start];
-        let group_byte_end = if expression_end_idx < line_starts.len() {
-            line_starts[expression_end_idx] + lines[expression_end_idx].len()
-        } else {
-            content.len()
-        };
-
-        // Check if any unsafe range is fully contained within the group OR
-        // starts within the group but extends beyond it. The latter catches
-        // backslash continuations followed by case/if(ternary)/until/while
-        // expressions: the construct starts in the continuation line but
-        // extends far past the group, so it can't be collapsed to one line.
-        // We intentionally don't check for unsafe ranges that merely CONTAIN
-        // the group (like def bodies) — those are legitimate contexts for
-        // backslash continuation offenses.
-        let has_unsafe = unsafe_ranges.iter().any(|&(us, ue)| {
-            if us < group_byte_start || us >= group_byte_end {
-                return false;
-            }
-            if ternary_then_idx.is_some()
-                && us == group_statement_start
-                && ternary_ranges.iter().any(|&(ts, te)| ts == us && te == ue)
-            {
-                return false;
-            }
-            if us == group_statement_start
-                && (group_trimmed_start.starts_with(b"if ")
-                    || group_trimmed_start.starts_with(b"if(")
-                    || group_trimmed_start.starts_with(b"unless ")
-                    || group_trimmed_start.starts_with(b"unless("))
-            {
-                return false;
-            }
-            if group_starts_with_elsif
-                && (us == group_statement_start || us == group_statement_start + keyword_prefix_len)
-            {
-                return false;
-            }
-            if group_starts_with_paren && us == group_statement_start {
-                return false;
-            }
-            if modifier_prefix_len > 0
-                && (us == group_statement_start
-                    || us == group_statement_start + modifier_prefix_len)
-            {
-                return false;
-            }
-            true
-        });
-        if has_unsafe {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // Some constructs should suppress the text fallback even when the
-        // unsafe node starts before the backslash group. Examples:
-        // - `class Foo < \` newline `Bar`
-        // - backslash groups nested inside a larger multiline `CallNode`
-        //   that the AST phase already judged as a whole.
-        let blocked_by_enclosing_range = group_blocking_ranges.iter().any(|&(bs, be)| {
-            if ternary_then_idx.is_some()
-                && bs == group_statement_start
-                && ternary_ranges.iter().any(|&(ts, te)| ts == bs && te == be)
-            {
-                return false;
-            }
-            if group_starts_with_elsif {
-                return false;
-            }
-            if modifier_prefix_len > 0
-                && (bs == group_statement_start
-                    || bs == group_statement_start + modifier_prefix_len)
-            {
-                return false;
-            }
-            bs <= group_byte_start && be >= group_byte_end
-        });
-        if blocked_by_enclosing_range {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // Compare the chain range against the post-indent statement start, since
-        // an AST CallNode starts at the call name (e.g. `pipe`), not at column 0
-        // of the line. Without this, the strict-enclosure check fails for
-        // `pipe \\\n   arg1,\n   arg2` even though the call covers the whole
-        // group.
-        let covered_by_checked_chain = checked_chain_ranges.iter().any(|&(cs, ce)| {
-            cs <= group_statement_start
-                && ce >= group_byte_end
-                && (cs < group_statement_start || ce > group_byte_end)
-        });
-        if covered_by_checked_chain && !is_elsif_line {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // The AST phase already reported an enclosing assignment / call. RuboCop's
-        // `register_offense` calls `ignore_node`, so the inner expression is skipped
-        // by `part_of_ignored_node?`. Phase 2's text scan has no AST context, so
-        // mirror the suppression: if the backslash group's first line falls inside
-        // an already-reported AST range, skip it. Comparing against `group_byte_end`
-        // is too strict because Phase 2 extends the group past the actual expression
-        // (into the following statement) when the last continuation line has no
-        // trailing comma.
-        let covered_by_ast_report = ast_reported_ranges
-            .iter()
-            .any(|&(rs, re)| rs <= group_byte_start && re > group_byte_start);
-        if covered_by_ast_report {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // When InspectBlocks is false (default), skip backslash groups that
-        // overlap with any block (single-line or multiline). This is slightly
-        // more conservative than RuboCop's AST-level check, but prevents Phase 2
-        // from flagging expressions that the AST phase would handle differently.
-        if !inspect_blocks {
-            let has_block = block_ranges
-                .iter()
-                .any(|&(bs, be, _)| bs < group_byte_end && be > group_byte_start);
-            if has_block {
-                i = final_line_idx + 1;
-                continue;
-            }
-        }
-
-        let has_comment = ((group_start + 1)..=(expression_end_idx + 1))
-            .any(|line_num| comment_lines.contains(&line_num));
-        if has_comment {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        // Build the combined single-line version.
-        let indent = leading_whitespace_len(lines[group_start]);
-        let mut combined = Vec::new();
-        combined.extend_from_slice(&lines[group_start][..indent]);
-
-        for (j, line_idx) in (group_start..=expression_end_idx).enumerate() {
-            let t = trim_trailing_whitespace(lines[line_idx]);
-            if t.is_empty() {
-                continue;
-            }
-            // `group_end` is the first line WITHOUT a trailing backslash (one
-            // past the last backslash-continued line). Only strip the trailing
-            // `\` for lines that actually have one, otherwise we drop the last
-            // content character (`,` or `)`) and undercount the joined length.
-            let content_part = if line_idx < group_end {
-                let before_bs = trim_trailing_whitespace(&t[..t.len() - 1]);
-                trim_leading_whitespace(before_bs)
-            } else {
-                trim_leading_whitespace(t)
-            };
-
-            if j == 0 {
-                combined.extend_from_slice(content_part);
-            } else {
-                combined.push(b' ');
-                combined.extend_from_slice(content_part);
-            }
-        }
-
-        if utf8_char_count(&combined) > max_line_length {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        let next_content = trim_leading_whitespace(lines[group_start + 1]);
-        if starts_with_keyword(next_content, b"until")
-            || starts_with_keyword(next_content, b"while")
-        {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        if ternary_then_idx.is_none()
-            && (next_content.starts_with(b"&&") || next_content.starts_with(b"||"))
-            && !contains_boolean_operator_before_continuation(group_trimmed_start)
-        {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        if is_string_concat_continuation(&lines, group_start, group_end) {
-            i = final_line_idx + 1;
-            continue;
-        }
-
-        diagnostics.push(cop.diagnostic(
-            source,
-            report_line,
-            report_col,
-            "Redundant line break detected.".to_string(),
-        ));
-
-        i = final_line_idx + 1;
-    }
-}
-
-fn trim_trailing_whitespace(line: &[u8]) -> &[u8] {
-    let mut end = line.len();
-    while end > 0 && (line[end - 1] == b' ' || line[end - 1] == b'\t' || line[end - 1] == b'\r') {
-        end -= 1;
-    }
-    &line[..end]
-}
-
-fn trim_leading_whitespace(line: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while start < line.len() && (line[start] == b' ' || line[start] == b'\t') {
-        start += 1;
-    }
-    &line[start..]
-}
-
-fn is_string_concat_continuation(lines: &[&[u8]], group_start: usize, group_end: usize) -> bool {
-    for j in group_start..group_end {
-        let t = trim_trailing_whitespace(lines[j]);
-        if t.is_empty() || t[t.len() - 1] != b'\\' {
-            return false;
-        }
-        let before_bs = trim_trailing_whitespace(&t[..t.len() - 1]);
-        if before_bs.is_empty() {
-            return false;
-        }
-        let last_char = before_bs[before_bs.len() - 1];
-        if last_char != b'\'' && last_char != b'"' {
-            return false;
-        }
-
-        if j + 1 < lines.len() {
-            let next_content = trim_leading_whitespace(lines[j + 1]);
-            if next_content.is_empty() {
-                return false;
-            }
-            let first_char = next_content[0];
-            if first_char != b'\'' && first_char != b'"' {
-                if j + 1 == group_end && is_branch_terminator(next_content) {
-                    break;
-                }
-                return false;
-            }
-        }
-    }
-    if group_end < lines.len() {
-        let tail_content = trim_leading_whitespace(trim_trailing_whitespace(lines[group_end]));
-        if tail_content.is_empty() {
-            return false;
-        }
-        let first_char = tail_content[0];
-        if first_char == b'\'' || first_char == b'"' {
-            return true;
-        }
-        if is_branch_terminator(tail_content) {
-            return true;
-        }
-        return false;
-    }
-    true
-}
-
-/// Check if a trimmed line starts with a method chain dot followed by a word
-/// character, matching RuboCop's `/\n\s*(?=(&)?\.\w)/` pattern.
-/// Lines starting with `.operator` (like `.[]`, `.==`, `.+`) get a space
-/// when joining, while `.method_name` chains get no space.
-fn starts_with_method_chain_dot(trimmed: &[u8]) -> bool {
-    if trimmed.starts_with(b"&.") {
-        trimmed.len() > 2 && is_word_char(trimmed[2])
-    } else if trimmed.starts_with(b".") {
-        trimmed.len() > 1 && is_word_char(trimmed[1])
-    } else {
-        false
-    }
-}
-
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn starts_with_keyword(trimmed: &[u8], keyword: &[u8]) -> bool {
-    trimmed.starts_with(keyword)
-        && trimmed
-            .get(keyword.len())
-            .is_some_and(|b| b.is_ascii_whitespace())
-}
-
-fn modifier_condition_prefix_len(trimmed: &[u8]) -> usize {
-    for prefix in [b"return unless ".as_slice(), b"return if ".as_slice()] {
-        if trimmed.starts_with(prefix) {
-            return prefix.len();
-        }
-    }
-    0
-}
-
-fn contains_boolean_operator_before_continuation(trimmed: &[u8]) -> bool {
-    if !trimmed.ends_with(b"\\") {
-        return false;
-    }
-
-    let before_backslash = trim_trailing_whitespace(&trimmed[..trimmed.len() - 1]);
-    before_backslash
-        .windows(2)
-        .any(|window| window == b"||" || window == b"&&")
-        || contains_keyword_operator(before_backslash, b"or")
-        || contains_keyword_operator(before_backslash, b"and")
-}
-
-fn contains_keyword_operator(bytes: &[u8], keyword: &[u8]) -> bool {
-    if bytes.len() < keyword.len() {
-        return false;
-    }
-
-    bytes
-        .windows(keyword.len())
-        .enumerate()
-        .any(|(idx, window)| {
-            if window != keyword {
-                return false;
-            }
-            let before_ok = idx == 0 || !is_word_char(bytes[idx - 1]);
-            let after_idx = idx + keyword.len();
-            let after_ok = after_idx == bytes.len() || !is_word_char(bytes[after_idx]);
-            before_ok && after_ok
-        })
-}
-
-fn ends_with_special_global_backslash(trimmed: &[u8]) -> bool {
-    trimmed.len() >= 2 && trimmed[trimmed.len() - 2] == b'$' && trimmed[trimmed.len() - 1] == b'\\'
-}
-
-fn is_keyword_only_continuation(trimmed: &[u8]) -> bool {
-    if !trimmed.ends_with(b"\\") {
-        return false;
-    }
-
-    let before_backslash = trim_trailing_whitespace(&trimmed[..trimmed.len() - 1]);
-    before_backslash == b"if" || before_backslash == b"elsif" || before_backslash == b"unless"
-}
-
-fn leading_whitespace_len(line: &[u8]) -> usize {
-    let mut count = 0;
-    for &b in line {
-        if b == b' ' || b == b'\t' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count
-}
-
+/// Whether `bytes` contains a newline that is not a backslash line continuation.
 fn contains_non_continuation_newline(bytes: &[u8]) -> bool {
     for (i, &b) in bytes.iter().enumerate() {
         if b != b'\n' {
@@ -2246,13 +1713,12 @@ fn contains_non_continuation_newline(bytes: &[u8]) -> bool {
     false
 }
 
-fn is_branch_terminator(trimmed: &[u8]) -> bool {
-    trimmed == b"end"
-        || trimmed == b"else"
-        || trimmed == b"ensure"
-        || trimmed.starts_with(b"elsif ")
-        || trimmed.starts_with(b"when ")
-        || trimmed.starts_with(b"rescue ")
+fn trim_trailing_whitespace(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b' ' || line[end - 1] == b'\t' || line[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// Count the number of Unicode characters (code points) in a UTF-8 byte slice.
