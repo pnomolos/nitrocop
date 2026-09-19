@@ -311,10 +311,28 @@ fn descend_children<'pr>(
 /// {:max_by :min_by}) (args (arg $_x)) (lvar _x))`, say — silently fails to
 /// match. A list of two or more statements *is* a Parser `begin` and is left
 /// alone.
+///
+/// The full rule, from `parser`'s `Builders::Default#compstmt` and restated on
+/// `DefNode#body` (`vendor/rubocop-ast/lib/rubocop/ast/node/def_node.rb:43-51`):
+///
+/// | statements | Parser child |
+/// |---|---|
+/// | 0 | `nil` |
+/// | 1 | the statement itself |
+/// | 2+ | `(begin stmt…)` |
+///
+/// An `ElseNode` is peeled the same way, because Parser has no `else` node —
+/// only the body it guards — which is what the `else` slot of `(if … … …)`,
+/// `(case …)` and `(case_match …)` holds. A `BeginNode` is *not* peeled: it
+/// carries the `rescue`/`ensure` clause Prism keeps in sibling fields, which
+/// is the separate mapping gap recorded on [`super::ancestors`].
 fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
     let Some(node) = body else {
         return MatchChild::Absent;
     };
+    if let Some(else_node) = node.as_else_node() {
+        return body_child(else_node.statements().map(|s| s.as_node()));
+    }
     if let Some(statements) = node.as_statements_node() {
         let mut only: Option<ruby_prism::Node<'pr>> = None;
         for (index, statement) in statements.body().iter().enumerate() {
@@ -323,11 +341,33 @@ fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
             }
             only = Some(statement);
         }
-        if let Some(statement) = only {
-            return MatchChild::Node(statement);
-        }
+        // Zero statements is Parser's `nil` body: `if x then end` is
+        // `(if (send nil :x) nil nil)`.
+        return only.map_or(MatchChild::Absent, MatchChild::Node);
     }
     MatchChild::Node(node)
+}
+
+/// The match child for a parameter-list slot.
+///
+/// Parser always builds an `(args …)` node for a `def`, `defs` or block, empty
+/// when it takes no parameters; Prism has no node there at all. `(block
+/// #expect? (args) _body)` (`RSpec/VoidExpect`), `(block (send _ :describe
+/// $(const ...) ...) (args) $_)` (`RSpec/DescribedClass`) and `(def :blank?
+/// (args) ...)` (`Rails/Blank`) are all written against that always-present
+/// node.
+///
+/// The synthetic carries no value, so [`matches_synthetic`] gives it an empty
+/// child list: `(args)` matches a parameterless definition and `(args _)` does
+/// not. A `$` on the slot binds the empty byte slice — there is no node.
+fn args_child<'pr>(params: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
+    match params {
+        Some(node) => MatchChild::Node(node),
+        None => MatchChild::Synthetic {
+            parser_type: "args",
+            value: b"",
+        },
+    }
 }
 
 /// The Parser-gem sibling of `node` among `parent`'s children, `offset` places
@@ -340,6 +380,9 @@ fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
 /// a [`MatchChild::Node`] answers `None`, so `Struct.new(keyword_init: nil)`
 /// correctly finds no node before the hash while
 /// `Struct.new(:foo, keyword_init: nil)` finds `:foo`.
+// Consumed by the IR cop runtime on the `ir/*` branches (`Cop IR:
+// Style/RedundantStructKeywordInit`), which is not on this branch yet.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn parser_sibling<'pr>(
     node: &ruby_prism::Node<'pr>,
@@ -364,6 +407,9 @@ pub(crate) fn parser_sibling<'pr>(
 }
 
 /// Whether `parent` has `node` as a direct Parser-gem child.
+// Consumed by the IR cop runtime on the `ir/*` branches (`Cop IR:
+// Style/RedundantStructKeywordInit`), which is not on this branch yet.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn is_parser_child(node: &ruby_prism::Node<'_>, parent: &ruby_prism::Node<'_>) -> bool {
     let Some(parser_type) = parser_type_for_node(parent).or_else(|| block_type_of(parent)) else {
@@ -1322,26 +1368,14 @@ pub(crate) fn get_children<'pr>(
                     parser_type: "sym",
                     value: b"it",
                 }),
-                _ => match params {
-                    Some(p) => children.push(MatchChild::Node(p)),
-                    None => children.push(MatchChild::Absent),
-                },
+                _ => children.push(args_child(params)),
             }
             children.push(body_child(body));
         }
         "def" => {
             let def = node.as_def_node()?;
             children.push(MatchChild::Name(def.name().as_slice()));
-            // Parser always builds an `(args)` node, empty or not, so
-            // `(def :m (args) …)` is how upstream spells a parameterless
-            // definition; Prism has no node there at all.
-            match def.parameters() {
-                Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Synthetic {
-                    parser_type: "args",
-                    value: b"",
-                }),
-            }
+            children.push(args_child(def.parameters().map(|p| p.as_node())));
             children.push(body_child(def.body()));
         }
         "defs" => {
@@ -1351,16 +1385,7 @@ pub(crate) fn get_children<'pr>(
                 None => children.push(MatchChild::Absent),
             }
             children.push(MatchChild::Name(def.name().as_slice()));
-            // Parser always builds an `(args)` node, empty or not, so
-            // `(def :m (args) …)` is how upstream spells a parameterless
-            // definition; Prism has no node there at all.
-            match def.parameters() {
-                Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Synthetic {
-                    parser_type: "args",
-                    value: b"",
-                }),
-            }
+            children.push(args_child(def.parameters().map(|p| p.as_node())));
             children.push(body_child(def.body()));
         }
         "const" => {
@@ -1474,14 +1499,8 @@ pub(crate) fn get_children<'pr>(
         "if" => {
             let if_node = node.as_if_node()?;
             children.push(MatchChild::Node(if_node.predicate()));
-            match if_node.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
-            match if_node.subsequent() {
-                Some(s) => children.push(MatchChild::Node(s)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(if_node.statements().map(|s| s.as_node())));
+            children.push(body_child(if_node.subsequent()));
         }
         "case" => {
             let case = node.as_case_node()?;
@@ -1492,45 +1511,30 @@ pub(crate) fn get_children<'pr>(
             for cond in case.conditions().iter() {
                 children.push(MatchChild::Node(cond));
             }
-            match case.else_clause() {
-                Some(e) => children.push(MatchChild::Node(e.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(case.else_clause().map(|e| e.as_node())));
         }
         "when" => {
             let when = node.as_when_node()?;
             for cond in when.conditions().iter() {
                 children.push(MatchChild::Node(cond));
             }
-            match when.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(when.statements().map(|s| s.as_node())));
         }
         "while" => {
             let w = node.as_while_node()?;
             children.push(MatchChild::Node(w.predicate()));
-            match w.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(w.statements().map(|s| s.as_node())));
         }
         "until" => {
             let u = node.as_until_node()?;
             children.push(MatchChild::Node(u.predicate()));
-            match u.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(u.statements().map(|s| s.as_node())));
         }
         "for" => {
             let f = node.as_for_node()?;
             children.push(MatchChild::Node(f.index()));
             children.push(MatchChild::Node(f.collection()));
-            match f.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(f.statements().map(|s| s.as_node())));
         }
         "return" => {
             let r = node.as_return_node()?;
@@ -1639,10 +1643,7 @@ pub(crate) fn get_children<'pr>(
             for condition in case.conditions().iter() {
                 children.push(MatchChild::Node(condition));
             }
-            match case.else_clause() {
-                Some(e) => children.push(MatchChild::Node(e.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(case.else_clause().map(|e| e.as_node())));
         }
         "in_pattern" => {
             // Parser: `(in_pattern pattern guard body)`. Prism folds the guard
@@ -1652,10 +1653,7 @@ pub(crate) fn get_children<'pr>(
             let in_node = node.as_in_node()?;
             children.push(MatchChild::Node(in_node.pattern()));
             children.push(MatchChild::Absent);
-            match in_node.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(in_node.statements().map(|s| s.as_node())));
         }
         "sclass" => {
             // Parser: `(sclass expr body)`.
@@ -1730,10 +1728,7 @@ pub(crate) fn get_children<'pr>(
                 Some(r) => children.push(MatchChild::Node(r)),
                 None => children.push(MatchChild::Absent),
             }
-            match resbody.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(resbody.statements().map(|s| s.as_node())));
         }
         "rational" | "complex" => {
             // Value-only nodes — matched via the literal special-cases.
