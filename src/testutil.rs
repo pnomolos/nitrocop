@@ -472,12 +472,75 @@ pub fn assert_cop_no_offenses_full_with_config(
 
 // ---- Variant fixture helpers ----
 
+/// Split a `# nitrocop-config:` directive body on top-level `, ` separators,
+/// ignoring commas nested inside `[...]` list values.
+fn split_top_level_pairs(config_str: &str) -> Vec<&str> {
+    let mut pairs = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let bytes = config_str.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 && config_str[i..].starts_with(", ") => {
+                pairs.push(&config_str[start..i]);
+                i += 1; // skip the space too, loop increment handles the comma
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    pairs.push(&config_str[start..]);
+    pairs
+}
+
+/// Parse a single directive value into a typed `serde_yml::Value`.
+fn parse_variant_value(value: &str) -> serde_yml::Value {
+    if value == "true" {
+        return serde_yml::Value::Bool(true);
+    }
+    if value == "false" {
+        return serde_yml::Value::Bool(false);
+    }
+    if value == "~" {
+        return serde_yml::Value::Null;
+    }
+    if let Ok(n) = value.parse::<i64>() {
+        return serde_yml::Value::Number(serde_yml::Number::from(n));
+    }
+    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        let items: Vec<serde_yml::Value> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            inner
+                .split(',')
+                .map(|item| serde_yml::Value::String(item.trim().to_string()))
+                .collect()
+        };
+        return serde_yml::Value::Sequence(items);
+    }
+    serde_yml::Value::String(value.to_string())
+}
+
 /// Parse a `# nitrocop-config:` directive from fixture bytes and return
 /// (config, source_without_directive).
 ///
 /// The directive format is: `# nitrocop-config: Key1: value1, Key2: value2`
 /// This is used by `cop_variant_fixture_tests!` to auto-discover variant
 /// fixtures and run them with the correct config.
+///
+/// Values are type-sniffed so non-string options (bool, int, list, null) work
+/// with `CopConfig::get_bool`/`get_usize`/`get_string_array`, not just
+/// `get_str`:
+/// - `true` / `false` -> bool
+/// - a bare integer -> number
+/// - `~` -> null
+/// - `[a, b, c]` -> sequence of strings (commas inside brackets are not
+///   treated as pair separators)
+/// - anything else -> string (as before)
 pub fn parse_variant_fixture(fixture_bytes: &[u8]) -> (CopConfig, Vec<u8>) {
     let text = std::str::from_utf8(fixture_bytes).expect("fixture must be valid UTF-8");
     let first_line = text.lines().next().unwrap_or("");
@@ -485,13 +548,10 @@ pub fn parse_variant_fixture(fixture_bytes: &[u8]) -> (CopConfig, Vec<u8>) {
     if let Some(config_str) = first_line.strip_prefix("# nitrocop-config: ") {
         use std::collections::HashMap;
         let mut options = HashMap::new();
-        for pair in config_str.split(", ") {
+        for pair in split_top_level_pairs(config_str) {
             let pair = pair.trim();
             if let Some((key, value)) = pair.split_once(": ") {
-                options.insert(
-                    key.trim().to_string(),
-                    serde_yml::Value::String(value.trim().to_string()),
-                );
+                options.insert(key.trim().to_string(), parse_variant_value(value.trim()));
             }
         }
 
@@ -670,6 +730,66 @@ fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Variant fixture directive value parsing ----
+
+    #[test]
+    fn parse_variant_value_bool_and_null() {
+        assert_eq!(parse_variant_value("true"), serde_yml::Value::Bool(true));
+        assert_eq!(parse_variant_value("false"), serde_yml::Value::Bool(false));
+        assert_eq!(parse_variant_value("~"), serde_yml::Value::Null);
+    }
+
+    #[test]
+    fn parse_variant_value_integer() {
+        assert_eq!(
+            parse_variant_value("2"),
+            serde_yml::Value::Number(serde_yml::Number::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_variant_value_list() {
+        assert_eq!(
+            parse_variant_value("[foo, bar/baz]"),
+            serde_yml::Value::Sequence(vec![
+                serde_yml::Value::String("foo".to_string()),
+                serde_yml::Value::String("bar/baz".to_string()),
+            ])
+        );
+        assert_eq!(
+            parse_variant_value("[]"),
+            serde_yml::Value::Sequence(vec![])
+        );
+    }
+
+    #[test]
+    fn parse_variant_value_plain_string_unchanged() {
+        assert_eq!(
+            parse_variant_value("always_braces"),
+            serde_yml::Value::String("always_braces".to_string())
+        );
+    }
+
+    #[test]
+    fn split_top_level_pairs_ignores_commas_inside_brackets() {
+        let pairs = split_top_level_pairs(
+            "DisallowedCops: [Layout/LineLength, Style/Foo], AllowWithReason: true",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                "DisallowedCops: [Layout/LineLength, Style/Foo]",
+                "AllowWithReason: true",
+            ]
+        );
+    }
+
+    #[test]
+    fn split_top_level_pairs_single_pair() {
+        let pairs = split_top_level_pairs("EnforcedStyle: always_braces");
+        assert_eq!(pairs, vec!["EnforcedStyle: always_braces"]);
+    }
 
     // ---- Annotation parser unit tests ----
 
