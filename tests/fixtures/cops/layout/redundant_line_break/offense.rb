@@ -635,3 +635,29 @@ params[:advanced_search] = {
     }
   ]
 }
+
+# Chained assignment. RuboCop's `check_assignment` has no `part_of_ignored_node?`
+# guard (only `on_send` does), so every nested write node that is still multiline
+# is reported — not just the outermost one.
+@textInsert =
+^ Layout/RedundantLineBreak: Redundant line break detected.
+@textChangeHeight =
+^ Layout/RedundantLineBreak: Redundant line break detected.
+@textChange =
+^ Layout/RedundantLineBreak: Redundant line break detected.
+@textDelete = nil
+
+# Same shape, but the outermost assignment joins to 122 characters so `too_long?`
+# suppresses it; the nested ones below it still fit and are each reported.
+        @chkDefault =
+        @chkUseBitmapClass =
+        ^ Layout/RedundantLineBreak: Redundant line break detected.
+        @chkDisable =
+        ^ Layout/RedundantLineBreak: Redundant line break detected.
+        @chkUsePressed =
+        ^ Layout/RedundantLineBreak: Redundant line break detected.
+        @chkUseFocused =
+        ^ Layout/RedundantLineBreak: Redundant line break detected.
+        @chkUseCurrent =
+        ^ Layout/RedundantLineBreak: Redundant line break detected.
+        @chkUseDisabled = nil

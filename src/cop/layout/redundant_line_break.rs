@@ -358,6 +358,18 @@ use crate::parse::source::SourceFile;
 ///
 ///   Sampled corpus effect (21 repos reproducing the oracle's per-repo counts):
 ///   FP 39 → 23, FN unchanged.
+/// - **Chained assignment**: `check_assignment` no longer consults
+///   `part_of_reported_node`. RuboCop's `CheckAssignment` path is
+///   `return unless offense?(node); register_offense(node)` — the
+///   `!part_of_ignored_node?(node)` guard exists only on `on_send`. So in
+///   `@a =\n@b =\n@c = nil` each nested write node that is still multiline is
+///   reported, while nitrocop reported only the outermost one. Where the
+///   outermost join exceeds `MaxLineLength` (mcorino/wxRuby3
+///   `samples/widgets/button.rb:51`) nitrocop previously reported nothing at
+///   all, because the outer node was rejected and the inner ones suppressed.
+///
+///   Sampled corpus effect: FN 77 → 33 (wxRuby3 41 → 0, gdelugre/origami
+///   3 → 0, dependabot-core 3 → 0), FP unchanged at 23.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -1522,11 +1534,21 @@ impl<'pr> Visit<'pr> for RedundantLineBreakVisitor<'_, 'pr> {
 }
 
 impl RedundantLineBreakVisitor<'_, '_> {
+    /// Mirrors RuboCop's `check_assignment`:
+    ///
+    /// ```ruby
+    /// def check_assignment(node, _rhs)
+    ///   return unless offense?(node)
+    ///
+    ///   register_offense(node)
+    /// end
+    /// ```
+    ///
+    /// Note the absence of a `part_of_ignored_node?` guard — only `on_send`
+    /// has one. Chained assignments (`@a =\n@b =\n@c = nil`) are therefore
+    /// reported once per nested write node, not once for the outermost one.
     fn check_assignment(&mut self, start_offset: usize, end_offset: usize) {
         if !self.is_multiline(start_offset, end_offset) {
-            return;
-        }
-        if self.part_of_reported_node(start_offset, end_offset) {
             return;
         }
         if !self.suitable_as_single_line(start_offset, end_offset) {
