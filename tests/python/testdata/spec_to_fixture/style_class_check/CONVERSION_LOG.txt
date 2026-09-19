@@ -1,0 +1,5 @@
+Style/ClassCheck: 4 example(s) converted, 0 skipped
+  wrote: tests/python/testdata/spec_to_fixture/style_class_check/style/class_check/offense.is_a.rb
+  wrote: tests/python/testdata/spec_to_fixture/style_class_check/style/class_check/offense.kind_of.rb
+  wrote: tests/python/testdata/spec_to_fixture/style_class_check/style/class_check/corrected.is_a.rb
+  wrote: tests/python/testdata/spec_to_fixture/style_class_check/style/class_check/corrected.kind_of.rb

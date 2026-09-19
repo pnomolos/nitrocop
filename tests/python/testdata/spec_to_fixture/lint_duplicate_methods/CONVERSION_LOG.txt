@@ -1,0 +1,74 @@
+Lint/DuplicateMethods: 13 example(s) converted, 64 skipped
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/no_offense.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_1.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_2.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_3.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_4.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_5.rb
+  wrote: tests/python/testdata/spec_to_fixture/lint_duplicate_methods/lint/duplicate_methods/offense/scenario_6.rb
+Skipped:
+  spec line 6: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 20: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 33: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 47: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 60: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 73: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 87: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 101: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 114: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 128: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 149: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 165: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 181: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 200: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 216: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 237: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 253: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 265: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 276: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 287: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 299: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 310: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 321: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 332: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 340: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 351: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 362: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 377: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 388: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 403: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 413: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 423: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 443: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 463: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 481: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 499: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 522: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 534: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 546: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 558: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 570: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 582: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 594: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 606: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 617: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 631: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 643: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 654: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 668: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 680: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 692: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 710: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 722: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 733: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 744: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 755: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 768: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 778: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 789: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 800: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 811: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 829: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 844: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 859: inside shared_examples/it_behaves_like or a parameterized block
