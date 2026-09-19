@@ -7448,3 +7448,78 @@ fn shared_module_usage_lint() {
         panic!("{msg}");
     }
 }
+
+// ---------- Vendor pattern builtin-resolution coverage ----------
+
+/// How many vendored patterns resolve with *no* cop-level resolver — i.e. use
+/// only the builtin predicate registry — and which helper names the rest need.
+///
+/// The unresolved list is the input to the IR work: every name here has to
+/// become a `matchers:`/`predicates:` entry on the cop that declares it (or,
+/// for the rubocop-rspec `Language` modules, an entry in the shared prelude).
+#[test]
+fn verifier_vendor_pattern_builtin_resolution_coverage() {
+    use nitrocop::node_pattern::{
+        Lexer, NoResolver, Parser, Unresolved, collect_unresolved, walk_vendor_patterns,
+    };
+    use std::collections::BTreeMap;
+
+    let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    if !vendor_root.is_dir() {
+        eprintln!("vendor/ directory not found — skipping resolution coverage test");
+        return;
+    }
+    let patterns = walk_vendor_patterns(&vendor_root);
+    if patterns.is_empty() {
+        eprintln!("No vendor patterns extracted — submodules may not be initialized. Skipping.");
+        return;
+    }
+
+    let mut total = 0usize;
+    let mut resolved = 0usize;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for (_cop_name, extracted) in &patterns {
+        total += 1;
+        let mut lexer = Lexer::new(&extracted.pattern);
+        let mut parser = Parser::new(lexer.tokenize());
+        let Some(ast) = parser.parse() else { continue };
+
+        let mut unresolved = Vec::new();
+        collect_unresolved(&ast, &NoResolver, &mut unresolved);
+        if unresolved.is_empty() {
+            resolved += 1;
+            continue;
+        }
+        for name in unresolved {
+            let key = match &name {
+                Unresolved::Helper(_) | Unresolved::Predicate(_) | Unresolved::Constant(_) => {
+                    name.to_string()
+                }
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let rate = (resolved as f64 / total as f64) * 100.0;
+    eprintln!("\n=== Vendor Pattern Builtin-Resolution Coverage ===");
+    eprintln!("Total patterns:        {total}");
+    eprintln!("Builtins only:         {resolved} ({rate:.1}%)");
+    eprintln!("Need a cop resolver:   {}", total - resolved);
+    eprintln!("Distinct unresolved names: {}", counts.len());
+    eprintln!();
+
+    let mut ranked: Vec<_> = counts.iter().collect();
+    ranked.sort_by_key(|(name, count)| (std::cmp::Reverse(**count), (*name).clone()));
+    for (name, count) in &ranked {
+        eprintln!("  {count:4}  {name}");
+    }
+
+    // A floor, not an exact figure: adding a builtin should be free to move it
+    // up, and a vendor bump should not have to touch this test to move it a
+    // little either way.
+    assert!(
+        resolved * 100 >= total * 70,
+        "builtin-only resolution fell below 70% ({resolved}/{total})"
+    );
+}
