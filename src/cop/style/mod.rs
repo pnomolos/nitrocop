@@ -189,6 +189,7 @@ pub mod proc;
 pub mod quoted_symbols;
 pub mod raise_args;
 pub mod random_with_offset;
+pub mod reduce_to_hash;
 pub mod redundant_argument;
 pub mod redundant_array_constructor;
 pub mod redundant_array_flatten;
@@ -601,6 +602,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(perl_backrefs::PerlBackrefs));
     registry.register(Box::new(quoted_symbols::QuotedSymbols));
     registry.register(Box::new(random_with_offset::RandomWithOffset));
+    registry.register(Box::new(reduce_to_hash::ReduceToHash));
     registry.register(Box::new(redundant_argument::RedundantArgument));
     registry.register(Box::new(
         redundant_array_constructor::RedundantArrayConstructor,
