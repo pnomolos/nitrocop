@@ -1,0 +1,35 @@
+schema: 1
+cop: "Style/TimeNow"
+version_added: "1.90"
+enabled_default: pending
+tier: preview
+autocorrect: safe
+docs: |
+  Checks for `Time.new` without arguments, which is an implicit way to retrieve
+  the current system time. Prefer the more explicit `Time.now`.
+
+  `Time.new` with arguments constructs a specific time and is left alone.
+restrict_on_send: [new]
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0 lib/rubocop/cop/style/time_now.rb.
+  # `(call ...)` rather than `(send ...)` plus `alias on_csend on_send` is why
+  # the hook lists both `send` and `csend`.
+  time_new:
+    pattern: |
+      (call (const {nil? cbase} :Time) :new)
+
+hooks:
+  - on: [send, csend]
+    match: time_new
+    offense:
+      location: node
+      message: "Prefer `Time.now` over `Time.new` to retrieve the current time."
+      correct:
+        # Upstream is
+        #   corrector.replace(node.loc.selector.join(node.source_range.end), 'now')
+        # — from the start of `new` to the end of the whole call, so the empty
+        # argument list of `Time.new()` is swallowed too.
+        - op: replace
+          range: { start: node.selector.start, stop: node.expression.stop }
+          text: "now"

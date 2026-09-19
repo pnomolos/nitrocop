@@ -92,8 +92,8 @@ mod tests {
     fn default_registry_has_cops() {
         let reg = CopRegistry::default_registry();
         assert!(!reg.is_empty());
-        // 915 supported + 5 no-ops (obsolete on Ruby 3.4+)
-        assert_eq!(reg.len(), 915 + 5);
+        // 915 supported + 5 no-ops (obsolete on Ruby 3.4+) + 1 embedded IR cop
+        assert_eq!(reg.len(), 915 + 5 + super::super::ir::embedded::FILES.len());
         // Spot-check cops from each department
         assert!(reg.get("Layout/TrailingWhitespace").is_some());
         assert!(reg.get("Layout/LineLength").is_some());
@@ -111,6 +111,8 @@ mod tests {
         assert!(reg.get("Style/EmptyMethod").is_some());
         assert!(reg.get("Lint/BooleanSymbol").is_some());
         assert!(reg.get("Lint/UnifiedInteger").is_some());
+        // Declarative cops register alongside the hand-written ones.
+        assert!(reg.get("Style/TimeNow").is_some());
     }
 
     #[test]
