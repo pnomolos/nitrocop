@@ -39,6 +39,9 @@ pub enum Value<'pr> {
     Str(Cow<'pr, [u8]>),
     Sym(Cow<'pr, [u8]>),
     Node(ruby_prism::Node<'pr>),
+    /// A `loc` part: a byte range with no node of its own, produced by
+    /// `{ attr: [x, "loc", "dot"] }`. Only the position attributes read it.
+    Loc(usize, usize),
     List(Vec<Value<'pr>>),
     Nil,
 }
@@ -53,6 +56,7 @@ impl Clone for Value<'_> {
             Value::Str(bytes) => Value::Str(bytes.clone()),
             Value::Sym(bytes) => Value::Sym(bytes.clone()),
             Value::Node(node) => Value::Node(dup_node(node)),
+            Value::Loc(start, end) => Value::Loc(*start, *end),
             Value::List(items) => Value::List(items.clone()),
             Value::Nil => Value::Nil,
         }
@@ -68,6 +72,19 @@ impl<'pr> Value<'pr> {
     #[must_use]
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
+    }
+
+    /// The byte range this value occupies: a node's own extent, or a `loc`
+    /// part's. Everything else has none.
+    #[must_use]
+    pub fn span(&self) -> Option<(usize, usize)> {
+        match self {
+            Value::Node(node) => {
+                Some((node.location().start_offset(), node.location().end_offset()))
+            }
+            Value::Loc(start, end) => Some((*start, *end)),
+            _ => None,
+        }
     }
 
     /// The node this value holds, if it is one.
@@ -319,6 +336,23 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .and_then(crate::node_pattern::parser_type_name)
             .map_or(Value::Nil, |name| Value::str(name.as_bytes()));
     }
+    // The position family reads a byte range, so it applies to a `loc` part
+    // exactly as it does to a node. `last_line`/`last_column` are Parser's
+    // `Range#last_line`/`#last_column`: the line and column of `end_pos`.
+    if matches!(
+        attr,
+        Attr::Line | Attr::LastLine | Attr::Column | Attr::LastColumn
+    ) {
+        let Some((start, end)) = value.span() else {
+            return Value::Nil;
+        };
+        let at_start = matches!(attr, Attr::Line | Attr::Column);
+        let (line, column) = ctx
+            .src
+            .offset_to_line_col(if at_start { start } else { end });
+        let wants_line = matches!(attr, Attr::Line | Attr::LastLine);
+        return Value::Int(if wants_line { line } else { column } as i64);
+    }
     let Some(node) = value.node() else {
         return Value::Nil;
     };
@@ -352,12 +386,9 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .next_back()
             .map_or(Value::Nil, Value::Node),
         Attr::Source => Value::str(node.location().as_slice()),
-        Attr::Line => {
-            Value::Int(ctx.src.offset_to_line_col(node.location().start_offset()).0 as i64)
-        }
-        Attr::Column => {
-            Value::Int(ctx.src.offset_to_line_col(node.location().start_offset()).1 as i64)
-        }
+        Attr::Loc(part) => super::cop::part_loc(node, part).map_or(Value::Nil, |loc| {
+            Value::Loc(loc.start_offset(), loc.end_offset())
+        }),
         Attr::Value => literal_value(node),
         Attr::Type => crate::node_pattern::parser_type_name(node)
             .map_or(Value::Nil, |name| Value::str(name.as_bytes())),
@@ -371,7 +402,9 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .into_iter()
             .next_back()
             .map_or(Value::Nil, Value::Node),
-        Attr::ParentType => unreachable!("handled above"),
+        Attr::ParentType | Attr::Line | Attr::LastLine | Attr::Column | Attr::LastColumn => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -474,12 +507,14 @@ fn compare(op: CmpOp, lhs: &Value<'_>, rhs: &Value<'_>) -> bool {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         (Value::Nil, Value::Nil) => Some(Ordering::Equal),
-        // Two nodes compare by identity, i.e. by byte range — which is what
-        // `==` on Parser nodes effectively means (design §1.6).
-        (Value::Node(a), Value::Node(b)) => Some(
-            (a.location().start_offset(), a.location().end_offset())
-                .cmp(&(b.location().start_offset(), b.location().end_offset())),
-        ),
+        // Two nodes (or two `loc` parts) compare by identity, i.e. by byte
+        // range — which is what `==` on Parser nodes means (design §1.6).
+        (Value::Node(_) | Value::Loc(..), Value::Node(_) | Value::Loc(..)) => {
+            match (lhs.span(), rhs.span()) {
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
+                _ => None,
+            }
+        }
         _ => match (lhs.bytes(), rhs.bytes()) {
             (Some(a), Some(b)) => Some(a.as_ref().cmp(b.as_ref())),
             _ => None,
@@ -1021,6 +1056,45 @@ mod tests {
             )
             .captures("[arg]"),
             Case::new("Time.new", TIME_NEW, "{ eq: [node.type, \"send\"] }"),
+            // --- positions, on a node and on a `loc` part -----------------
+            Case::new(
+                "array\n  .map(&:to_s)\n  .join\n",
+                "(send _ :join)",
+                "{ eq: [node.receiver.last_line, 2] }",
+            ),
+            Case::new("Time.new", TIME_NEW, "{ eq: [node.last_line, 1] }"),
+            Case::new("  Time.new", TIME_NEW, "{ eq: [node.last_column, 10] }"),
+            // `Style/MapJoin`'s `receiver.last_line < map_send.loc.dot.line`:
+            // the dot is on the line after the receiver ends.
+            Case::new(
+                "array\n  .map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ lt: [node.receiver.last_line, node.loc.dot.line] }",
+            ),
+            Case::new(
+                "array.map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ lt: [node.receiver.last_line, node.loc.dot.line] }",
+            )
+            .falsey(),
+            Case::new(
+                "array\n  .map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ eq: [node.loc.dot.column, 2] }",
+            ),
+            // The `attr` operator spelling of the same step.
+            Case::new(
+                "array.map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ eq: [{ attr: [{ attr: [node, \"loc\", \"selector\"] }, \"column\"] }, 6] }",
+            ),
+            // A part the node does not have, and a part of a non-node: both nil.
+            Case::new("Time.new", TIME_NEW, "{ eq: [node.loc.keyword, null] }"),
+            Case::new(
+                "Time.new",
+                TIME_NEW,
+                "{ eq: [node.method_name.line, null] }",
+            ),
             Case::new(
                 "x = Time.new",
                 TIME_NEW,

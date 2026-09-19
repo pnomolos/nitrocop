@@ -65,10 +65,19 @@ pub enum Attr {
     LastArgument,
     /// `.source` — the node's verbatim source text.
     Source,
-    /// `.line` — 1-based start line.
+    /// `.line` — 1-based line of the start of the node or loc part.
     Line,
-    /// `.column` — 0-based start column.
+    /// `.last_line` — 1-based line of its end (Parser's `Range#last_line`).
+    LastLine,
+    /// `.column` — 0-based column of its start.
     Column,
+    /// `.last_column` — 0-based column of its end.
+    LastColumn,
+    /// `.loc.<part>` — one of the node's `loc` sub-ranges, as a location
+    /// value. The same part vocabulary anchors use, so
+    /// `{ attr: [node.loc.dot, line] }` and `node.loc.dot.start` name the
+    /// same range.
+    Loc(LocPart),
     /// `.value` — a literal node's value (string/symbol/int/bool/nil).
     Value,
     /// `.type` — Parser-gem type name.
@@ -86,6 +95,67 @@ pub enum Attr {
     LastChild,
 }
 
+/// The `node.loc.<part>` vocabulary, shared by anchors (`load.rs`'s
+/// `anchor_segments`, `cop.rs`'s `parse_anchor`/`part_loc`) and by expressions
+/// (`{ attr: [x, "loc", "dot"] }` / `x.loc.dot`). One list, so a part that
+/// resolves in an anchor resolves in a guard and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocPart {
+    Expression,
+    Selector,
+    Dot,
+    Keyword,
+    EndKeyword,
+    Operator,
+    Begin,
+    End,
+}
+
+impl LocPart {
+    /// Every part name, for diagnostics.
+    pub const NAMES: &'static [&'static str] = &[
+        "expression",
+        "selector",
+        "dot",
+        "keyword",
+        "end_keyword",
+        "operator",
+        "begin",
+        "end",
+    ];
+
+    /// The part a `loc` path segment names, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "expression" => Self::Expression,
+            "selector" => Self::Selector,
+            "dot" => Self::Dot,
+            "keyword" => Self::Keyword,
+            "end_keyword" => Self::EndKeyword,
+            "operator" => Self::Operator,
+            "begin" => Self::Begin,
+            "end" => Self::End,
+            _ => return None,
+        })
+    }
+
+    /// The name this part is written with.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expression => "expression",
+            Self::Selector => "selector",
+            Self::Dot => "dot",
+            Self::Keyword => "keyword",
+            Self::EndKeyword => "end_keyword",
+            Self::Operator => "operator",
+            Self::Begin => "begin",
+            Self::End => "end",
+        }
+    }
+}
+
 fn attr_from_name(name: &str) -> Option<Attr> {
     Some(match name {
         "method_name" => Attr::MethodName,
@@ -97,7 +167,9 @@ fn attr_from_name(name: &str) -> Option<Attr> {
         "last_argument" => Attr::LastArgument,
         "source" => Attr::Source,
         "line" => Attr::Line,
+        "last_line" => Attr::LastLine,
         "column" => Attr::Column,
+        "last_column" => Attr::LastColumn,
         "value" => Attr::Value,
         "type" => Attr::Type,
         "parent_type" => Attr::ParentType,
@@ -649,16 +721,53 @@ fn compile_scalar(text: &str, ctx: &mut CompileCtx<'_>) -> Result<Expr, IrError>
             }
         }
     };
-    segments.try_fold(base, |of, segment| match attr_from_name(segment) {
-        Some(attr) => Ok(Expr::Attr {
+    let rest: Vec<&str> = segments.collect();
+    attr_path(base, &rest, text, ctx)
+}
+
+/// Fold `[.<attr>]*` onto `base`, where `loc` consumes the segment after it as
+/// a [`LocPart`] — the one place a path step is two segments wide.
+fn attr_path(
+    base: Expr,
+    segments: &[&str],
+    text: &str,
+    ctx: &CompileCtx<'_>,
+) -> Result<Expr, IrError> {
+    let mut of = base;
+    let mut index = 0;
+    while index < segments.len() {
+        let attr = if segments[index] == "loc" {
+            let Some(name) = segments.get(index + 1) else {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`{text}`: `loc` must be followed by a part name, one of {:?}",
+                    LocPart::NAMES
+                );
+            };
+            let Some(part) = LocPart::from_name(name) else {
+                cerr!(ctx, Expr, "`{text}`: unknown `loc` part `{name}`");
+            };
+            index += 2;
+            Attr::Loc(part)
+        } else {
+            let Some(attr) = attr_from_name(segments[index]) else {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`{text}`: unknown attribute `{}`",
+                    segments[index]
+                );
+            };
+            index += 1;
+            attr
+        };
+        of = Expr::Attr {
             of: Box::new(of),
             attr,
-        }),
-        None => Err(ctx.error(
-            IrErrorKind::Expr,
-            format!("`{text}`: unknown attribute `{segment}`"),
-        )),
-    })
+        };
+    }
+    Ok(of)
 }
 
 fn compile_op(
@@ -774,6 +883,20 @@ fn compile_op(
                     )
                 })?;
                 Attr::Arg(index as usize)
+            } else if name == "loc" {
+                let part = items
+                    .get(2)
+                    .and_then(|v| v.as_str())
+                    .and_then(LocPart::from_name);
+                let Some(part) = part else {
+                    cerr!(
+                        ctx,
+                        Expr,
+                        "`attr`: `loc` needs a part name, one of {:?}",
+                        LocPart::NAMES
+                    );
+                };
+                Attr::Loc(part)
             } else {
                 match attr_from_name(name) {
                     Some(attr) if items.len() == 2 => attr,

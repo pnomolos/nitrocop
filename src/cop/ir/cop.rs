@@ -52,7 +52,7 @@ use crate::node_pattern::resolve::{Params, Resolver};
 use crate::parse::source::SourceFile;
 
 use super::eval::{EvalCtx, Value, eval};
-use super::expr::{Attr, Collection, CompiledDoc, DocResolver, Expr, Intrinsic, Target};
+use super::expr::{Attr, Collection, CompiledDoc, DocResolver, Expr, Intrinsic, LocPart, Target};
 use super::load::{IrCop, IrError, IrErrorKind};
 use super::schema::{
     AutocorrectMode, ConfigType, CorrectionOp, EnabledDefault, LocationSpec, MatchSpec,
@@ -134,7 +134,7 @@ enum AnchorTarget {
 struct Anchor {
     target: AnchorTarget,
     accessors: Vec<String>,
-    part: Option<String>,
+    part: Option<LocPart>,
     /// `true` for `.start`, `false` for `.stop`; `None` on a range shorthand.
     edge: Option<bool>,
 }
@@ -732,36 +732,34 @@ fn parse_anchor(path: &str, captures: &[String], want_edge: bool) -> Option<Anch
         part: None,
         edge: None,
     };
+    // `loc` is an optional marker before a part; the loader accepts both
+    // spellings, so both have to split the same way here.
+    let mut expect_part = false;
     for segment in segments {
+        if std::mem::take(&mut expect_part) {
+            anchor.part = Some(LocPart::from_name(segment)?);
+            continue;
+        }
         match segment {
             "start" => anchor.edge = Some(true),
             "stop" => anchor.edge = Some(false),
             _ if anchor.edge.is_some() => return None,
-            part if PARTS.contains(&part) => {
+            "loc" if anchor.part.is_none() => expect_part = true,
+            _ if LocPart::from_name(segment).is_some() => {
                 if anchor.part.is_some() {
                     return None;
                 }
-                anchor.part = Some(part.to_string());
+                anchor.part = LocPart::from_name(segment);
             }
             accessor if anchor.part.is_none() => anchor.accessors.push(accessor.to_string()),
             _ => return None,
         }
     }
+    if expect_part {
+        return None;
+    }
     (anchor.edge.is_some() == want_edge).then_some(anchor)
 }
-
-/// `node.loc.<part>` names. Mirrors `load::PARTS`; the split above needs to
-/// tell a part from an accessor, which the loader never has to.
-const PARTS: &[&str] = &[
-    "expression",
-    "selector",
-    "dot",
-    "keyword",
-    "end_keyword",
-    "operator",
-    "begin",
-    "end",
-];
 
 impl AnchorRange {
     fn resolve(
@@ -797,7 +795,7 @@ impl Anchor {
         for accessor in &self.accessors {
             current = accessor_node(&current, accessor, ancestors)?;
         }
-        let loc = match &self.part {
+        let loc = match self.part {
             Some(part) => part_loc(&current, part)?,
             None => current.location(),
         };
@@ -890,13 +888,15 @@ fn call_arg<'pr>(node: &ruby_prism::Node<'pr>, index: usize) -> Option<ruby_pris
         .nth(index)
 }
 
-/// The `node.loc.<part>` vocabulary of `load::PARTS`.
-fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'pr>> {
+/// The `node.loc.<part>` vocabulary, shared with the expression layer's
+/// `{ attr: [x, "loc", "<part>"] }` (`eval::attr_of`), so a part means the same
+/// range in a guard as in an anchor.
+pub(super) fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: LocPart) -> Option<PrismLoc<'pr>> {
     match part {
-        "expression" => Some(node.location()),
-        "selector" => pick!(node; opt as_call_node.message_loc, req as_def_node.name_loc),
-        "dot" => node.as_call_node()?.call_operator_loc(),
-        "keyword" => pick!(node;
+        LocPart::Expression => Some(node.location()),
+        LocPart::Selector => pick!(node; opt as_call_node.message_loc, req as_def_node.name_loc),
+        LocPart::Dot => node.as_call_node()?.call_operator_loc(),
+        LocPart::Keyword => pick!(node;
             opt as_if_node.if_keyword_loc,
             req as_unless_node.keyword_loc,
             req as_while_node.keyword_loc,
@@ -914,7 +914,7 @@ fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'p
             req as_defined_node.keyword_loc,
             opt as_begin_node.begin_keyword_loc,
         ),
-        "end_keyword" => pick!(node;
+        LocPart::EndKeyword => pick!(node;
             opt as_def_node.end_keyword_loc,
             opt as_if_node.end_keyword_loc,
             opt as_unless_node.end_keyword_loc,
@@ -926,7 +926,7 @@ fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'p
             req as_module_node.end_keyword_loc,
             opt as_begin_node.end_keyword_loc,
         ),
-        "operator" => pick!(node;
+        LocPart::Operator => pick!(node;
             req as_and_node.operator_loc,
             req as_or_node.operator_loc,
             opt as_assoc_node.operator_loc,
@@ -937,7 +937,7 @@ fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'p
             req as_constant_write_node.operator_loc,
             req as_range_node.operator_loc,
         ),
-        "begin" => pick!(node;
+        LocPart::Begin => pick!(node;
             opt as_call_node.opening_loc,
             opt as_array_node.opening_loc,
             req as_hash_node.opening_loc,
@@ -947,7 +947,7 @@ fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'p
             req as_lambda_node.opening_loc,
             opt as_interpolated_string_node.opening_loc,
         ),
-        "end" => pick!(node;
+        LocPart::End => pick!(node;
             opt as_call_node.closing_loc,
             opt as_array_node.closing_loc,
             req as_hash_node.closing_loc,
@@ -957,7 +957,6 @@ fn part_loc<'pr>(node: &ruby_prism::Node<'pr>, part: &str) -> Option<PrismLoc<'p
             req as_lambda_node.closing_loc,
             opt as_interpolated_string_node.closing_loc,
         ),
-        _ => None,
     }
 }
 
@@ -1037,7 +1036,9 @@ fn value_text(value: Option<&Value<'_>>) -> String {
             .map(|item| value_text(Some(item)))
             .collect::<Vec<_>>()
             .join(", "),
-        Some(Value::Nil) | None => String::new(),
+        // A `loc` part has no text of its own to interpolate; only the
+        // position attributes read one.
+        Some(Value::Loc(..) | Value::Nil) | None => String::new(),
     }
 }
 
@@ -1448,6 +1449,11 @@ hooks:
             ("node.selector", 6, 10),
             ("node.begin", 10, 11),
             ("node.end", 12, 13),
+            // Upstream's own spelling: `loc` before the part is optional and
+            // names the same range, which is what the expression layer's
+            // `{ attr: [node.loc.selector, line] }` reads.
+            ("node.loc.selector", 6, 10),
+            ("node.receiver.loc.expression", 0, 5),
         ];
         for (anchor, start_col, end_col) in cases {
             let yaml = ANCHORS

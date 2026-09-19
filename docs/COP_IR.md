@@ -102,13 +102,20 @@ hooks:
         - { op: remove, range: { start: node.dot.start, stop: node.selector.stop } }
 ```
 
-**Anchors** are `<target>[.<accessor|part>]*[.start|.stop]`, where `target` is
-`node`, `parent` or a declared `$capture`; `accessor` is a structural accessor
-(`receiver`, `body`, `first_argument`, `left_sibling`, …) and `part` is a
-`node.loc.<part>` name
-(`expression`, `selector`, `dot`, `keyword`, `end_keyword`, `operator`, `begin`,
-`end`). A `location:` shorthand denotes a range and must **not** end in an edge;
-an anchor inside `{ start:, stop: }` or `at:` must.
+**Anchors** are `<target>[.<accessor>]*[.[loc.]<part>][.start|.stop]`, where
+`target` is `node`, `parent` or a declared `$capture`; `accessor` is a
+structural accessor (`receiver`, `body`, `first_argument`, `left_sibling`, …)
+and `part` is a `loc` part name (`expression`, `selector`, `dot`, `keyword`,
+`end_keyword`, `operator`, `begin`, `end`). The `loc.` before a part is
+optional, so `node.loc.dot.start` — upstream's own spelling — and
+`node.dot.start` are the same anchor. A `location:` shorthand denotes a range
+and must **not** end in an edge; an anchor inside `{ start:, stop: }` or `at:`
+must.
+
+Parts are one vocabulary: the same eight names, resolved by the same
+`cop.rs::part_loc`, are what an expression reads with `x.loc.<part>` (see
+[Attributes](#attributes)). A name that is not a part is a load error in both
+places (`Location` for an anchor, `Expr` for a guard).
 
 **Messages** interpolate `%{name}` over the hook's captures, its binds and the
 declared config keys. Every placeholder must resolve; a bare `%` is an error
@@ -153,7 +160,7 @@ self reference is a load error.
 | `if` | 3 exprs (cond, then, else) | the taken branch's value |
 | `lit` | 1 scalar | that literal, never a reference |
 | `lookup` | `[consts.<Table>, expr]` | the table's value, or `nil` |
-| `attr` | `[expr, "<attr>"]`, or `[expr, "arg", <int>]` | see attribute table |
+| `attr` | `[expr, "<attr>"]`, `[expr, "arg", <int>]`, or `[expr, "loc", "<part>"]` | see attribute table |
 | `pred` | `[expr, "<name>", <arg>…]` | bool |
 | `matches` | `[expr, "<matcher or predicate>"]` | bool |
 | `regex` | `[expr, "<source>"]` or `[expr, "<source>", "<imx flags>"]` | bool |
@@ -220,13 +227,46 @@ attribute of a non-node, or one the node does not have, is `nil`.
 | `arg` (index) | call | node or nil — `{ attr: [x, "arg", 1] }` |
 | `first_argument`, `last_argument` | call | node or nil |
 | `source` | any | string — verbatim source text |
-| `line` | any | int — 1-based start line |
-| `column` | any | int — 0-based start column |
+| `line` | node, loc part | int — 1-based line of the start |
+| `last_line` | node, loc part | int — 1-based line of the end |
+| `column` | node, loc part | int — 0-based column of the start |
+| `last_column` | node, loc part | int — 0-based column of the end |
+| `loc` (part) | any | loc part — `{ attr: [x, "loc", "dot"] }`, or `x.loc.dot` |
 | `value` | str, sym, int, true, false | the literal's value |
 | `type` | any | string — Parser-gem type name |
 | `parent_type` | any | string — sugar for `parent.type` |
 | `first_child`, `last_child` | any | node or nil — direct children, source order |
 | `left_sibling`, `right_sibling` | any | node or nil — the adjacent Parser-gem child of this node's parent |
+
+#### Positions and `loc` parts
+
+`line`, `last_line`, `column` and `last_column` are Parser's
+`Source::Range#line` / `#last_line` / `#column` / `#last_column`: the first two
+read the range's `begin_pos`, the last two its `end_pos`. They apply to a node
+and to a `loc` part alike, because both are just a byte range.
+
+`loc` is the one path step two segments wide — `x.loc.dot` in a scalar path,
+`{ attr: [x, "loc", "dot"] }` as an operator — and it yields a *location*, not a
+node: only the four position attributes read one, and its part vocabulary is
+the anchor vocabulary (`expression`, `selector`, `dot`, `keyword`,
+`end_keyword`, `operator`, `begin`, `end`). A part the node does not have is
+`nil`, as any other missing attribute is. This is what makes upstream's
+
+```ruby
+receiver.last_line < map_send.loc.dot.line
+```
+
+(`Style/MapJoin#removal_range`) expressible verbatim:
+
+```yaml
+when: { lt: [$map.receiver.last_line, $map.loc.dot.line] }
+```
+
+The two vocabularies are not yet *identical*: an anchor accessor is a step to a
+node (`condition`, `arguments`, `block`, `value`) and an expression attribute
+may yield bytes or an int instead (`method_name`, `arg_count`, `source`,
+`type`), so the accessor and attribute lists still differ where the two layers
+genuinely need different things. Parts, and the four positions, are shared.
 
 `left_sibling` / `right_sibling` mirror `RuboCop::AST::Node`'s: they index into
 the *Parser-gem* child list, where a `send`'s method name is a Symbol rather
