@@ -301,18 +301,18 @@ pub enum CorrectionOp {
     Remove { range: LocationSpec },
 }
 
-/// A `when:`/`bind:`/`predicates[].expr` expression.
+/// A `when:`/`bind:`/`predicates[].expr` expression, as written.
 ///
-/// Schema v1 keeps expressions as a **structured-but-untyped** YAML value: the
-/// typed `Expr` enum of design §2.1 lands with the compiler/evaluator PR. The
-/// loader still enforces the shape statically (`load::validate_expr`):
+/// This stays the **serde surface**: the loader hands it to
+/// [`super::expr::compile`], which turns it into the typed
+/// [`super::expr::Expr`] of design §2.1. The surface shape is:
 ///
-/// * a scalar is a literal (`"str"`, `3`, `true`) or a path reference —
+/// * a scalar is a literal (`"str"`, `3`, `true`, `:sym`) or a path reference —
 ///   `node`, `parent`, `$capture[.attr]*`, `cfg.<Key>`, `bind.<Name>`,
-///   `consts.<Table>`;
+///   `consts.<Table>`, or a quantifier's `var:` name;
 /// * a mapping is an operator application with exactly one key drawn from
 ///   [`OPERATORS`] whose value is the operand (a single expression, or a
-///   sequence of them);
+///   sequence of them; a [`QUANTIFIERS`] key takes a mapping instead);
 /// * nesting is capped at [`MAX_EXPR_DEPTH`] (design §2.1: "reject `when:`
 ///   depth > 6") so the language cannot drift into a programming language.
 #[derive(Debug, Clone, Deserialize)]
@@ -324,8 +324,9 @@ pub const MAX_EXPR_DEPTH: usize = 6;
 
 /// Operator keys accepted as the single key of an expression mapping.
 ///
-/// This is the surface syntax of design §2.1's `Expr` enum; the compiler PR
-/// turns these into typed nodes. Unknown keys fail closed at load.
+/// This is the surface syntax of design §2.1's `Expr` enum. Unknown keys fail
+/// closed at load. Mirrored in `scripts/shared/ir_schema.json`, with a drift
+/// test in `tests/ir_fixtures.rs`.
 pub const OPERATORS: &[&str] = &[
     // logic
     "all", "any", "not", // comparison
@@ -334,3 +335,14 @@ pub const OPERATORS: &[&str] = &[
     "pred", "matches", "regex", // bounded quantifiers
     "any_of", "all_of", "none_of", "count",
 ];
+
+/// The subset of [`OPERATORS`] whose operand is a quantifier mapping rather
+/// than an expression or an operand list.
+pub const QUANTIFIERS: &[&str] = &["any_of", "all_of", "none_of", "count"];
+
+/// Keys a quantifier operand mapping accepts. `of:` defaults to `node`.
+pub const QUANTIFIER_KEYS: &[&str] = &["of", "over", "var", "body"];
+
+/// `over:` collection names. `descendants` also takes an explicit depth,
+/// `descendants(N)`, capped by [`super::expr::MAX_DESCEND_DEPTH`].
+pub const COLLECTIONS: &[&str] = &["args", "children", "ancestors", "descendants"];

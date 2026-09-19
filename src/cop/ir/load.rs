@@ -16,7 +16,8 @@
 //! * `%{...}` message placeholders resolve to a capture, bind or config key;
 //! * location/anchor strings are well-formed and reference declared captures;
 //! * `config:` defaults match their declared type, and enum defaults are members;
-//! * `when:`/`bind:` expressions obey the §2.1 surface shape and depth cap.
+//! * `when:`/`bind:` expressions compile to the typed [`super::expr::Expr`]
+//!   tree, which is where reference resolution, arity and the depth cap now live.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -25,9 +26,9 @@ use std::sync::OnceLock;
 
 use crate::node_pattern;
 
+use super::expr::{CompileCtx, CompiledDoc, CompiledHook};
 use super::schema::{
-    AutocorrectMode, ConfigType, CorrectionOp, ExprSyntax, IrDocument, LocationSpec,
-    MAX_EXPR_DEPTH, MatchSpec, OPERATORS, SCHEMA_VERSION,
+    AutocorrectMode, ConfigType, CorrectionOp, IrDocument, LocationSpec, MatchSpec, SCHEMA_VERSION,
 };
 
 /// Departments owned by hand-written Rust cops. User cops may not use these
@@ -61,11 +62,15 @@ const EDGES: &[&str] = &["start", "stop"];
 ///
 /// This is the *document* level type. The runtime `Cop` implementation that
 /// compiles this into matchers and expressions arrives with a later PR.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IrCop {
     /// Path (or pseudo-path) the document was read from, used in diagnostics.
     pub origin: String,
+    /// The document exactly as written; the serde surface.
     pub document: IrDocument,
+    /// The document's compiled matchers, predicates, constants and per-hook
+    /// `when:`/`bind:` expressions.
+    pub compiled: CompiledDoc,
 }
 
 impl IrCop {
@@ -115,6 +120,12 @@ pub enum IrErrorKind {
     Message,
     Location,
     Expr,
+    /// An operator or predicate applied to the wrong number of operands.
+    Arity,
+    /// A `pred:` name no builtin explains.
+    UnknownPredicate,
+    /// A `matches:` reference cycle between named predicates.
+    Cycle,
     Duplicate,
     Autocorrect,
 }
@@ -169,17 +180,18 @@ pub fn load_str(source: &str, origin: &str) -> Result<IrCop, IrError> {
 /// Load and validate a document under an explicit [`LoadMode`].
 pub fn load_str_with(source: &str, origin: &str, mode: LoadMode) -> Result<IrCop, IrError> {
     let document = parse_document(source, origin)?;
-    let cop = IrCop {
-        origin: origin.to_string(),
-        document,
-    };
-    Validator {
-        cop: &cop,
+    let compiled = Validator {
+        document: &document,
+        origin,
         source,
         mode,
     }
     .run()?;
-    Ok(cop)
+    Ok(IrCop {
+        origin: origin.to_string(),
+        document,
+        compiled,
+    })
 }
 
 /// Deserialize the document.
@@ -228,27 +240,6 @@ fn node_type_names() -> &'static HashSet<&'static str> {
     })
 }
 
-/// The **sole** coupling point to `crate::node_pattern`.
-///
-/// PRs #1-#5 are reshaping that module (real captures, `#helper` resolution,
-/// `<>` support); keeping the dependency to this one function means a rebase
-/// touches exactly these four lines.
-///
-/// The current parser is lenient — it accepts an unterminated sequence such as
-/// `(call` — so this check catches gross syntax errors only. It tightens for
-/// free as the node_pattern PRs land.
-fn parse_node_pattern(pattern: &str) -> Result<(), String> {
-    let trimmed = pattern.trim();
-    if trimmed.is_empty() {
-        return Err("empty pattern".to_string());
-    }
-    let tokens = node_pattern::Lexer::new(trimmed).tokenize();
-    match node_pattern::Parser::new(tokens).parse() {
-        Some(_) => Ok(()),
-        None => Err("could not be parsed as a NodePattern".to_string()),
-    }
-}
-
 /// `bail!(self, Kind, needle, "fmt {}", arg)` — build and return an [`IrError`].
 /// `needle` is a source substring used to guess the offending line.
 macro_rules! bail {
@@ -258,7 +249,8 @@ macro_rules! bail {
 }
 
 struct Validator<'a> {
-    cop: &'a IrCop,
+    document: &'a IrDocument,
+    origin: &'a str,
     source: &'a str,
     mode: LoadMode,
 }
@@ -266,7 +258,7 @@ struct Validator<'a> {
 impl Validator<'_> {
     fn err(&self, kind: IrErrorKind, needle: Option<&str>, message: String) -> IrError {
         IrError {
-            origin: self.cop.origin.clone(),
+            origin: self.origin.to_string(),
             line: needle.and_then(|n| locate(self.source, n)),
             column: None,
             kind,
@@ -275,16 +267,30 @@ impl Validator<'_> {
     }
 
     fn doc(&self) -> &IrDocument {
-        &self.cop.document
+        self.document
     }
 
-    fn run(&self) -> Result<(), IrError> {
+    /// Give a compiler error the best-effort line the rest of the loader
+    /// computes for its own errors. Compiler messages open with the name of
+    /// the expression they came from, which is the needle to scan for.
+    fn located(&self, mut err: IrError) -> IrError {
+        let needle = err
+            .message
+            .split_once('`')
+            .and_then(|(_, rest)| rest.split('`').next());
+        err.line = needle.and_then(|n| locate(self.source, n));
+        err
+    }
+
+    fn run(&self) -> Result<CompiledDoc, IrError> {
         self.check_meta()?;
         self.check_config()?;
-        self.check_matchers()?;
-        self.check_predicates()?;
-        self.check_hooks()?;
-        Ok(())
+        // Compiles `matchers:` (NodePattern) and `predicates:` (expressions,
+        // with cycle detection) before anything can reference them.
+        let mut ctx = CompileCtx::new(self.origin, self.doc()).map_err(|e| self.located(e))?;
+        self.check_matchers(&ctx)?;
+        let hooks = self.check_hooks(&mut ctx)?;
+        Ok(ctx.finish(hooks))
     }
 
     fn check_meta(&self) -> Result<(), IrError> {
@@ -381,12 +387,9 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn check_matchers(&self) -> Result<(), IrError> {
+    fn check_matchers(&self, ctx: &CompileCtx<'_>) -> Result<(), IrError> {
         let doc = self.doc();
         for (name, matcher) in &doc.matchers {
-            if let Err(e) = parse_node_pattern(&matcher.pattern) {
-                bail!(self, Pattern, Some(name), "matcher `{name}`: {e}");
-            }
             let mut seen = HashSet::new();
             for capture in &matcher.captures {
                 if !is_ident(capture) || !seen.insert(capture) {
@@ -397,6 +400,16 @@ impl Validator<'_> {
                         "matcher `{name}`: invalid or duplicate capture name `{capture}`"
                     );
                 }
+            }
+            let slots = ctx.capture_count(name).unwrap_or_default();
+            if matcher.captures.len() > slots {
+                bail!(
+                    self,
+                    Capture,
+                    Some(name),
+                    "matcher `{name}`: {} capture names declared but the pattern has {slots} `$` captures",
+                    matcher.captures.len()
+                );
             }
             for param in &matcher.params {
                 if !doc.config.contains_key(param) && !doc.constants.contains_key(param) {
@@ -412,24 +425,12 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn check_predicates(&self) -> Result<(), IrError> {
-        let all_captures: HashSet<&str> = self
-            .doc()
-            .matchers
-            .values()
-            .flat_map(|m| m.captures.iter().map(String::as_str))
-            .collect();
-        for (name, decl) in &self.doc().predicates {
-            self.check_expr(&decl.expr, &all_captures, &HashSet::new(), name)?;
-        }
-        Ok(())
-    }
-
-    fn check_hooks(&self) -> Result<(), IrError> {
+    fn check_hooks(&self, ctx: &mut CompileCtx<'_>) -> Result<Vec<CompiledHook>, IrError> {
         let doc = self.doc();
         let types = node_type_names();
         let wants_correction = doc.autocorrect != AutocorrectMode::None;
         let mut has_correction = false;
+        let mut compiled = Vec::with_capacity(doc.hooks.len());
 
         for hook in &doc.hooks {
             if hook.on.is_empty() {
@@ -454,7 +455,10 @@ impl Validator<'_> {
             // Resolve `match:` and collect the captures it makes available.
             let mut matcher_names = Vec::new();
             collect_matchers(&hook.match_spec, &mut matcher_names);
-            let mut captures: HashSet<&str> = HashSet::new();
+            // Capture *slots* are per matcher, in `$`-occurrence order; a
+            // combinator's operands contribute their names in declaration
+            // order, first occurrence winning.
+            let mut ordered: Vec<String> = Vec::new();
             for name in &matcher_names {
                 let Some(matcher) = doc.matchers.get(name) else {
                     bail!(
@@ -464,16 +468,27 @@ impl Validator<'_> {
                         "hook `match:` references undeclared matcher `{name}`"
                     );
                 };
-                captures.extend(matcher.captures.iter().map(String::as_str));
+                for capture in &matcher.captures {
+                    if !ordered.contains(capture) {
+                        ordered.push(capture.clone());
+                    }
+                }
             }
+            let captures: HashSet<&str> = ordered.iter().map(String::as_str).collect();
 
             let binds: HashSet<&str> = hook.bind.0.iter().map(|(k, _)| k.as_str()).collect();
+            ctx.enter_hook(ordered.clone());
+            let mut hook_exprs = CompiledHook::default();
             for (name, expr) in &hook.bind.0 {
-                self.check_expr(expr, &captures, &binds, name)?;
+                let compiled = ctx.compile_in(expr, name).map_err(|e| self.located(e))?;
+                hook_exprs.binds.push((name.clone(), compiled));
+                // Declared only now, so a bind may reference earlier binds only.
+                ctx.declare_bind(name);
             }
             if let Some(when) = &hook.when {
-                self.check_expr(when, &captures, &binds, "when")?;
+                hook_exprs.when = Some(ctx.compile_in(when, "when").map_err(|e| self.located(e))?);
             }
+            compiled.push(hook_exprs);
 
             self.check_location(&hook.offense.location, &captures)?;
             self.check_message(&hook.offense.message, &captures, &binds)?;
@@ -517,7 +532,7 @@ impl Validator<'_> {
                 }
             );
         }
-        Ok(())
+        Ok(compiled)
     }
 
     /// `location:`/`range:`: an anchor shorthand denoting a range, or an explicit
@@ -638,107 +653,6 @@ impl Validator<'_> {
                         "message template `{template}` contains a bare `%`; write `%%`"
                     );
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Structural check of a `when:`/`bind:`/predicate expression (schema §2.1
-    /// surface syntax). See [`ExprSyntax`] for the shape.
-    fn check_expr(
-        &self,
-        expr: &ExprSyntax,
-        captures: &HashSet<&str>,
-        binds: &HashSet<&str>,
-        context: &str,
-    ) -> Result<(), IrError> {
-        self.walk_expr(&expr.0, captures, binds, context, 1)
-    }
-
-    fn walk_expr(
-        &self,
-        value: &serde_yml::Value,
-        captures: &HashSet<&str>,
-        binds: &HashSet<&str>,
-        context: &str,
-        depth: usize,
-    ) -> Result<(), IrError> {
-        if depth > MAX_EXPR_DEPTH {
-            bail!(
-                self,
-                Expr,
-                Some(context),
-                "`{context}`: expression nested deeper than {} levels",
-                MAX_EXPR_DEPTH
-            );
-        }
-        match value {
-            serde_yml::Value::Mapping(map) => {
-                if map.len() != 1 {
-                    bail!(
-                        self,
-                        Expr,
-                        Some(context),
-                        "`{context}`: an expression mapping must have exactly one operator key"
-                    );
-                }
-                let (key, operand) = map.iter().next().expect("len checked above");
-                let op = key.as_str().unwrap_or_default();
-                if !OPERATORS.contains(&op) {
-                    bail!(
-                        self,
-                        Expr,
-                        Some(context),
-                        "`{context}`: unknown expression operator `{op}`"
-                    );
-                }
-                self.walk_expr(operand, captures, binds, context, depth + 1)
-            }
-            // A sequence is an operand list, not a nesting level: only operator
-            // applications (mappings) count toward the depth cap.
-            serde_yml::Value::Sequence(items) => items
-                .iter()
-                .try_for_each(|item| self.walk_expr(item, captures, binds, context, depth)),
-            serde_yml::Value::String(s) => self.check_reference(s, captures, binds, context),
-            _ => Ok(()),
-        }
-    }
-
-    /// Strings that *look like* references are resolved; everything else is a
-    /// string literal (`"is_a?"`, `"block_argument?"`, …).
-    fn check_reference(
-        &self,
-        s: &str,
-        captures: &HashSet<&str>,
-        binds: &HashSet<&str>,
-        context: &str,
-    ) -> Result<(), IrError> {
-        let head = s.split('.').next().unwrap_or_default();
-        let unknown = |what: &str, name: &str| {
-            self.err(
-                IrErrorKind::Expr,
-                Some(context),
-                format!("`{context}`: `{s}` references undeclared {what} `{name}`"),
-            )
-        };
-        if let Some(name) = head.strip_prefix('$') {
-            if !captures.contains(name) {
-                return Err(unknown("capture", name));
-            }
-        } else if head == "cfg" {
-            let key = s.split('.').nth(1).unwrap_or_default();
-            if !self.doc().config.contains_key(key) {
-                return Err(unknown("config key", key));
-            }
-        } else if head == "bind" {
-            let key = s.split('.').nth(1).unwrap_or_default();
-            if !binds.contains(key) {
-                return Err(unknown("bind", key));
-            }
-        } else if head == "consts" {
-            let key = s.split('.').nth(1).unwrap_or_default();
-            if !self.doc().constants.contains_key(key) {
-                return Err(unknown("constant table", key));
             }
         }
         Ok(())

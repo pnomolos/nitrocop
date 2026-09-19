@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use nitrocop::cop::ir::schema::{ConfigType, OPERATORS};
+use nitrocop::cop::ir::schema::{COLLECTIONS, ConfigType, OPERATORS, QUANTIFIER_KEYS, QUANTIFIERS};
 use nitrocop::cop::ir::{LoadMode, load_path_with};
 
 fn fixture_dir(name: &str) -> PathBuf {
@@ -144,14 +144,45 @@ fn json_schema_matches_rust_schema() {
         "ir_schema.json drifted from IrDocument"
     );
 
-    // Operator vocabulary must match schema::OPERATORS exactly.
-    let ops: BTreeSet<&str> = json["$defs"]["expr"]["oneOf"][2]["propertyNames"]["enum"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
+    // Operator vocabulary must match schema::OPERATORS exactly. Branch 2 of
+    // the `expr` union carries the plain operators, branch 3 the quantifiers
+    // (whose operand is a quantifier mapping, not an expression).
+    let enum_at = |branch: usize| -> BTreeSet<&str> {
+        json["$defs"]["expr"]["oneOf"][branch]["propertyNames"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect()
+    };
+    let quantifiers = enum_at(3);
+    assert_eq!(
+        quantifiers,
+        QUANTIFIERS.iter().copied().collect::<BTreeSet<_>>()
+    );
+    let ops: BTreeSet<&str> = enum_at(2).union(&quantifiers).copied().collect();
     assert_eq!(ops, OPERATORS.iter().copied().collect::<BTreeSet<_>>());
+
+    // Quantifier operand keys and `over:` collections must match too.
+    let keys: BTreeSet<&str> = json["$defs"]["quantifier"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        QUANTIFIER_KEYS.iter().copied().collect::<BTreeSet<_>>()
+    );
+    let over = json["$defs"]["quantifier"]["properties"]["over"]["pattern"]
+        .as_str()
+        .unwrap();
+    for collection in COLLECTIONS {
+        assert!(
+            over.contains(collection),
+            "ir_schema.json `over:` pattern is missing {collection}"
+        );
+    }
 
     // Config types must match ConfigType's variants.
     let types: Vec<String> = json["$defs"]["configType"]["enum"]
