@@ -26,7 +26,7 @@ Planning branch, not for upstream. Read this first when resuming.
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | #3 → #4 → #5 → #7 open; ancestors/`^`/`` ` `` + repetition operators in progress (branches np/ancestors, np/repetition) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); then IrCop + registry, first translated cop | in progress |
-| W6 | Translator scripts + pilot on 23 new cops | blocked on W1, W5 |
+| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py in progress (branch ir/translator-extract, base ir/expr); synth + verify after IrCop lands | in progress |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
@@ -35,6 +35,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - #7 np: `#helper`/`pred?`/`%param` resolution (base #5); 747/991 vendored patterns resolve on builtins alone
 - #8 fix: Lint/RedundantCopDisableDirective (base main) — sample FP 437→3, FN 121→111; remaining FN is cluster 4 below
 - #6 vendor: 8 new cop config options (base #2), makes the bump stack green
+- #11 np: walker ancestor stack, `^`/`` ` ``/`%0`, ancestor predicates (base #7); repetition operators PR in progress
+- #12 ir: Expr compiler + evaluator (base #9, includes merge of np/predicate-resolution)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #10 fix: Layout/HashAlignment separator variant (base main) — two structural causes; note it still replicates the 1.84.2 clobber-abort quirk that 1.91.0 removes, revisit after the bump
 - #4 np: `<>` unordered + mapping expansion (base #3)
