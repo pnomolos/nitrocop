@@ -221,7 +221,6 @@ fn check_line_lengths(
     let uri_regex = allow_uri.then(|| compile_uri_regex(&uri_schemes));
 
     let lines: Vec<&[u8]> = source.lines().collect();
-    let mut line_length_disabled = false;
     let mut after_end_marker = false;
 
     for (i, raw_line) in lines.iter().enumerate() {
@@ -239,14 +238,6 @@ fn check_line_lengths(
             continue;
         }
         let line_str = std::str::from_utf8(line).ok();
-        let directive_state = line_str
-            .map(parse_line_length_directive)
-            .unwrap_or_default();
-        let current_line_disabled = line_length_disabled || directive_state.disables_current_line;
-        line_length_disabled = directive_state.apply(line_length_disabled);
-        if current_line_disabled {
-            continue;
-        }
 
         // RuboCop measures line length in characters, not bytes.
         // For multi-byte UTF-8 (e.g. accented chars), byte length > char length.
@@ -362,65 +353,6 @@ fn check_line_lengths(
 struct ExemptionRange {
     begin: usize,
     end: usize,
-}
-
-#[derive(Clone, Copy, Default)]
-struct DirectiveState {
-    disables_current_line: bool,
-    starts_block_disable: bool,
-    ends_block_disable: bool,
-}
-
-impl DirectiveState {
-    fn apply(self, current: bool) -> bool {
-        if self.ends_block_disable {
-            false
-        } else if self.starts_block_disable {
-            true
-        } else {
-            current
-        }
-    }
-}
-
-fn parse_line_length_directive(line: &str) -> DirectiveState {
-    let mut state = DirectiveState::default();
-    let Some(comment_start) = line.find('#') else {
-        return state;
-    };
-    let is_inline_comment = line[..comment_start]
-        .chars()
-        .any(|char| !char.is_whitespace());
-
-    for (needle, is_disable) in [("# rubocop:disable", true), ("# rubocop:enable", false)] {
-        let mut search_from = comment_start;
-        while let Some(pos) = line[search_from..].find(needle) {
-            let directive_start = search_from + pos + needle.len();
-            if directive_mentions_line_length(&line[directive_start..]) {
-                if is_disable {
-                    state.disables_current_line = true;
-                    if !is_inline_comment {
-                        state.starts_block_disable = true;
-                    }
-                } else if !is_inline_comment {
-                    state.ends_block_disable = true;
-                }
-            }
-            search_from = directive_start;
-        }
-    }
-
-    state
-}
-
-fn directive_mentions_line_length(rest: &str) -> bool {
-    rest.trim_start().split(',').map(str::trim).any(|token| {
-        let normalized = token.replace(':', "/");
-        matches!(
-            normalized.as_str(),
-            "all" | "LineLength" | "Layout/LineLength" | "Metrics/LineLength"
-        )
-    })
 }
 
 fn allowed_combination(
@@ -1144,7 +1076,13 @@ x = [
     }
 
     #[test]
-    fn inline_disable_only_affects_that_line() {
+    fn disabled_lines_are_still_reported_by_the_cop() {
+        // The cop no longer interprets `rubocop:disable` directives itself.
+        // RuboCop hands *disabled* offenses to
+        // `Lint/RedundantCopDisableDirective`, so nitrocop must emit them here
+        // and let `linter::lint_source_inner` suppress them (which marks the
+        // directive used). Suppressing inside the cop made every
+        // `Layout/LineLength` directive look unused.
         use std::collections::HashMap;
         let config = CopConfig {
             options: HashMap::from([("Max".into(), serde_yml::Value::Number(10.into()))]),
@@ -1154,10 +1092,11 @@ x = [
             b"foo = \"1234567890\" # rubocop:disable Layout/LineLength\nbar = \"1234567890\"\n",
             config,
         );
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].location.line, 2);
-        assert_eq!(diags[0].location.column, 10);
-        assert_eq!(diags[0].message, "Line is too long. [18/10]");
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].location.line, 1);
+        assert_eq!(diags[1].location.line, 2);
+        assert_eq!(diags[1].location.column, 10);
+        assert_eq!(diags[1].message, "Line is too long. [18/10]");
     }
 
     #[test]

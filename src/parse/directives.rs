@@ -90,6 +90,39 @@ pub struct DisableDirective {
     pub range: (usize, usize),
     /// Whether this directive actually suppressed at least one diagnostic.
     pub used: bool,
+    /// Whether this directive's range directly follows the previous range
+    /// recorded for the same cop, i.e. the cop was already disabled there.
+    ///
+    /// Mirrors `RedundantCopDisableDirective#each_already_disabled`, which
+    /// walks `line_ranges.each_cons(2)` and flags the second range whenever
+    /// `previous_range.end == range.begin`. Such a directive is redundant
+    /// "whether there are offenses or not", so it bypasses the usual
+    /// did-it-suppress-anything test.
+    ///
+    /// This is computed as a post-pass over the *append-ordered* range list
+    /// for each cop (see `mark_already_disabled`), not eagerly when a block
+    /// disable re-opens an still-open range: `CommentConfig#analyze` appends
+    /// an inline directive's single-line range as soon as it is seen but only
+    /// appends a block range when it closes, so an inline directive in between
+    /// two block disables breaks `each_cons(2)` adjacency and RuboCop does not
+    /// report the re-opening directive. Inline directives participate too — a
+    /// comment naming the same cop twice (`# rubocop:disable Foo, Foo`)
+    /// produces two identical single-line ranges, which *are* adjacent.
+    pub already_disabled: bool,
+}
+
+impl DisableDirective {
+    /// RuboCop-qualified cop name for this directive.
+    ///
+    /// Mirrors `RuboCop::Cop::Registry.qualified_cop_name`: a bare cop name
+    /// whose short name matches exactly one registered cop is resolved to the
+    /// qualified name (`LineLength` -> `Layout/LineLength`), everything else
+    /// (departments, unknown names, ambiguous short names) is returned as
+    /// written. `Lint/RedundantCopDisableDirective` reports the qualified name
+    /// because RuboCop keys `CommentConfig#cop_disabled_line_ranges` by it.
+    pub fn qualified_name(&self) -> &str {
+        &self.key
+    }
 }
 
 /// Tracks line ranges where cops are disabled via inline comments.
@@ -231,6 +264,11 @@ impl DisabledRanges {
         registry: &crate::cop::registry::CopRegistry,
     ) -> Self {
         let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        // Directive index that produced each entry of `ranges`, in lockstep.
+        // Used by `mark_already_disabled` to port RuboCop's
+        // `each_already_disabled`, which depends on the *append order* of
+        // `CommentConfig#analyze`'s per-cop range list.
+        let mut range_owners: HashMap<String, Vec<usize>> = HashMap::new();
         // Track open block disables: cop_name -> (start_line, column, directive_index)
         let mut open_disables: HashMap<String, (usize, usize, usize)> = HashMap::new();
         let mut found_any = false;
@@ -332,6 +370,10 @@ impl DisabledRanges {
                         if is_inline {
                             let range = (line, line);
                             ranges.entry(key.to_string()).or_default().push(range);
+                            range_owners
+                                .entry(key.to_string())
+                                .or_default()
+                                .push(directives.len());
                             directives.push(DisableDirective {
                                 cop_name: cop.to_string(),
                                 key: key.to_string(),
@@ -340,6 +382,8 @@ impl DisabledRanges {
                                 is_inline: true,
                                 range,
                                 used: false,
+                                // Filled in by `mark_already_disabled`.
+                                already_disabled: false,
                             });
                         } else {
                             // Close any existing open disable for the same cop
@@ -351,6 +395,10 @@ impl DisabledRanges {
                             {
                                 let range = (prev_start, line);
                                 ranges.entry(key.to_string()).or_default().push(range);
+                                range_owners
+                                    .entry(key.to_string())
+                                    .or_default()
+                                    .push(prev_idx);
                                 if prev_idx < directives.len() {
                                     directives[prev_idx].range = range;
                                 }
@@ -364,6 +412,8 @@ impl DisabledRanges {
                                 is_inline: false,
                                 range: (line, usize::MAX), // placeholder, updated on enable/EOF
                                 used: false,
+                                // Filled in by `mark_already_disabled`.
+                                already_disabled: false,
                             });
                             open_disables.insert(key.to_string(), (line, col, directive_idx));
                         }
@@ -389,7 +439,11 @@ impl DisabledRanges {
                                 open_disables.drain()
                             {
                                 let range = (start_line, line);
-                                ranges.entry(open_cop).or_default().push(range);
+                                ranges.entry(open_cop.clone()).or_default().push(range);
+                                range_owners
+                                    .entry(open_cop)
+                                    .or_default()
+                                    .push(directive_idx);
                                 if directive_idx < directives.len() {
                                     directives[directive_idx].range = range;
                                 }
@@ -407,6 +461,10 @@ impl DisabledRanges {
                             {
                                 let range = (start_line, line);
                                 ranges.entry(dept.to_string()).or_default().push(range);
+                                range_owners
+                                    .entry(dept.to_string())
+                                    .or_default()
+                                    .push(directive_idx);
                                 if directive_idx < directives.len() {
                                     directives[directive_idx].range = range;
                                 }
@@ -423,7 +481,11 @@ impl DisabledRanges {
                                     open_disables.remove(&open_cop)
                                 {
                                     let range = (start_line, line);
-                                    ranges.entry(open_cop).or_default().push(range);
+                                    ranges.entry(open_cop.clone()).or_default().push(range);
+                                    range_owners
+                                        .entry(open_cop)
+                                        .or_default()
+                                        .push(directive_idx);
                                     if directive_idx < directives.len() {
                                         directives[directive_idx].range = range;
                                     }
@@ -434,6 +496,10 @@ impl DisabledRanges {
                         {
                             let range = (start_line, line);
                             ranges.entry(key.to_string()).or_default().push(range);
+                            range_owners
+                                .entry(key.to_string())
+                                .or_default()
+                                .push(directive_idx);
                             // Update the directive's range
                             if directive_idx < directives.len() {
                                 directives[directive_idx].range = range;
@@ -449,16 +515,52 @@ impl DisabledRanges {
         // Close any remaining open disables to EOF
         for (cop, (start_line, _col, directive_idx)) in open_disables {
             let range = (start_line, usize::MAX);
-            ranges.entry(cop).or_default().push(range);
+            ranges.entry(cop.clone()).or_default().push(range);
+            range_owners.entry(cop).or_default().push(directive_idx);
             if directive_idx < directives.len() {
                 directives[directive_idx].range = range;
             }
         }
 
+        Self::mark_already_disabled(&ranges, &range_owners, &mut directives);
+
         DisabledRanges {
             ranges,
             empty: !found_any,
             directives,
+        }
+    }
+
+    /// Port of `RedundantCopDisableDirective#each_already_disabled`.
+    ///
+    /// RuboCop walks `line_ranges.each_cons(2)` per cop and flags the *second*
+    /// range whenever `previous_range.end == range.begin`. The list is the one
+    /// `CommentConfig#analyze` builds, in append order: an inline directive's
+    /// single-line range is appended when the directive is seen, a block range
+    /// only when it closes. `ranges`/`range_owners` are built with that same
+    /// ordering, so replaying `each_cons(2)` here reproduces RuboCop exactly —
+    /// including the case where an inline directive between two block disables
+    /// breaks the adjacency, so the re-opening directive is *not* reported.
+    fn mark_already_disabled(
+        ranges: &HashMap<String, Vec<(usize, usize)>>,
+        range_owners: &HashMap<String, Vec<usize>>,
+        directives: &mut [DisableDirective],
+    ) {
+        for (key, key_ranges) in ranges {
+            let Some(owners) = range_owners.get(key) else {
+                continue;
+            };
+            if owners.len() != key_ranges.len() {
+                continue;
+            }
+            for (idx, window) in key_ranges.windows(2).enumerate() {
+                if window[0].1 != window[1].0 {
+                    continue;
+                }
+                if let Some(directive) = directives.get_mut(owners[idx + 1]) {
+                    directive.already_disabled = true;
+                }
+            }
         }
     }
 
@@ -543,6 +645,15 @@ impl DisabledRanges {
     /// Return all unused disable directives (those that didn't suppress any diagnostic).
     pub fn unused_directives(&self) -> impl Iterator<Item = &DisableDirective> {
         self.directives.iter().filter(|d| !d.used)
+    }
+
+    /// Directives that `Lint/RedundantCopDisableDirective` has to consider:
+    /// the unused ones, plus re-opened ranges, which are redundant even when
+    /// they suppressed something.
+    pub fn redundancy_candidates(&self) -> impl Iterator<Item = &DisableDirective> {
+        self.directives
+            .iter()
+            .filter(|d| !d.used || d.already_disabled)
     }
 
     pub fn is_empty(&self) -> bool {

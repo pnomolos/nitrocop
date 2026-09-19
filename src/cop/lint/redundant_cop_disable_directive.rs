@@ -13,6 +13,108 @@ use crate::diagnostic::Severity;
 /// here. This struct exists so the cop name is registered and can be
 /// referenced in configuration (enabled/disabled/excluded).
 ///
+/// ## Fixed (2026-09-18): department-less directive names
+///
+/// `is_directive_redundant` skipped every name without a `/`, treating
+/// `# rubocop:disable LineLength` and `# rubocop:disable AlignHash` as
+/// department disables. RuboCop's `CommentConfig#analyze` runs each name
+/// through `Registry.qualified_cop_name` first, so:
+///   - a bare short name matching exactly one cop resolves (`LineLength` ->
+///     `Layout/LineLength`) and is checked — and *reported* — under that name;
+///   - a bare name matching nothing is an unknown cop (pre-0.50 names like
+///     `AlignHash`, `PredicateName`, `UselessComparison` are the corpus cases);
+///   - a bare name matching several cops makes RuboCop raise
+///     `AmbiguousCopName`, which aborts the file, so nitrocop must never flag;
+///   - a real department is expanded to its cops and reported as a
+///     `DEPARTMENT` offense, which nitrocop still declines to do.
+///
+/// The qualification already existed in `DisabledRanges` (the suppression key),
+/// it just was not exposed; `DisableDirective::qualified_name()` now is.
+/// The malformed-name guard (`/BlockLength`) has to run on the *raw* text,
+/// because qualification resolves its short name to `Metrics/BlockLength`.
+///
+/// ## Fixed (2026-09-18): re-disabling an already-disabled cop
+///
+/// RuboCop has two independent redundancy checks. `each_line_range` is the
+/// familiar one ("this range suppressed nothing"). `each_already_disabled`
+/// walks `each_cons(2)` over a cop's disabled line ranges and flags the second
+/// whenever `previous_range.end == range.begin` — a `# rubocop:disable Foo`
+/// that reopens a range still open from an earlier directive with no
+/// intervening `# rubocop:enable`. That is redundant "whether there are
+/// offenses or not", so it must bypass the used/unused test entirely, and it
+/// does not depend on whether the cop ran.
+///
+/// `DisabledRanges::from_comments` already detected this shape (it closes the
+/// previous range at the new directive's line); it now records it as
+/// `DisableDirective::already_disabled`, and `redundancy_candidates()` yields
+/// those directives even when they are marked used.
+///
+/// Inline directives are deliberately excluded: an inline disable inside an
+/// open block range produces a single-line range that does not start where the
+/// block range ends, so `followed_ranges?` is false for it.
+///
+/// Not replicated (no corpus evidence, and each needs range bookkeeping this
+/// cop does not have): the same rule when the still-open directive is a
+/// department or `all` disable — RuboCop expands those to every cop name, so
+/// `# rubocop:disable all` followed by `# rubocop:disable Foo/Bar` flags the
+/// second comment.
+///
+/// ## Not fixed: include-gated cop cascade (~85% of remaining corpus FNs)
+///
+/// `Rails/CreateTableWithTimestamps`, `Rails/ThreeStateBooleanColumn`,
+/// `Rails/BulkChangeTable`, `Rails/ReversibleMigration`, `Rails/NotNullColumn`,
+/// `Rails/Output`, `Rake/*` and the rest of `compute_ig_cops.py`'s list carry
+/// cop-level `Include:` patterns that are *not* `**/`-prefixed. RuboCop
+/// resolves those relative to the config file's directory; the corpus oracle's
+/// main pass passes a config from a temp dir, so RuboCop never runs those cops
+/// and reports every one of their disable directives as redundant. nitrocop
+/// runs them (its `is_cop_match` is repo-relative), the directive is marked
+/// used, and this cop under-reports. The oracle papers over this for the cops
+/// themselves with a parallel include-gated pass
+/// (`bench/corpus/merge_include_gated.py`), but that pass does not cover
+/// `Lint/RedundantCopDisableDirective`, so the cascade lands here instead.
+/// Fixing it means either matching RuboCop's config-relative `Include`
+/// base_dir in `CopFilterSet` (see
+/// `docs/investigations/investigation-target-dir-relativization.md`) or
+/// extending the include-gated oracle pass to re-derive this cop. Both are
+/// outside this cop; do not "fix" it by ignoring include-gated cops when
+/// marking directives used — that would be wrong for real repos, where the
+/// config sits at the repo root and the cops do run.
+///
+/// The same relativization hits cop-level `Exclude` and is the only remaining
+/// FP cluster: `is_directive_redundant` reports a directive as redundant when
+/// `is_cop_excluded` matches, but RuboCop absolutizes `Exclude` against the
+/// config file's directory. In the corpus that turns rubocop-rails'
+/// `Lint/UselessMethodDefinition: Exclude: ['**/app/controllers/**/*.rb']`
+/// into `<bench/corpus>/**/app/controllers/**/*.rb`, which matches nothing, so
+/// RuboCop runs the cop, its (disabled) offense keeps the directive alive, and
+/// nitrocop's exclusion-based flag is an FP (2 in openproject). Verified with a
+/// `Cop::Team#roundup_relevant_cops` probe printing the absolutized patterns.
+///
+/// ## Fixed (2026-09-18): Layout/LineLength self-suppression — 740 corpus FPs
+///
+/// `Layout/LineLength` parsed `rubocop:disable` directives itself (a private
+/// `parse_line_length_directive` in `src/cop/layout/line_length.rs`) and
+/// `continue`d past disabled lines. Because no diagnostic was ever produced,
+/// `DisabledRanges::check_and_mark_used` never ran for those lines, the
+/// directive stayed unused, and this cop reported it as redundant. That was
+/// ~99% of the corpus FPs for this cop (CultivateLabs/raif alone: 121).
+///
+/// RuboCop's runner does the opposite: `Runner#file_offenses` passes the full
+/// offense list — *including* offenses whose status is `:disabled` — to
+/// `RedundantCopDisableDirective#offenses_to_check`, and only then does
+/// `offenses.sort.reject(&:disabled?)`. So a suppressed offense still marks
+/// its directive as needed.
+///
+/// The fix deletes the cop-local directive parser so `Layout/LineLength`
+/// always reports, and `lint_source_inner` suppresses the diagnostic through
+/// the shared `DisabledRanges` bookkeeping (which also handles department
+/// disables, `all`, and legacy names like `Metrics/LineLength`). Unlike the
+/// two reverted attempts below this removes work instead of adding it: forem
+/// (3257 files) runs in 2.5s. No other cop suppresses its own diagnostics on
+/// directive lines — `grep -rn 'rubocop:disable' src/cop/` to confirm before
+/// assuming a new FP cluster has the same cause.
+///
 /// ## Reverted (twice): Layout/LineLength self-suppression compensation
 ///
 /// `compensate_line_length_self_suppression` re-checks unused Layout/LineLength

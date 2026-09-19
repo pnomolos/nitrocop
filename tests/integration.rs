@@ -12,6 +12,7 @@ use nitrocop::config::load_config;
 use nitrocop::cop::autocorrect_allowlist::AutocorrectAllowlist;
 use nitrocop::cop::registry::CopRegistry;
 use nitrocop::cop::tiers::TierMap;
+use nitrocop::diagnostic::Diagnostic;
 use nitrocop::fs::DiscoveredFiles;
 use nitrocop::linter::run_linter;
 
@@ -7446,4 +7447,399 @@ fn shared_module_usage_lint() {
         }
         panic!("{msg}");
     }
+}
+
+// ---------- Layout/LineLength directive round-trip ----------
+//
+// `Layout/LineLength` used to parse `rubocop:disable` directives itself and
+// skip the disabled lines. Because no diagnostic was produced, the central
+// directive bookkeeping never marked the directive used and
+// Lint/RedundantCopDisableDirective flagged every LineLength disable as
+// redundant (740 corpus FPs). The cop now always reports, and
+// `lint_source_inner` suppresses the diagnostic while marking the directive
+// used — which mirrors RuboCop, where disabled offenses are still handed to
+// Lint/RedundantCopDisableDirective.
+
+fn line_length_directive_case(name: &str, body: String) -> (PathBuf, Vec<Diagnostic>) {
+    let dir = temp_dir(name);
+    let file = write_file(&dir, "test.rb", body.as_bytes());
+    let config = load_config(None, Some(&dir), None).unwrap();
+    let registry = CopRegistry::default_registry();
+    let args = default_args();
+    let result = run_linter(
+        &discovered(&[file]),
+        &config,
+        &registry,
+        &args,
+        &TierMap::load(),
+        &AutocorrectAllowlist::load(),
+    );
+    (dir, result.diagnostics)
+}
+
+#[test]
+fn line_length_inline_disable_is_not_redundant() {
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\ny = \"{long}\" # rubocop:disable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_inline_disable", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(
+        redundant.len(),
+        0,
+        "Directive suppressed a real long line, got: {redundant:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.cop_name == "Layout/LineLength"),
+        "Disabled LineLength offense must not be reported: {diagnostics:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_block_disable_legacy_colon_name_is_not_redundant() {
+    // `Layout:LineLength` parses as a department-level `Layout` disable in
+    // RuboCop (`:` is not a word character), so the enclosed long line is
+    // suppressed and the directive is not redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\n# rubocop:disable Layout:LineLength\ny = \"{long}\"\n# rubocop:enable Layout:LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_block_disable_legacy", body);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.cop_name == "Layout/LineLength"),
+        "Block-disabled LineLength offense must not be reported: {diagnostics:?}"
+    );
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 0, "got: {redundant:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_legacy_metrics_name_disable_is_not_redundant() {
+    // `Metrics/LineLength` is the pre-0.78 name; RuboCop still resolves it to
+    // `Layout/LineLength` by short name, so the directive suppresses the
+    // offense and is not redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# frozen_string_literal: true\n\ny = \"{long}\" # rubocop:disable Metrics/LineLength\n"
+    );
+    let (dir, diagnostics) = line_length_directive_case("line_length_legacy_metrics_name", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 0, "got: {redundant:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_length_unused_disable_is_still_redundant() {
+    // Control case: a LineLength disable on a short line has nothing to
+    // suppress and must still be flagged.
+    let body =
+        "# frozen_string_literal: true\n\ny = 1 # rubocop:disable Layout/LineLength\n".to_string();
+    let (dir, diagnostics) = line_length_directive_case("line_length_unused_disable", body);
+
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    assert_eq!(redundant.len(), 1, "got: {redundant:?}");
+    assert!(redundant[0].message.contains("Layout/LineLength"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------- Department-less (bare) directive names ----------
+//
+// RuboCop's `CommentConfig#analyze` runs every directive name through
+// `Registry.qualified_cop_name`, so `# rubocop:disable LineLength` is keyed as
+// `Layout/LineLength` and a bare name that resolves to nothing (e.g. the
+// pre-0.50 `AlignHash`) stays unqualified and is reported as an unknown cop.
+// nitrocop used to skip every name without a `/`, treating bare cop names as
+// department disables.
+
+fn redundant_directives(name: &str, body: &str) -> (PathBuf, Vec<Diagnostic>) {
+    let dir = temp_dir(name);
+    let file = write_file(&dir, "test.rb", body.as_bytes());
+    let config = load_config(None, Some(&dir), None).unwrap();
+    let registry = CopRegistry::default_registry();
+    let args = default_args();
+    let result = run_linter(
+        &discovered(&[file]),
+        &config,
+        &registry,
+        &args,
+        &TierMap::load(),
+        &AutocorrectAllowlist::load(),
+    );
+    let diagnostics = result
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    (dir, diagnostics)
+}
+
+#[test]
+fn redundant_disable_bare_cop_name_is_qualified() {
+    // `LineLength` resolves to `Layout/LineLength`; the line is short, so the
+    // directive is redundant and the message uses the qualified name.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_bare_name",
+        "x = 1 # rubocop:disable LineLength\n",
+    );
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `Layout/LineLength`."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_bare_cop_name_with_offense_is_kept() {
+    // Same bare name, but now it really suppresses a `Layout/LineLength`
+    // offense, so it must not be flagged.
+    let long = "x".repeat(150);
+    let body = format!("y = \"{long}\" # rubocop:disable LineLength\n");
+    let (dir, diagnostics) = redundant_directives("redundant_disable_bare_name_used", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_bare_unknown_cop_name() {
+    // `AlignHash` was renamed to `Layout/HashAlignment`, so the short name no
+    // longer resolves — RuboCop reports it as an unknown cop.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_bare_unknown",
+        "# rubocop:disable AlignHash\nx = { a: 1 }\n# rubocop:enable AlignHash\n",
+    );
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `AlignHash` (unknown cop)."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_department_name_still_skipped() {
+    // A real department name stays conservative: nitrocop does not report
+    // department-level redundancy.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_department_name",
+        "# rubocop:disable Metrics\nx = 1\n# rubocop:enable Metrics\n",
+    );
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_malformed_bare_name_still_skipped() {
+    // `/BlockLength` is not a valid cop name; RuboCop ignores it silently and
+    // so must we — the leading `/` check runs on the raw text, before
+    // qualification would turn it into `Metrics/BlockLength`.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_malformed_bare",
+        "# rubocop:disable /BlockLength, Metrics/\nx = 1\n# rubocop:enable /BlockLength, Metrics/\n",
+    );
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------- Re-disabling an already-disabled cop ----------
+//
+// RuboCop's `each_already_disabled` walks consecutive disabled line ranges for
+// a cop and flags the second one whenever `previous_range.end == range.begin`
+// — i.e. a `rubocop:disable` that reopens a range still open from an earlier
+// directive. That is redundant "whether there are offenses or not", so the
+// usual "did it suppress anything?" test does not apply.
+
+#[test]
+fn redundant_disable_reopened_without_enable() {
+    // Two block disables for the same cop with no `enable` in between: the
+    // second one is redundant even though the range contains a real offense.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = 1\n# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened", &body);
+
+    // RuboCop reports both: line 1 because its range (1..3) holds no offense,
+    // line 3 because the cop was already disabled there.
+    let mut lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![1, 3], "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `Layout/LineLength`."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_reopened_with_offenses_in_both_ranges() {
+    // Both ranges suppress a real offense, so only the reopening directive on
+    // line 3 is redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:disable Layout/LineLength\nw = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened_both", &body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 3);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_reopened_only_for_repeated_cop() {
+    // `Style/SymbolProc` is reopened, `Layout/LineLength` is not — only the
+    // reopened name is flagged, and it is reported on the second directive.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Style/SymbolProc\ny = 1\n# rubocop:disable Style/SymbolProc, Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Style/SymbolProc, Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened_multi", &body);
+
+    let lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.location.line == 3 && d.message.contains("Style/SymbolProc")),
+        "expected the reopened cop at line 3, got: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("Layout/LineLength")),
+        "LineLength suppresses a real offense: {diagnostics:?}"
+    );
+    assert!(!lines.contains(&5), "enable directives are a different cop");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reenabled_cop_can_be_disabled_again() {
+    // Control: an `enable` closes the first range, so the second `disable` is
+    // a fresh range and is only judged on whether it suppressed anything.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = \"{long}\"\n# rubocop:enable Layout/LineLength\nw = 1\n# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reenabled", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn inline_disable_inside_open_range_is_not_already_disabled() {
+    // An inline directive produces a single-line range that does not start
+    // where the open block range ends, so RuboCop's `followed_ranges?` is
+    // false and the usual offense check applies — here it suppresses a real
+    // offense, so nothing is reported.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = 1\nz = \"{long}\" # rubocop:disable Layout/LineLength\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_inline_inside", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn intervening_inline_range_breaks_already_disabled_adjacency() {
+    // `each_already_disabled` walks `line_ranges.each_cons(2)` over the
+    // *append-ordered* range list built by `CommentConfig#analyze`. An inline
+    // directive appends its single-line range as soon as it is seen, while a
+    // block range is only appended when it closes. So for
+    //
+    //   1: # rubocop:disable Style/SymbolProc
+    //   2: # rubocop:disable Style/SymbolProc
+    //   3: <offense> # rubocop:disable Style/SymbolProc
+    //   4: <offense>
+    //   5: # rubocop:enable Style/SymbolProc
+    //
+    // the list is [1..2, 3..3, 2..5]: the line-2 directive's range (2..5) is
+    // no longer adjacent to the line-1 range (1..2), so RuboCop does *not*
+    // report line 2. Only line 1 is reported (its range holds no offense).
+    let body = "# rubocop:disable Style/SymbolProc\n\
+                # rubocop:disable Style/SymbolProc\n\
+                a.map { |t| t.foo } # rubocop:disable Style/SymbolProc\n\
+                b.map { |t| t.foo }\n\
+                # rubocop:enable Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_intervening_inline", body);
+
+    let lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    assert_eq!(lines, vec![1], "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn duplicate_cop_name_in_one_directive_reports_once() {
+    // `on_new_investigation` collects `redundant_cops[comment]` as a `Set`, so
+    // a comment naming the same cop twice yields a single offense even though
+    // both `each_line_range` (the first, empty range) and
+    // `each_already_disabled` (the reopened range) flag it.
+    let body = "# rubocop:disable Style/SymbolProc, Style/SymbolProc\n\
+                a.map { |t| t.foo }\n\
+                # rubocop:enable Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_duplicate_name", body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn duplicate_cop_name_in_one_inline_directive_is_already_disabled() {
+    // Two single-line ranges for the same cop on the same line are adjacent
+    // (`1..1` then `1..1`), so `followed_ranges?` holds and RuboCop reports the
+    // comment once even though the directive really does suppress an offense.
+    let body = "a.map { |t| t.foo } # rubocop:disable Style/SymbolProc, Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_duplicate_inline_name", body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 1);
+
+    fs::remove_dir_all(&dir).ok();
 }

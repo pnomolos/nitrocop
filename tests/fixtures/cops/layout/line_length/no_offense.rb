@@ -27,10 +27,6 @@ TEXT
 # AllowURI: URL with embedded URL in query params — the first URL starts before max and extends to end of line
       "oembed_get_request" => "http://www.flickr.com/services/oembed/?format=json&frame=1&iframe=1&maxheight=420&maxwidth=420&url=http://www.flickr.com/photos/bees/2341623661",
 
-# Legacy block disable syntax with `Layout:LineLength` should still suppress the enclosed long line
-# rubocop:disable Layout:LineLength
-x = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-# rubocop:enable Layout:LineLength
 
 # AllowURI: URL followed by \n escape — the URL extends to end of line via word boundary extension
 puts "\nFor all saved admins, copy and paste into the wiki at https://wiki.transformativeworks.org/mediawiki/AO3_Admins:\n"

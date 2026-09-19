@@ -614,10 +614,11 @@ struct RedundantDirectiveCheck<'a> {
 /// Returns `None` if we should skip it.
 ///
 /// The logic:
-///   - "all" or department-only directives: never flag (too broad to check)
+///   - "all" or real department names: never flag (too broad to check)
 ///   - Known cop that is explicitly disabled (Enabled: false): flag as redundant
 ///   - Known cop that is enabled + all_cops_ran + file matched: flag as redundant
 ///     (cop ran and didn't fire)
+///   - Re-opened range (`already_disabled`): flag unconditionally
 ///   - Renamed cop: flag, with conservative handling in --only mode
 ///   - Completely unknown cop: flag with "(unknown cop)" suffix, except during
 ///     unrelated `--only` runs where it would leak into another cop's results
@@ -625,23 +626,40 @@ fn is_directive_redundant(
     directive: &DisableDirective,
     context: &RedundantDirectiveCheck<'_>,
 ) -> Option<&'static str> {
-    let cop_name = directive.cop_name.as_str();
+    // Malformed cop name (e.g. "/BlockLength") — the first character must be
+    // an ASCII uppercase letter to form a valid Department/CopName.  RuboCop
+    // silently ignores these, so we should too.  This runs on the raw text,
+    // before qualification, because `qualified_name()` resolves the short name
+    // in "/BlockLength" to `Metrics/BlockLength`.
+    if !directive
+        .cop_name
+        .starts_with(|c: char| c.is_ascii_uppercase())
+    {
+        return None;
+    }
+
+    // Use the RuboCop-qualified name: `CommentConfig#analyze` keys every
+    // directive through `Registry.qualified_cop_name`, so a bare `LineLength`
+    // is really `Layout/LineLength` (and is reported under that name).
+    let cop_name = directive.qualified_name();
 
     // "all" is a wildcard — never flag (too broad to determine redundancy)
     if cop_name == "all" {
         return None;
     }
 
-    // Department-only name (no '/') — never flag (too broad to check)
     if !cop_name.contains('/') {
-        return None;
-    }
-
-    // Malformed cop name (e.g. "/BlockLength") — the first character must be
-    // an ASCII uppercase letter to form a valid Department/CopName.  RuboCop
-    // silently ignores these, so we should too.
-    if !cop_name.starts_with(|c: char| c.is_ascii_uppercase()) {
-        return None;
+        // A bare name that `qualified_name()` could not resolve is either a
+        // department (RuboCop expands it to every cop in the department and
+        // reports a department-level offense — nitrocop stays conservative and
+        // skips those), or a short name matching several cops, which makes
+        // RuboCop raise `AmbiguousCopName` so the file yields no offenses at
+        // all.  Anything else is an unknown cop and falls through below.
+        if is_department_name(context.registry, cop_name)
+            || short_name_matches(context.registry, cop_name) > 1
+        {
+            return None;
+        }
     }
 
     // Self-referential: disabling RedundantCopDisableDirective itself is
@@ -660,6 +678,12 @@ fn is_directive_redundant(
 
     if let Some((idx, _)) = cop_entry {
         // Cop IS in the registry.
+        if directive.already_disabled {
+            // The directive re-opens a range that was still open for this cop,
+            // so RuboCop reports it whether or not anything was suppressed and
+            // whether or not the cop ran (`each_already_disabled`).
+            return Some("");
+        }
         let filter = context.cop_filters.cop_filter(idx);
         if !filter.is_enabled() {
             // Cop is explicitly disabled — the disable directive is redundant.
@@ -722,6 +746,26 @@ fn is_directive_redundant(
         }
         Some(" (unknown cop)")
     }
+}
+
+/// Whether `name` is a department (the part before `/` of some registered cop).
+fn is_department_name(registry: &CopRegistry, name: &str) -> bool {
+    registry
+        .cops()
+        .iter()
+        .any(|cop| cop.name().split('/').next() == Some(name))
+}
+
+/// Number of registered cops whose short name (after `/`) is `name`.
+///
+/// Mirrors `RuboCop::Cop::Registry#qualify_badge`: zero matches means an
+/// unknown cop, more than one means `AmbiguousCopName`.
+fn short_name_matches(registry: &CopRegistry, name: &str) -> usize {
+    registry
+        .cops()
+        .iter()
+        .filter(|cop| cop.name().split('/').nth(1) == Some(name))
+        .count()
 }
 
 /// Validate that corrected bytes are still valid Ruby by re-parsing with Prism.
@@ -1320,7 +1364,13 @@ fn lint_source_once(
                 redundant_disable_explicitly_selected,
                 all_cops_ran,
             };
-            for directive in disabled.unused_directives() {
+            // `on_new_investigation` accumulates `redundant_cops[comment]` as
+            // a `Set`, so one comment yields at most one offense per cop name
+            // even when both `each_line_range` and `each_already_disabled`
+            // flag it (e.g. `# rubocop:disable Foo, Foo`). Comments are one per
+            // line, so (line, qualified name) is the same key.
+            let mut reported_directives: HashSet<(usize, &str)> = HashSet::new();
+            for directive in disabled.redundancy_candidates() {
                 // If this line is within an explicit `# rubocop:disable
                 // Lint/RedundantCopDisableDirective` region, suppress the
                 // offense — the user explicitly silenced this cop here.
@@ -1336,9 +1386,14 @@ fn lint_source_once(
                     None => continue,
                 };
 
+                if !reported_directives.insert((directive.line, directive.qualified_name())) {
+                    continue;
+                }
+
                 let message = format!(
                     "Unnecessary disabling of `{}`{}.",
-                    directive.cop_name, suffix
+                    directive.qualified_name(),
+                    suffix
                 );
                 diagnostics.push(Diagnostic {
                     path: source.path_str().to_string(),
