@@ -35,6 +35,10 @@ impl CopRegistry {
         super::rspec_rails::register_all(&mut registry);
         super::security::register_all(&mut registry);
         super::style::register_all(&mut registry);
+        // Declarative cops last, so a hand-written cop keeps the lower
+        // `cop_index` (and therefore wins a correction conflict) if the two
+        // ever overlap during a migration.
+        super::ir::embedded::register_all(&mut registry);
         registry
     }
 

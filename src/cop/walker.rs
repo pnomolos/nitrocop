@@ -5,6 +5,11 @@ use crate::cop::{Cop, CopConfig};
 use crate::diagnostic::Diagnostic;
 use crate::parse::source::SourceFile;
 
+/// Single-cop walker, used by the fixture-test harness (`crate::testutil`).
+///
+/// Like [`BatchedCopWalker`] it maintains an ancestor stack only when the cop
+/// asks for one, so a fixture test drives an ancestor-aware cop — an IR cop
+/// whose pattern uses `^`, say — exactly as the linter does.
 pub struct CopWalker<'a, 'pr> {
     pub cop: &'a dyn Cop,
     pub source: &'a SourceFile,
@@ -12,29 +17,77 @@ pub struct CopWalker<'a, 'pr> {
     pub cop_config: &'a CopConfig,
     pub diagnostics: Vec<Diagnostic>,
     pub corrections: Option<Vec<crate::correction::Correction>>,
+    /// Enclosing branch nodes, outermost first; empty unless the cop asked.
+    ancestors: Vec<ruby_prism::Node<'pr>>,
+    track_ancestors: bool,
+}
+
+impl<'a, 'pr> CopWalker<'a, 'pr> {
+    pub fn new(
+        cop: &'a dyn Cop,
+        source: &'a SourceFile,
+        parse_result: &'a ruby_prism::ParseResult<'pr>,
+        cop_config: &'a CopConfig,
+    ) -> Self {
+        Self {
+            cop,
+            source,
+            parse_result,
+            cop_config,
+            diagnostics: Vec::new(),
+            corrections: None,
+            ancestors: Vec::new(),
+            track_ancestors: cop.wants_ancestors(),
+        }
+    }
+
+    /// Collect corrections as well as diagnostics.
+    #[must_use]
+    pub fn with_corrections(mut self) -> Self {
+        self.corrections = Some(Vec::new());
+        self
+    }
+
+    fn dispatch(&mut self, node: &ruby_prism::Node<'pr>) {
+        if self.track_ancestors {
+            self.cop.check_node_with_ancestors(
+                self.source,
+                node,
+                &self.ancestors,
+                self.parse_result,
+                self.cop_config,
+                &mut self.diagnostics,
+                self.corrections.as_mut(),
+            );
+        } else {
+            self.cop.check_node(
+                self.source,
+                node,
+                self.parse_result,
+                self.cop_config,
+                &mut self.diagnostics,
+                self.corrections.as_mut(),
+            );
+        }
+    }
 }
 
 impl<'pr> Visit<'pr> for CopWalker<'_, 'pr> {
     fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
-        self.cop.check_node(
-            self.source,
-            &node,
-            self.parse_result,
-            self.cop_config,
-            &mut self.diagnostics,
-            self.corrections.as_mut(),
-        );
+        self.dispatch(&node);
+        if self.track_ancestors {
+            self.ancestors.push(node);
+        }
+    }
+
+    fn visit_branch_node_leave(&mut self) {
+        if self.track_ancestors {
+            self.ancestors.pop();
+        }
     }
 
     fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
-        self.cop.check_node(
-            self.source,
-            &node,
-            self.parse_result,
-            self.cop_config,
-            &mut self.diagnostics,
-            self.corrections.as_mut(),
-        );
+        self.dispatch(&node);
     }
 }
 

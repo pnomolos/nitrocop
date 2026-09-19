@@ -125,6 +125,16 @@ pub struct Captures<'pr> {
 }
 
 impl<'pr> Captures<'pr> {
+    /// Build from pre-filled slots.
+    ///
+    /// The IR runtime merges several matchers' captures into one hook-level
+    /// slot vector (`cop/ir/cop.rs`) before evaluating `when:`, so it needs a
+    /// way in that is not [`MatchEnv::into_captures`].
+    #[must_use]
+    pub fn from_slots(slots: Vec<Option<CaptureValue<'pr>>>) -> Self {
+        Self { slots }
+    }
+
     /// Number of capture slots in the pattern (filled or not).
     #[must_use]
     pub fn len(&self) -> usize {
