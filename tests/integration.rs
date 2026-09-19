@@ -7783,3 +7783,63 @@ fn inline_disable_inside_open_range_is_not_already_disabled() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn intervening_inline_range_breaks_already_disabled_adjacency() {
+    // `each_already_disabled` walks `line_ranges.each_cons(2)` over the
+    // *append-ordered* range list built by `CommentConfig#analyze`. An inline
+    // directive appends its single-line range as soon as it is seen, while a
+    // block range is only appended when it closes. So for
+    //
+    //   1: # rubocop:disable Style/SymbolProc
+    //   2: # rubocop:disable Style/SymbolProc
+    //   3: <offense> # rubocop:disable Style/SymbolProc
+    //   4: <offense>
+    //   5: # rubocop:enable Style/SymbolProc
+    //
+    // the list is [1..2, 3..3, 2..5]: the line-2 directive's range (2..5) is
+    // no longer adjacent to the line-1 range (1..2), so RuboCop does *not*
+    // report line 2. Only line 1 is reported (its range holds no offense).
+    let body = "# rubocop:disable Style/SymbolProc\n\
+                # rubocop:disable Style/SymbolProc\n\
+                a.map { |t| t.foo } # rubocop:disable Style/SymbolProc\n\
+                b.map { |t| t.foo }\n\
+                # rubocop:enable Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_intervening_inline", body);
+
+    let lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    assert_eq!(lines, vec![1], "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn duplicate_cop_name_in_one_directive_reports_once() {
+    // `on_new_investigation` collects `redundant_cops[comment]` as a `Set`, so
+    // a comment naming the same cop twice yields a single offense even though
+    // both `each_line_range` (the first, empty range) and
+    // `each_already_disabled` (the reopened range) flag it.
+    let body = "# rubocop:disable Style/SymbolProc, Style/SymbolProc\n\
+                a.map { |t| t.foo }\n\
+                # rubocop:enable Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_duplicate_name", body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn duplicate_cop_name_in_one_inline_directive_is_already_disabled() {
+    // Two single-line ranges for the same cop on the same line are adjacent
+    // (`1..1` then `1..1`), so `followed_ranges?` holds and RuboCop reports the
+    // comment once even though the directive really does suppress an offense.
+    let body = "a.map { |t| t.foo } # rubocop:disable Style/SymbolProc, Style/SymbolProc\n";
+    let (dir, diagnostics) = redundant_directives("redundant_disable_duplicate_inline_name", body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}

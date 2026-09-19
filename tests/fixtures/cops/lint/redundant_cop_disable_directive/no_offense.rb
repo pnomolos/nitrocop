@@ -36,3 +36,12 @@ plain = 1
 # rubocop:disable Style/SymbolProc
 others.map { |t| t.foo }
 # rubocop:enable Style/SymbolProc
+
+# An inline directive between two block disables for the same cop breaks the
+# `each_cons(2)` adjacency of `CommentConfig`'s append-ordered range list
+# ([1..2, 3..3, 2..5] below), so `each_already_disabled` does not flag the
+# second block disable. (The first one is flagged in offense.rb.)
+# rubocop:disable Style/SymbolProc
+things.map { |t| t.foo } # rubocop:disable Style/SymbolProc
+others.map { |t| t.foo }
+# rubocop:enable Style/SymbolProc

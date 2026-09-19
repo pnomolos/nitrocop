@@ -78,3 +78,16 @@ things.map { |t| t.foo }
 ^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Style/SymbolProc`.
 other.map { |t| t.foo }
 # rubocop:enable Style/SymbolProc
+
+# The same cop named twice in one comment produces two adjacent ranges, so
+# both `each_line_range` (the empty first range) and `each_already_disabled`
+# flag it — but `redundant_cops[comment]` is a Set, so RuboCop reports it once.
+# rubocop:disable Style/SymbolProc, Style/SymbolProc
+^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Style/SymbolProc`.
+things.map { |t| t.foo }
+# rubocop:enable Style/SymbolProc
+
+# Same for an inline comment: two `N..N` ranges are adjacent, so the directive
+# is redundant even though it really does suppress the offense on its line.
+others.map { |t| t.foo } # rubocop:disable Style/SymbolProc, Style/SymbolProc
+^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Style/SymbolProc`.

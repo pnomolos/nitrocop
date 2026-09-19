@@ -1364,6 +1364,12 @@ fn lint_source_once(
                 redundant_disable_explicitly_selected,
                 all_cops_ran,
             };
+            // `on_new_investigation` accumulates `redundant_cops[comment]` as
+            // a `Set`, so one comment yields at most one offense per cop name
+            // even when both `each_line_range` and `each_already_disabled`
+            // flag it (e.g. `# rubocop:disable Foo, Foo`). Comments are one per
+            // line, so (line, qualified name) is the same key.
+            let mut reported_directives: HashSet<(usize, &str)> = HashSet::new();
             for directive in disabled.redundancy_candidates() {
                 // If this line is within an explicit `# rubocop:disable
                 // Lint/RedundantCopDisableDirective` region, suppress the
@@ -1379,6 +1385,10 @@ fn lint_source_once(
                     Some(s) => s,
                     None => continue,
                 };
+
+                if !reported_directives.insert((directive.line, directive.qualified_name())) {
+                    continue;
+                }
 
                 let message = format!(
                     "Unnecessary disabling of `{}`{}.",
