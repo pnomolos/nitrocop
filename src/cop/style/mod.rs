@@ -49,6 +49,7 @@ pub mod def_with_parentheses;
 pub mod dig_chain;
 pub mod dir;
 pub mod dir_empty;
+pub mod directive_scope;
 pub mod disable_cops_within_source_code_directive;
 pub mod document_dynamic_eval_definition;
 pub mod documentation;
@@ -179,6 +180,7 @@ pub mod optional_boolean_parameter;
 pub mod or_assignment;
 pub mod parallel_assignment;
 pub mod parentheses_around_condition;
+pub mod partition_instead_of_double_select;
 pub mod percent_literal_delimiters;
 pub mod percent_q_literals;
 pub mod perl_backrefs;
@@ -187,6 +189,7 @@ pub mod proc;
 pub mod quoted_symbols;
 pub mod raise_args;
 pub mod random_with_offset;
+pub mod reduce_to_hash;
 pub mod redundant_argument;
 pub mod redundant_array_constructor;
 pub mod redundant_array_flatten;
@@ -304,6 +307,9 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(negated_while::NegatedWhile));
     registry.register(Box::new(
         parentheses_around_condition::ParenthesesAroundCondition,
+    ));
+    registry.register(Box::new(
+        partition_instead_of_double_select::PartitionInsteadOfDoubleSelect,
     ));
     registry.register(Box::new(if_unless_modifier::IfUnlessModifier));
     registry.register(Box::new(word_array::WordArray));
@@ -501,6 +507,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(date_time::DateTime));
     registry.register(Box::new(dig_chain::DigChain));
     registry.register(Box::new(self::dir::Dir));
+    registry.register(Box::new(directive_scope::DirectiveScope));
     registry.register(Box::new(dir_empty::DirEmpty));
     registry.register(Box::new(
         disable_cops_within_source_code_directive::DisableCopsWithinSourceCodeDirective,
@@ -595,6 +602,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     registry.register(Box::new(perl_backrefs::PerlBackrefs));
     registry.register(Box::new(quoted_symbols::QuotedSymbols));
     registry.register(Box::new(random_with_offset::RandomWithOffset));
+    registry.register(Box::new(reduce_to_hash::ReduceToHash));
     registry.register(Box::new(redundant_argument::RedundantArgument));
     registry.register(Box::new(
         redundant_array_constructor::RedundantArrayConstructor,

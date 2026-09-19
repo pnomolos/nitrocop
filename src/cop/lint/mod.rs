@@ -63,6 +63,7 @@ pub mod literal_as_condition;
 pub mod literal_assignment_in_condition;
 pub mod literal_in_interpolation;
 pub mod loop_cop;
+pub mod misplaced_magic_comment;
 pub mod missing_cop_enable_directive;
 pub mod missing_super;
 pub mod mixed_case_range;
@@ -255,6 +256,7 @@ pub fn register_all(registry: &mut CopRegistry) {
     ));
     registry.register(Box::new(literal_in_interpolation::LiteralInInterpolation));
     registry.register(Box::new(loop_cop::Loop));
+    registry.register(Box::new(misplaced_magic_comment::MisplacedMagicComment));
     registry.register(Box::new(missing_super::MissingSuper));
     registry.register(Box::new(mixed_case_range::MixedCaseRange));
     registry.register(Box::new(
