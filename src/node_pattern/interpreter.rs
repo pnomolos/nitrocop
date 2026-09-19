@@ -330,6 +330,55 @@ fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
     MatchChild::Node(node)
 }
 
+/// The Parser-gem sibling of `node` among `parent`'s children, `offset` places
+/// away (`-1` for `left_sibling`, `1` for `right_sibling`).
+///
+/// `RuboCop::AST::Node#left_sibling` indexes into `parent.children`, which for
+/// a `send` includes the method *name* — a Symbol, not a node — which is why
+/// `Style/RedundantStructKeywordInit` guards its result with
+/// `.is_a?(AST::Node)`. The same distinction survives here: a slot that is not
+/// a [`MatchChild::Node`] answers `None`, so `Struct.new(keyword_init: nil)`
+/// correctly finds no node before the hash while
+/// `Struct.new(:foo, keyword_init: nil)` finds `:foo`.
+#[must_use]
+pub(crate) fn parser_sibling<'pr>(
+    node: &ruby_prism::Node<'pr>,
+    parent: &ruby_prism::Node<'pr>,
+    offset: isize,
+) -> Option<ruby_prism::Node<'pr>> {
+    let parser_type = parser_type_for_node(parent).or_else(|| block_type_of(parent))?;
+    let children = get_children(parser_type, parent)?;
+    // `NodeId` rather than the byte range alone: a wrapper can share its only
+    // child's range (a one-pair `KeywordHashNode` and its `AssocNode` do), and
+    // a range-only test would then call a node its own child.
+    let wanted = NodeId::of(node);
+    let index = children.iter().position(|child| match child {
+        MatchChild::Node(child) => NodeId::of(child) == wanted,
+        _ => false,
+    })?;
+    let target = index.checked_add_signed(offset)?;
+    match children.get(target)? {
+        MatchChild::Node(sibling) => Some(dup_node(sibling)),
+        _ => None,
+    }
+}
+
+/// Whether `parent` has `node` as a direct Parser-gem child.
+#[must_use]
+pub(crate) fn is_parser_child(node: &ruby_prism::Node<'_>, parent: &ruby_prism::Node<'_>) -> bool {
+    let Some(parser_type) = parser_type_for_node(parent).or_else(|| block_type_of(parent)) else {
+        return false;
+    };
+    let Some(children) = get_children(parser_type, parent) else {
+        return false;
+    };
+    let wanted = NodeId::of(node);
+    children.iter().any(|child| match child {
+        MatchChild::Node(child) => NodeId::of(child) == wanted,
+        _ => false,
+    })
+}
+
 /// Everything `descend` should walk into below `node`.
 ///
 /// Parser's `children` for a block is `[send, args, body]`, and Prism's
@@ -2167,6 +2216,15 @@ fn matches_seq_head<'pr>(
         PatternNode::Unify(name) => env.unify(name, node.location().as_slice()),
         // A type name, which is what a head term usually is.
         PatternNode::Ident(name) | PatternNode::TypePredicate(name) => node_has_type(node, name),
+        // `nil`, `true` and `false` are node *type* names in head position —
+        // `(nil)`, `(true)`, `(false)` are how upstream spells those literals
+        // as sequences (`Style/RedundantStructKeywordInit`'s
+        // `(pair (sym :keyword_init) {(true) (nil)})`). The parser reads a bare
+        // one as the literal term it is everywhere else, so the head is parked
+        // under the complex-head sentinel and lands here.
+        PatternNode::NilLiteral => node_has_type(node, "nil"),
+        PatternNode::TrueLiteral => node_has_type(node, "true"),
+        PatternNode::FalseLiteral => node_has_type(node, "false"),
         // `access_node` ignores `seq_head`, so these see the node.
         PatternNode::ParentRef(_) | PatternNode::DescendRef(_) => {
             matches_deferred(pattern, &PredTarget::Node(node), env)
@@ -4003,6 +4061,71 @@ mod tests {
         let node = first_stmt(&source);
         assert!(interpret_pattern("(itblock _ _ (lvar :it))", &node));
         assert!(!interpret_pattern("(itblock _ _ (lvar :other))", &node));
+    }
+
+    /// `(nil)`, `(true)` and `(false)` are sequences whose head is a node
+    /// *type*, which is how upstream spells those literals inside a pattern.
+    #[test]
+    fn literal_sequences_are_type_heads() {
+        for (source, matching, other) in [
+            ("a = nil", "(nil)", "(true)"),
+            ("a = true", "(true)", "(false)"),
+            ("a = false", "(false)", "(nil)"),
+        ] {
+            let parsed = ruby_prism::parse(source.as_bytes());
+            let node = first_stmt(&parsed);
+            let pattern = format!("(lvasgn :a {matching})");
+            assert!(interpret_pattern(&pattern, &node), "{pattern} vs {source}");
+            let pattern = format!("(lvasgn :a {other})");
+            assert!(!interpret_pattern(&pattern, &node), "{pattern} vs {source}");
+        }
+        let parsed = ruby_prism::parse(b"Struct.new(keyword_init: nil)");
+        let node = first_stmt(&parsed);
+        assert!(interpret_pattern(
+            "(send _ :new (hash (pair (sym :keyword_init) {(true) (nil)})))",
+            &node,
+        ));
+    }
+
+    /// `Node#left_sibling` / `#right_sibling` over the Parser-gem child list,
+    /// where a `send`'s method name is a name rather than a node.
+    #[test]
+    fn parser_siblings_skip_non_node_slots() {
+        test_support::with_node_and_chain(
+            "Struct.new(:foo, a: 1, keyword_init: nil)\n",
+            "keyword_init: nil",
+            |pair, chain| {
+                let hash = chain.last().expect("the pair is inside the hash");
+                assert!(is_parser_child(pair, hash));
+                let left = parser_sibling(pair, hash, -1).expect("`a: 1`");
+                assert_eq!(left.location().as_slice(), b"a: 1");
+                assert!(parser_sibling(pair, hash, 1).is_none());
+
+                let call = chain
+                    .iter()
+                    .rev()
+                    .find(|node| is_parser_child(hash, node))
+                    .expect("the hash is an argument of the call");
+                // `:foo` precedes the hash in the argument list.
+                let left = parser_sibling(hash, call, -1).expect("`:foo`");
+                assert_eq!(left.location().as_slice(), b":foo");
+                assert!(parser_sibling(hash, call, 1).is_none());
+            },
+        );
+        // With no preceding argument the slot before the hash is the method
+        // *name*, which is not a node — upstream's `.is_a?(AST::Node)` guard.
+        test_support::with_node_and_chain(
+            "Struct.new(keyword_init: nil)\n",
+            "Struct.new(keyword_init: nil)",
+            |call, _| {
+                let hash = call
+                    .as_call_node()
+                    .and_then(|c| c.arguments())
+                    .and_then(|a| a.arguments().iter().next())
+                    .expect("the hash argument");
+                assert!(parser_sibling(&hash, call, -1).is_none());
+            },
+        );
     }
 
     #[test]
