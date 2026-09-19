@@ -47,3 +47,9 @@ range = self #: as untyped # rubocop:disable Style/RedundantSelf
 
 range = self #: as untyped # rubocop:disable Style/RedundantSelf
              ^ Style/DisableCopsWithinSourceCodeDirective: RuboCop disable/enable directives are not permitted.
+
+# rubocop:disable-next Metrics/AbcSize
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Style/DisableCopsWithinSourceCodeDirective: RuboCop disable/enable directives are not permitted.
+def another_complex_method
+  y = 1
+end
