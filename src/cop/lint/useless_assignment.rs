@@ -172,8 +172,32 @@ impl Cop for UselessAssignment {
         let rescue_modifier_writes = rescue_modifier_collector.writes;
         let chained_assignment_descendants =
             collect_chained_assignment_descendant_offsets(parse_result);
+        let loop_shape_referenced_offsets = collect_loop_shape_referenced_offsets(parse_result);
         let mut candidates = collector.take_candidates();
         candidates.sort_by_key(|candidate| candidate.node_offset);
+        // RuboCop processes `scope.variables` in variable-*declaration* order
+        // (Ruby hash insertion order), checking every assignment of one
+        // variable — including `ignore_node` calls from `chained_assignment?`
+        // — before moving to the next-declared variable. A chained-assignment
+        // `ignore_node(outer)` therefore only suppresses descendant offenses
+        // on variables declared *after* the outer one; it cannot retroactively
+        // hide an offense on a variable that was already fully checked
+        // because it was declared earlier in the scope. Our candidate loop
+        // below walks by byte offset (not declaration order), so we must
+        // track each assignment's owning variable's declaration offset to
+        // replicate that ordering constraint.
+        let declaration_offset_by_assignment_offset: HashMap<usize, usize> = candidates
+            .iter()
+            .map(|candidate| {
+                let declaration_offset = candidate
+                    .assignment_states
+                    .iter()
+                    .map(|assignment| assignment.offset)
+                    .min()
+                    .unwrap_or(candidate.node_offset);
+                (candidate.node_offset, declaration_offset)
+            })
+            .collect();
         let mut suppressed_chained_descendants: HashSet<usize> = HashSet::new();
 
         for candidate in candidates {
@@ -202,6 +226,7 @@ impl Cop for UselessAssignment {
                         &rescue_modifier_writes,
                     )
                     && !retry_protected_rescue_offsets.contains(&candidate.node_offset)
+                    && !loop_shape_referenced_offsets.contains(&candidate.node_offset)
             };
 
             if !emit {
@@ -209,7 +234,19 @@ impl Cop for UselessAssignment {
             }
 
             if let Some(descendants) = chained_assignment_descendants.get(&candidate.node_offset) {
-                suppressed_chained_descendants.extend(descendants);
+                let outer_declaration_offset = declaration_offset_by_assignment_offset
+                    .get(&candidate.node_offset)
+                    .copied()
+                    .unwrap_or(candidate.node_offset);
+                for &descendant_offset in descendants {
+                    let descendant_declaration_offset = declaration_offset_by_assignment_offset
+                        .get(&descendant_offset)
+                        .copied()
+                        .unwrap_or(descendant_offset);
+                    if descendant_declaration_offset > outer_declaration_offset {
+                        suppressed_chained_descendants.insert(descendant_offset);
+                    }
+                }
             }
 
             let (line, column) = source.offset_to_line_col(candidate.node_offset);
@@ -1147,6 +1184,27 @@ impl<'pr> Visit<'pr> for RetryProtectedSuppressCollector<'_> {
 // This handles the archivesspace case while keeping the suppression scope
 // tight enough that Prism's tolerant parsing of malformed source can not
 // silently swallow unrelated later statements.
+//
+// ## FN fix: `ignore_node` only protects later-declared variables (2026-04-27)
+//
+// RuboCop's `after_leaving_scope` walks `scope.variables` in variable
+// *declaration* order (a Ruby hash preserves insertion order), and for each
+// variable checks *all* of its assignments — including any `ignore_node`
+// call from a chained assignment — before moving to the next-declared
+// variable. So `ignore_node(outer)` only ever suppresses a descendant
+// offense on a variable declared *after* `outer`; a variable declared
+// earlier has already been fully checked (and any offense already reported)
+// by the time `outer` is processed. Reporting purely by our own suppression
+// map (keyed only by AST containment, oblivious to declaration order) missed
+// this: github-linguist/linguist's `samples/Python/spec.linux.spec` reuses
+// `strip`/`upx`/`name` as inline positional-argument assignments in *two*
+// separate calls (`EXE(...)` then `COLLECT(...)`); `strip`/`upx`/`name` are
+// declared first (in the `EXE(...)` call), so RuboCop reports their second,
+// dead `COLLECT(...)` occurrence — even though it is textually a descendant
+// of the outer `collect = COLLECT(...)` chained assignment that DOES get
+// `ignore_node`'d. We therefore only add a descendant offset to the
+// suppression set when its owning variable's declaration offset is *after*
+// the outer chained assignment's variable's declaration offset.
 
 fn collect_chained_assignment_descendant_offsets(
     parse_result: &ruby_prism::ParseResult<'_>,
@@ -1179,6 +1237,260 @@ impl<'pr> Visit<'pr> for ChainedAssignmentDescendantCollector {
                     }
                 }
             }
+        }
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP suppression: RuboCop's loop-assignment node-equality quirk.
+// ---------------------------------------------------------------------------
+//
+// RuboCop's `VariableForce#mark_assignments_as_referenced_in_loop` grants a
+// "back-edge" reference to assignments RuboCop considers part of a
+// `while`/`until`/`for` loop, so a loop-body write whose only reader is the
+// next iteration is not flagged. It builds that assignment set with
+// `variable.assignments.select { |a| assignment_nodes_in_loop.include?(a.node) }`
+// — but `assignment_nodes_in_loop` only holds nodes that are *real*
+// descendants of the loop, while `Array#include?` calls `Parser::AST::Node#==`,
+// which is **structural**, not identity, equality. An assignment lexically
+// *outside* the loop whose node is structurally identical to one *inside* the
+// loop (same variable name, same value source, e.g. two `winrm_info = nil`
+// statements) is matched anyway. When that outer assignment also has an
+// `if`/`unless`/`case`/`case_match`/`rescue` ancestor anywhere above it (any
+// distance — `each_ancestor` doesn't stop at the nearest one), RuboCop's
+// `reference_assignments` unconditionally calls `Assignment#reference!` on it,
+// marking it "used" even though it is genuinely dead. See
+// hashicorp/vagrant `plugins/communicators/winrm/communicator.rb`:
+//
+//   def wait_for_ready(timeout)
+//     Timeout.timeout(timeout) do
+//       winrm_info = nil          # <- lexically outside the loop, but
+//       while true                #    structurally == the write below, and
+//         winrm_info = nil        #    it sits under the method's `rescue`
+//         ...
+//         break if winrm_info
+//       end
+//       ...
+//     end
+//   rescue Timeout::Error
+//     return false
+//   end
+//
+// We approximate RuboCop's structural node equality with a whitespace-
+// stripped comparison of the assigned value's source text, and approximate
+// "same local-variable scope" by requiring both the candidate write and the
+// matching loop to share the same nearest enclosing `def`/`defs` (or both be
+// outside any method). This mirrors the corpus example without matching
+// same-named/same-shaped locals across unrelated methods.
+
+fn collect_loop_shape_referenced_offsets(
+    parse_result: &ruby_prism::ParseResult<'_>,
+) -> HashSet<usize> {
+    let mut finder = LoopShapeFinder::default();
+    finder.visit(&parse_result.node());
+
+    let mut branchy = BranchAncestorWriteCollector::default();
+    branchy.visit(&parse_result.node());
+
+    let mut offsets = HashSet::new();
+    for candidate in &branchy.writes {
+        for loop_info in &finder.loops {
+            if loop_info.enclosing_def_id != candidate.enclosing_def_id {
+                continue;
+            }
+            if loop_info.read_names.contains(&candidate.name)
+                && loop_info
+                    .write_shapes
+                    .get(&candidate.name)
+                    .is_some_and(|shapes| shapes.contains(&candidate.shape))
+            {
+                offsets.insert(candidate.offset);
+                break;
+            }
+        }
+    }
+    offsets
+}
+
+fn normalized_value_shape(node: &ruby_prism::Node<'_>) -> Vec<u8> {
+    node.location()
+        .as_slice()
+        .iter()
+        .filter(|b| !b.is_ascii_whitespace())
+        .copied()
+        .collect()
+}
+
+#[derive(Default)]
+struct LoopBodyShape {
+    enclosing_def_id: Option<usize>,
+    read_names: HashSet<Vec<u8>>,
+    write_shapes: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct LoopShapeSubCollector {
+    shape: LoopBodyShape,
+}
+
+impl<'pr> Visit<'pr> for LoopShapeSubCollector {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.shape
+            .read_names
+            .insert(node.name().as_slice().to_vec());
+    }
+
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        let name = node.name().as_slice().to_vec();
+        let shape = normalized_value_shape(&node.value());
+        self.shape
+            .write_shapes
+            .entry(name)
+            .or_default()
+            .insert(shape);
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+}
+
+#[derive(Default)]
+struct LoopShapeFinder {
+    loops: Vec<LoopBodyShape>,
+    def_stack: Vec<usize>,
+}
+
+impl LoopShapeFinder {
+    fn current_def_id(&self) -> Option<usize> {
+        self.def_stack.last().copied()
+    }
+
+    fn push_loop_shape(&mut self, mut shape: LoopBodyShape) {
+        shape.enclosing_def_id = self.current_def_id();
+        self.loops.push(shape);
+    }
+}
+
+impl<'pr> Visit<'pr> for LoopShapeFinder {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.def_stack.push(node.location().start_offset());
+        ruby_prism::visit_def_node(self, node);
+        self.def_stack.pop();
+    }
+
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        let mut sub = LoopShapeSubCollector::default();
+        sub.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            for stmt in stmts.body().iter() {
+                sub.visit(&stmt);
+            }
+        }
+        self.push_loop_shape(sub.shape);
+        ruby_prism::visit_while_node(self, node);
+    }
+
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        let mut sub = LoopShapeSubCollector::default();
+        sub.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            for stmt in stmts.body().iter() {
+                sub.visit(&stmt);
+            }
+        }
+        self.push_loop_shape(sub.shape);
+        ruby_prism::visit_until_node(self, node);
+    }
+
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        let mut sub = LoopShapeSubCollector::default();
+        sub.visit(&node.collection());
+        sub.visit(&node.index());
+        if let Some(stmts) = node.statements() {
+            for stmt in stmts.body().iter() {
+                sub.visit(&stmt);
+            }
+        }
+        self.push_loop_shape(sub.shape);
+        ruby_prism::visit_for_node(self, node);
+    }
+}
+
+struct BranchAncestorWrite {
+    name: Vec<u8>,
+    offset: usize,
+    shape: Vec<u8>,
+    enclosing_def_id: Option<usize>,
+}
+
+#[derive(Default)]
+struct BranchAncestorWriteCollector {
+    branch_depth: usize,
+    def_stack: Vec<usize>,
+    writes: Vec<BranchAncestorWrite>,
+}
+
+impl BranchAncestorWriteCollector {
+    fn current_def_id(&self) -> Option<usize> {
+        self.def_stack.last().copied()
+    }
+}
+
+impl<'pr> Visit<'pr> for BranchAncestorWriteCollector {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.def_stack.push(node.location().start_offset());
+        ruby_prism::visit_def_node(self, node);
+        self.def_stack.pop();
+    }
+
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.branch_depth += 1;
+        ruby_prism::visit_if_node(self, node);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.branch_depth += 1;
+        ruby_prism::visit_unless_node(self, node);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        self.branch_depth += 1;
+        ruby_prism::visit_case_node(self, node);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        self.branch_depth += 1;
+        ruby_prism::visit_case_match_node(self, node);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+        let has_rescue = node.rescue_clause().is_some();
+        if has_rescue {
+            self.branch_depth += 1;
+        }
+        ruby_prism::visit_begin_node(self, node);
+        if has_rescue {
+            self.branch_depth -= 1;
+        }
+    }
+
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.branch_depth += 1;
+        ruby_prism::visit_rescue_modifier_node(self, node);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        if self.branch_depth > 0 {
+            self.writes.push(BranchAncestorWrite {
+                name: node.name().as_slice().to_vec(),
+                offset: node.location().start_offset(),
+                shape: normalized_value_shape(&node.value()),
+                enclosing_def_id: self.current_def_id(),
+            });
         }
         ruby_prism::visit_local_variable_write_node(self, node);
     }

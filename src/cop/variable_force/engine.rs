@@ -1611,6 +1611,40 @@ impl<'pr> Visit<'pr> for Engine<'_> {
         self.mark_loop_back_edges(loc.start_offset(), loc.end_offset());
     }
 
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        // `expr rescue fallback` parses to the same `:rescue` node type RuboCop
+        // uses for a full `begin/rescue`, so RuboCop's `Branch::Rescue` model
+        // (main body may jump/run incompletely; the rescue expression is its
+        // own exclusive sibling branch) applies here too. Without this, the
+        // fallback branch was walked as plain sequential code sharing the
+        // surrounding (unbranched) context, so an outer assignment whose value
+        // is the whole rescue-modifier expression (`x = expr rescue x =
+        // fallback`) would mark the fallback write as `reassigned`. RuboCop's
+        // `Branch.of` gives the fallback a *different* branch than the
+        // unbranched outer write, so `mark_last_as_reassigned!` never fires —
+        // the fallback assignment's liveness then depends solely on whether it
+        // is directly referenced or the variable is `captured_by_block`. This
+        // matters for cases like `pri = MAP[x] rescue pri = LOG_INFO` followed
+        // by a read of `pri` from inside a block: RuboCop does not flag the
+        // fallback write there (log4r `syslogoutputter.rb`), but nitrocop did,
+        // because it treated the fallback as reassigned regardless of the
+        // later block capture.
+        let location = node.location();
+        let parent_id = Self::branch_parent_id(&location);
+
+        self.branch_depth += 1;
+        self.push_branch_with_flags(parent_id, 0, false, false, true, true, false, true);
+        self.visit(&node.expression());
+        self.pop_branch();
+        self.branch_depth -= 1;
+
+        self.branch_depth += 1;
+        self.push_branch(parent_id, 1, false);
+        self.visit(&node.rescue_expression());
+        self.pop_branch();
+        self.branch_depth -= 1;
+    }
+
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         // Branch context is managed by the caller (`visit_begin_node`), which
         // visits each rescue clause under its own sibling branch context.

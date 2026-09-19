@@ -722,3 +722,49 @@ def retry_protected_rescue_capture(name, type)
   end
   response
 end
+
+# FP fix: rescue-modifier fallback write is a distinct RuboCop branch from
+# the outer assignment it feeds. `pri = expr rescue pri = fallback` parses
+# to the same `:rescue` node RuboCop uses for a full begin/rescue, so the
+# fallback write (nested in the rescue's resbody) is never marked
+# `reassigned` by the outer write (which sits outside any branch). Its
+# liveness then depends only on `captured_by_block`: since `pri` is read
+# from inside the `Syslog.open` block below, the variable is captured by a
+# block and RuboCop treats every one of its assignments as used.
+# Mirrors colbygk/log4r `lib/log4r/outputter/syslogoutputter.rb#canonical_log`.
+def rescue_modifier_fallback_captured_by_block(logevent)
+  pri = SYSLOG_LEVELS_MAP[@levels_map[LNAMES[logevent.level]]] rescue pri = LOG_INFO
+  Syslog.open(@ident, @logopt, @facility) do |s|
+    s.log(pri, "%s", "msg")
+  end
+end
+
+# FP fix: RuboCop's `mark_assignments_as_referenced_in_loop` grants a loop
+# "back-edge" reference using `Array#include?` against the loop's own
+# assignment nodes, which uses AST structural equality rather than identity.
+# A lexically-outside-the-loop assignment that is structurally identical to
+# one inside the loop (same name, same value source) is matched anyway. When
+# that outer assignment also has an `if`/`case`/`rescue` ancestor anywhere
+# above it, RuboCop unconditionally marks it referenced even though it is
+# genuinely dead (it is unconditionally overwritten before the loop's first
+# read on every iteration, including the first).
+# Mirrors hashicorp/vagrant
+# `plugins/communicators/winrm/communicator.rb#wait_for_ready`.
+def loop_shape_equality_quirk(timeout)
+  Timeout.timeout(timeout) do
+    winrm_info = nil
+    while true
+      winrm_info = nil
+      begin
+        winrm_info = Helper.winrm_info(@machine)
+      rescue Errors::WinRMNotReady
+        log_not_ready
+      end
+      break if winrm_info
+      sleep(0.5)
+    end
+    log_ready
+  end
+rescue Timeout::Error
+  false
+end

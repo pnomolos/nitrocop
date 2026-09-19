@@ -484,3 +484,48 @@ def call_argument_assignments_before_unread_rescue_modifier
   pid_file.check rescue error("Cannot start", nil, abort = true)
                                                    ^^^^^ Lint/UselessAssignment: Useless assignment to variable - `abort`.
 end
+
+# FN fix: a chained assignment's `ignore_node` only protects descendant
+# assignments on variables *declared later* in the scope. `strip`/`upx`/`name`
+# are first declared as inline positional-argument assignments inside the
+# `exe = EXE(...)` call, so RuboCop has already fully checked (and reported)
+# their later, dead reuse inside `collect = COLLECT(...)` by the time
+# `collect`'s own `ignore_node` (from being a chained assignment) fires —
+# declaration order, not source position, decides which side wins. Mirrors
+# github-linguist/linguist `samples/Python/spec.linux.spec` (a PyInstaller
+# `.spec` file that happens to parse as Ruby).
+def reused_inline_arg_names_across_two_chained_calls
+  exe = EXE(
+    pyz,
+    name = "Portablizer",
+    ^^^^ Lint/UselessAssignment: Useless assignment to variable - `name`.
+    strip = nil,
+    ^^^^^ Lint/UselessAssignment: Useless assignment to variable - `strip`.
+    upx = true
+    ^^^ Lint/UselessAssignment: Useless assignment to variable - `upx`.
+  )
+  collect = COLLECT(
+  ^^^^^^^ Lint/UselessAssignment: Useless assignment to variable - `collect`.
+    exe,
+    strip = nil,
+    ^^^^^ Lint/UselessAssignment: Useless assignment to variable - `strip`.
+    upx = true,
+    ^^^ Lint/UselessAssignment: Useless assignment to variable - `upx`.
+    name = "Portablizer"
+    ^^^^ Lint/UselessAssignment: Useless assignment to variable - `name`.
+  )
+end
+
+# FP fix: chained assignment. RuboCop calls `ignore_node` on `result`'s
+# assignment node (its value is a `send`) after reporting *its* offense,
+# which then hides the offense on the inline `name = value` positional
+# argument nested inside it — a self-documenting inline argument, not a
+# real dead store. `name` is declared after `result`, so `result`'s
+# `ignore_node` protects it (contrast with
+# `reused_inline_arg_names_across_two_chained_calls` above, where the reused
+# variable is declared *before* the chained assignment and so is not
+# protected).
+def chained_assignment_single_occurrence(records, properties, value)
+  result = resolve(records, properties, name = value)
+  ^^^^^^ Lint/UselessAssignment: Useless assignment to variable - `result`.
+end
