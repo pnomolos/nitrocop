@@ -7295,6 +7295,110 @@ fn verifier_vendor_pattern_parse_coverage() {
     );
 }
 
+/// Every vendored pattern lexes into tokens the grammar has a rule for.
+///
+/// The one this guards is `?`: before repetition existed, `_?` lexed as an
+/// identifier named `_?`, which then silently failed the node-type test rather
+/// than matching a wildcard zero-or-one times. An `Ident` may never end in
+/// `?` — a trailing `?` is either a predicate (`tPREDICATE`, its own token) or
+/// the repetition operator.
+#[test]
+fn verifier_vendor_patterns_never_lex_a_question_mark_into_an_identifier() {
+    use nitrocop::node_pattern::{Lexer, Token, walk_vendor_patterns};
+
+    let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    if !vendor_root.is_dir() {
+        eprintln!("vendor/ directory not found — skipping");
+        return;
+    }
+    let patterns = walk_vendor_patterns(&vendor_root);
+    if patterns.is_empty() {
+        eprintln!("No vendor patterns extracted — submodules may not be initialized. Skipping.");
+        return;
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (cop_name, extracted) in &patterns {
+        for token in Lexer::new(&extracted.pattern).tokenize() {
+            if let Token::Ident(name) = &token
+                && (name.ends_with('?') || name.ends_with('*') || name.ends_with('+'))
+            {
+                offenders.push(format!(
+                    "  {cop_name}::{} — {name:?}",
+                    extracted.method_name
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "{} pattern(s) lex a repetition operator into an identifier:\n{}",
+        offenders.len(),
+        offenders.join("\n"),
+    );
+}
+
+/// The vendored patterns that use `?`, `*` or `+` all parse, and the parsed
+/// tree round-trips back to a summary carrying the operator.
+#[test]
+fn verifier_vendor_repetition_patterns_parse() {
+    use nitrocop::node_pattern::{Lexer, Parser, Token, pattern_summary, walk_vendor_patterns};
+
+    let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    if !vendor_root.is_dir() {
+        eprintln!("vendor/ directory not found — skipping");
+        return;
+    }
+    let patterns = walk_vendor_patterns(&vendor_root);
+    if patterns.is_empty() {
+        eprintln!("No vendor patterns extracted — submodules may not be initialized. Skipping.");
+        return;
+    }
+
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (cop_name, extracted) in &patterns {
+        let tokens = Lexer::new(&extracted.pattern).tokenize();
+        if !tokens
+            .iter()
+            .any(|token| matches!(token, Token::Question | Token::Star | Token::Plus))
+        {
+            continue;
+        }
+        total += 1;
+        let mut parser = Parser::new(tokens);
+        match parser.parse() {
+            Some(ast) => {
+                let summary = pattern_summary(&ast);
+                if !summary.contains(['?', '*', '+']) {
+                    failures.push(format!(
+                        "  {cop_name}::{} — repetition lost in {summary}",
+                        extracted.method_name,
+                    ));
+                }
+            }
+            None => failures.push(format!(
+                "  {cop_name}::{} — {:?}",
+                extracted.method_name,
+                parser.error(),
+            )),
+        }
+    }
+
+    eprintln!("\n=== Vendor Repetition Patterns ===");
+    eprintln!("Patterns using `?` / `*` / `+`: {total}");
+    assert!(
+        failures.is_empty(),
+        "{} of {total} repetition patterns failed:\n{}",
+        failures.len(),
+        failures.join("\n"),
+    );
+    assert!(
+        total >= 60,
+        "expected the corpus to carry 60+ repetition patterns, found {total}"
+    );
+}
+
 // ---------- Shared module usage lint ----------
 
 /// Ensures cop files don't inline patterns that have shared equivalents.

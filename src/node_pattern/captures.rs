@@ -65,6 +65,21 @@ pub enum CaptureValue<'pr> {
     List(Vec<CaptureValue<'pr>>),
 }
 
+impl<'pr> Clone for CaptureValue<'pr> {
+    /// Duplicating a capture duplicates a node *handle*, not a node: the
+    /// arena the handle points into is the parse result, which outlives every
+    /// `MatchEnv`. A repetition needs this to accumulate one value per pass
+    /// while the slot is overwritten by the next (`sequence_subcompiler.rb:185-200`).
+    fn clone(&self) -> Self {
+        match self {
+            CaptureValue::Node(node) => CaptureValue::Node(dup_node(node)),
+            CaptureValue::Name(bytes) => CaptureValue::Name(bytes),
+            CaptureValue::Absent => CaptureValue::Absent,
+            CaptureValue::List(items) => CaptureValue::List(items.clone()),
+        }
+    }
+}
+
 impl<'pr> CaptureValue<'pr> {
     /// The captured node, if this capture bound a node.
     #[must_use]
@@ -319,6 +334,12 @@ impl<'pr, 'r> MatchEnv<'pr, 'r> {
             let (slot, previous) = self.trail.pop().expect("trail is non-empty above the mark");
             self.slots[slot] = previous;
         }
+    }
+
+    /// The value currently bound to `slot`, if any.
+    #[must_use]
+    pub fn get(&self, slot: usize) -> Option<&CaptureValue<'pr>> {
+        self.slots.get(slot)?.as_ref()
     }
 
     /// Bind `slot`, journaling the previous value so the write can be undone.
