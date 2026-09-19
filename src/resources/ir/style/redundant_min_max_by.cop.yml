@@ -1,0 +1,62 @@
+schema: 1
+cop: "Style/RedundantMinMaxBy"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: safe
+docs: |
+  Identifies places where `max_by { |x| x }`, `min_by { |x| x }` or
+  `minmax_by { |x| x }` can be replaced by `max`, `min` or `minmax`.
+
+constants:
+  # `REPLACEMENTS`, verbatim.
+  replacements: { max_by: "max", min_by: "min", minmax_by: "minmax" }
+
+matchers:
+  # All three verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/style/redundant_min_max_by.rb.
+  redundant_minmax_by_block:
+    pattern: |
+      (block $(call _ {:max_by :min_by :minmax_by}) (args (arg $_x)) (lvar _x))
+    captures: [send, var]
+  redundant_minmax_by_numblock:
+    pattern: |
+      (numblock $(call _ {:max_by :min_by :minmax_by}) 1 (lvar :_1))
+    captures: [send]
+  redundant_minmax_by_itblock:
+    pattern: |
+      (itblock $(call _ {:max_by :min_by :minmax_by}) _ (lvar :it))
+    captures: [send]
+
+hooks:
+  # `register_offense` is shared by all three upstream hooks:
+  #   range = range_between(send.loc.selector.begin_pos, node.loc.end.end_pos)
+  #   add_offense(range, message:) { |c| c.replace(range, REPLACEMENTS[...]) }
+  # `node` here is the Prism `CallNode` carrying the block, so the Parser
+  # `block` node's `loc.end` is reached as `node.block.end`.
+  - on: [block]
+    match: redundant_minmax_by_block
+    bind: &rmb_bind
+      method: $send.method_name
+      replacement: { lookup: [consts.replacements, $send.method_name] }
+    offense: &rmb_offense
+      location: &rmb_range
+        start: $send.selector.start
+        stop: node.block.end.stop
+      correct:
+        - { op: replace, range: *rmb_range, text: "%{replacement}" }
+      message: "Use `%{replacement}` instead of `%{method} { |%{var}| %{var} }`."
+
+  - on: [numblock]
+    match: redundant_minmax_by_numblock
+    bind: *rmb_bind
+    offense:
+      <<: *rmb_offense
+      message: "Use `%{replacement}` instead of `%{method} { _1 }`."
+
+  - on: [itblock]
+    match: redundant_minmax_by_itblock
+    bind: *rmb_bind
+    offense:
+      <<: *rmb_offense
+      message: "Use `%{replacement}` instead of `%{method} { it }`."
