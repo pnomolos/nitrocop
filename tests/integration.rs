@@ -7399,6 +7399,183 @@ fn verifier_vendor_repetition_patterns_parse() {
     );
 }
 
+/// Every vendored pattern with a `def`, `defs`, `block`, `numblock`,
+/// `itblock` or `begin` head compiles and can be matched against a fixed set
+/// of Ruby snippets without erroring or panicking.
+///
+/// This is the corpus-wide net under the body and `(args)` mapping rules: the
+/// per-pattern tests in `src/node_pattern/interpreter.rs` pin what those
+/// patterns *should* answer on a handful of snippets, and this pins that none
+/// of the other ~90 of them blow up on a node shape the rules now reach.
+/// A `#helper` a cop defines is resolved to a pattern that matches anything,
+/// so the sequence around it still gets walked.
+#[test]
+fn verifier_vendor_body_and_args_patterns_match_without_error() {
+    use nitrocop::node_pattern::{CompiledPattern, PatternError, Resolver, walk_vendor_patterns};
+
+    /// Resolves every `#helper` and `%Const` to a permissive stand-in, so a
+    /// pattern is exercised for its *shape* rather than skipped.
+    struct AnyOwner {
+        anything: CompiledPattern,
+        constant: nitrocop::node_pattern::Arg,
+    }
+
+    impl Resolver for AnyOwner {
+        fn matcher(&self, _name: &str) -> Option<&CompiledPattern> {
+            Some(&self.anything)
+        }
+
+        fn constant(&self, _name: &str) -> Option<&nitrocop::node_pattern::Arg> {
+            Some(&self.constant)
+        }
+    }
+
+    /// Node shapes the two rules touch: every body arity, a parameterless and
+    /// a parameterized `def` and block, both `else` spellings, and the
+    /// `numblock` / `itblock` / lambda variants.
+    const SNIPPETS: &[&str] = &[
+        "def m; end",
+        "def m(a, b = 1, *r, k:, **o, &blk); a; end",
+        "def m; x; y; end",
+        "def m; x; rescue => e; y; ensure; z; end",
+        "def self.m(a); @a = a; end",
+        "foo { }",
+        "foo { bar }",
+        "foo { bar; baz }",
+        "foo { |a| a }",
+        "foo { _1 }",
+        "foo { it }",
+        "xs.reduce(0) { |a, b| next if a; a + b }",
+        "-> { bar }",
+        "->(a) { a }",
+        "if a then b else c end",
+        "if a then end",
+        "if a then b elsif c then d end",
+        "while a; b; end",
+        "until a; end",
+        "for i in xs; b; end",
+        "case x; when 1 then a; else b; end",
+        "case x; in Integer then a; end",
+        "class C < B; a; end",
+        "class C; end",
+        "module M; a; b; end",
+        "class << self; def m; end; end",
+        "begin; a; rescue; b; else; c; ensure; d; end",
+        "(a + b).freeze",
+        "x = (a; b)",
+        "\"#{a}\"",
+        "has_many :xs, dependent: :destroy",
+        "Struct.new(:a, keyword_init: true)",
+        "xs.sort_by { |a| a }",
+        "xs.each_with_object({}) { |e, h| h[e] += 1 }",
+        "def blank?; true; end",
+        "def initialize(a); super; end",
+        "def foo=(v); @foo = v; end",
+        "def m(&block); block.call; end",
+        "def self.default_scope; where(a: 1); end",
+        "describe Foo do\n  it { is_expected.to be }\nend",
+        "setup do\n  foo\nend",
+        "(x & FLAG) == FLAG",
+        "class M < Base\n  def change\n    add_column :a, :b\n  end\nend",
+    ];
+
+    let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    if !vendor_root.is_dir() {
+        eprintln!("vendor/ directory not found — skipping");
+        return;
+    }
+    let patterns = walk_vendor_patterns(&vendor_root);
+    if patterns.is_empty() {
+        eprintln!("No vendor patterns extracted — submodules may not be initialized. Skipping.");
+        return;
+    }
+
+    let owner = AnyOwner {
+        anything: CompiledPattern::compile("_").expect("`_` compiles"),
+        constant: nitrocop::node_pattern::Arg::Symbol("any".into()),
+    };
+
+    let heads = [
+        "(def ",
+        "(def\n",
+        "(defs ",
+        "(block",
+        "(numblock",
+        "(itblock",
+        "(begin",
+    ];
+    let parsed: Vec<_> = SNIPPETS
+        .iter()
+        .map(|source| (source, ruby_prism::parse(source.as_bytes())))
+        .collect();
+
+    let mut considered = 0usize;
+    let mut matched_somewhere = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (cop_name, extracted) in &patterns {
+        if !heads.iter().any(|head| extracted.pattern.contains(head)) {
+            continue;
+        }
+        considered += 1;
+        let compiled = match CompiledPattern::compile_with(&extracted.pattern, &owner) {
+            Ok(compiled) => compiled,
+            // A `%param` or a genuinely unknown name is not this test's
+            // business; an arity or syntax error is.
+            Err(PatternError::Syntax) | Err(PatternError::PredicateArity { .. }) => {
+                failures.push(format!(
+                    "  {cop_name}::{} — does not compile: {}",
+                    extracted.method_name,
+                    extracted.pattern.chars().take(70).collect::<String>(),
+                ));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let mut hit = false;
+        for (source, result) in &parsed {
+            let root = result.node();
+            let Some(program) = root.as_program_node() else {
+                continue;
+            };
+            for statement in program.statements().body().iter() {
+                let _ = source;
+                if compiled.matches(&statement) {
+                    hit = true;
+                }
+                // Captures take the other path through the matcher, so both
+                // are exercised.
+                let _ = compiled.match_captures(&statement);
+            }
+        }
+        if hit {
+            matched_somewhere += 1;
+        }
+    }
+
+    eprintln!("\n=== Vendor `def` / `block` / `begin` Patterns ===");
+    eprintln!("Patterns considered:     {considered}");
+    eprintln!("Matched at least one snippet: {matched_somewhere}");
+    assert!(
+        failures.is_empty(),
+        "{} of {considered} body/args patterns failed to compile:\n{}",
+        failures.len(),
+        failures.join("\n"),
+    );
+    assert!(
+        considered >= 60,
+        "expected the corpus to carry 60+ body/args patterns, found {considered}"
+    );
+    // A floor, not an exact figure: the snippet set is small on purpose. The
+    // same snippets reach 20 patterns on `np/repetition` (before the body,
+    // `(args)` and `rescue` rules) and 31 with them, so the floor sits between.
+    assert!(
+        matched_somewhere >= 25,
+        "only {matched_somewhere} of {considered} matched any snippet — the \
+         mapping rules are probably not reaching the body, args or rescue slot"
+    );
+}
+
 // ---------- Shared module usage lint ----------
 
 /// Ensures cop files don't inline patterns that have shared equivalents.
