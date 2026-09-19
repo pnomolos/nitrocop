@@ -533,3 +533,71 @@ on_supported_os.each do |os, facts|
     end
   end
 end
+
+# Trailing whitespace on the LAST line of the expression is never followed by a
+# newline, so none of RuboCop's `to_single_line` substitutions strip it. The
+# joined length is 119 characters without it and 121 with it, which is what
+# suppresses the offense here (see the matching offense.rb case).
+params[:advanced_search] = {
+  filter_elements: [
+    {
+      repository_column_id: 'aaaaaaaaaaaaaaaa',
+      operator: 'yesterday'
+    }
+  ]
+}  
+
+# `offense?` returns `require_backslash?(node)` for `operator_keyword?` nodes:
+# a multiline `&&`/`||` whose operator line does NOT end with a backslash is
+# never reported, however short the joined line would be.
+def no_backslash?
+  to_idl_type.kind == :bits &&
+    @schema_hash.key?("const")
+end
+
+# Parser models `%x{...}` as an `xstr` whose children are `str` nodes, so a
+# newline in the executed string makes the enclosing expression unsafe to split.
+def front_appname
+  %x{osascript <<__APPLESCRIPT__
+  name of application (path to frontmost application as text)
+__APPLESCRIPT__}.chop
+end
+
+obj = %x{
+  {
+    a: 1,
+    b: "two"
+  }
+}
+
+# A heredoc body is unsafe to split, but the code inside its `#{...}`
+# interpolations is checked independently (the interpolation is a `begin` node
+# in Parser, which stops `on_send`'s walk-up). The `"\n    "` argument is a
+# `:str` descendant of that call, so the call is not safe to split either.
+def front_matter(matter, content)
+  Jekyll::Utils.strip_heredoc(<<-EOF)
+    ---
+    #{matter.gsub(
+      %r!\n!, "\n    "
+    )}
+    ---
+    #{content}
+  EOF
+end
+
+# Parser's send expression ends at the last argument, not at the `do` keyword,
+# so this command call is single-line even though a backslash continuation puts
+# its non-convertible block on the next line.
+Then '(the ){channel} from {string} should contain exactly {string}' \
+  do |channel, cmd, expected|
+  matcher = channel
+  expect(cmd).to matcher(expected)
+end
+
+# `other_cop_takes_precedence?` tests `block_node.parent.loc.dot`, which is set
+# for `::` as well as `.`. The single-line block's parent here is the
+# `AssertEntry::assert_contents` send, so Layout/SingleLineBlockChain owns this.
+def test_extract
+  AssertEntry::assert_contents(EXTRACTED_FILENAME,
+      zf.get_input_stream(ENTRY_TO_EXTRACT) { |is| is.read })
+end
