@@ -33,6 +33,32 @@ use crate::diagnostic::Severity;
 /// The malformed-name guard (`/BlockLength`) has to run on the *raw* text,
 /// because qualification resolves its short name to `Metrics/BlockLength`.
 ///
+/// ## Fixed (2026-09-18): re-disabling an already-disabled cop
+///
+/// RuboCop has two independent redundancy checks. `each_line_range` is the
+/// familiar one ("this range suppressed nothing"). `each_already_disabled`
+/// walks `each_cons(2)` over a cop's disabled line ranges and flags the second
+/// whenever `previous_range.end == range.begin` — a `# rubocop:disable Foo`
+/// that reopens a range still open from an earlier directive with no
+/// intervening `# rubocop:enable`. That is redundant "whether there are
+/// offenses or not", so it must bypass the used/unused test entirely, and it
+/// does not depend on whether the cop ran.
+///
+/// `DisabledRanges::from_comments` already detected this shape (it closes the
+/// previous range at the new directive's line); it now records it as
+/// `DisableDirective::already_disabled`, and `redundancy_candidates()` yields
+/// those directives even when they are marked used.
+///
+/// Inline directives are deliberately excluded: an inline disable inside an
+/// open block range produces a single-line range that does not start where the
+/// block range ends, so `followed_ranges?` is false for it.
+///
+/// Not replicated (no corpus evidence, and each needs range bookkeeping this
+/// cop does not have): the same rule when the still-open directive is a
+/// department or `all` disable — RuboCop expands those to every cop name, so
+/// `# rubocop:disable all` followed by `# rubocop:disable Foo/Bar` flags the
+/// second comment.
+///
 /// ## Not fixed: include-gated cop cascade (~85% of remaining corpus FNs)
 ///
 /// `Rails/CreateTableWithTimestamps`, `Rails/ThreeStateBooleanColumn`,

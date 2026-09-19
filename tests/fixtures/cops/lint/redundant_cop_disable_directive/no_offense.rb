@@ -26,3 +26,13 @@ def long_method
   1
 end
 # rubocop:enable Metrics
+
+# An `enable` closes the first range, so re-disabling afterwards opens a fresh
+# range and is judged only on whether it suppressed an offense.
+# rubocop:disable Style/SymbolProc
+things.map { |t| t.foo }
+# rubocop:enable Style/SymbolProc
+plain = 1
+# rubocop:disable Style/SymbolProc
+others.map { |t| t.foo }
+# rubocop:enable Style/SymbolProc

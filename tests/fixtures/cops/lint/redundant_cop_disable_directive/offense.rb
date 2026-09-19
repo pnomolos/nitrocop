@@ -68,3 +68,13 @@ x = 1 # rubocop:disable LineLength
 ^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `AlignHash` (unknown cop).
 h = { a: 1 }
 # rubocop:enable AlignHash
+
+# Re-disabling a cop that is still disabled from an earlier directive is
+# redundant even when the new range suppresses a real offense
+# (RuboCop's `each_already_disabled`).
+# rubocop:disable Style/SymbolProc
+things.map { |t| t.foo }
+# rubocop:disable Style/SymbolProc
+^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Style/SymbolProc`.
+other.map { |t| t.foo }
+# rubocop:enable Style/SymbolProc

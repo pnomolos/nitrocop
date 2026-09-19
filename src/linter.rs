@@ -618,6 +618,7 @@ struct RedundantDirectiveCheck<'a> {
 ///   - Known cop that is explicitly disabled (Enabled: false): flag as redundant
 ///   - Known cop that is enabled + all_cops_ran + file matched: flag as redundant
 ///     (cop ran and didn't fire)
+///   - Re-opened range (`already_disabled`): flag unconditionally
 ///   - Renamed cop: flag, with conservative handling in --only mode
 ///   - Completely unknown cop: flag with "(unknown cop)" suffix, except during
 ///     unrelated `--only` runs where it would leak into another cop's results
@@ -677,6 +678,12 @@ fn is_directive_redundant(
 
     if let Some((idx, _)) = cop_entry {
         // Cop IS in the registry.
+        if directive.already_disabled {
+            // The directive re-opens a range that was still open for this cop,
+            // so RuboCop reports it whether or not anything was suppressed and
+            // whether or not the cop ran (`each_already_disabled`).
+            return Some("");
+        }
         let filter = context.cop_filters.cop_filter(idx);
         if !filter.is_enabled() {
             // Cop is explicitly disabled — the disable directive is redundant.
@@ -1357,7 +1364,7 @@ fn lint_source_once(
                 redundant_disable_explicitly_selected,
                 all_cops_ran,
             };
-            for directive in disabled.unused_directives() {
+            for directive in disabled.redundancy_candidates() {
                 // If this line is within an explicit `# rubocop:disable
                 // Lint/RedundantCopDisableDirective` region, suppress the
                 // offense — the user explicitly silenced this cop here.

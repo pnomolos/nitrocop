@@ -7676,3 +7676,110 @@ fn redundant_disable_malformed_bare_name_still_skipped() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------- Re-disabling an already-disabled cop ----------
+//
+// RuboCop's `each_already_disabled` walks consecutive disabled line ranges for
+// a cop and flags the second one whenever `previous_range.end == range.begin`
+// — i.e. a `rubocop:disable` that reopens a range still open from an earlier
+// directive. That is redundant "whether there are offenses or not", so the
+// usual "did it suppress anything?" test does not apply.
+
+#[test]
+fn redundant_disable_reopened_without_enable() {
+    // Two block disables for the same cop with no `enable` in between: the
+    // second one is redundant even though the range contains a real offense.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = 1\n# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened", &body);
+
+    // RuboCop reports both: line 1 because its range (1..3) holds no offense,
+    // line 3 because the cop was already disabled there.
+    let mut lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![1, 3], "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `Layout/LineLength`."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_reopened_with_offenses_in_both_ranges() {
+    // Both ranges suppress a real offense, so only the reopening directive on
+    // line 3 is redundant.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:disable Layout/LineLength\nw = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened_both", &body);
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(diagnostics[0].location.line, 3);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_reopened_only_for_repeated_cop() {
+    // `Style/SymbolProc` is reopened, `Layout/LineLength` is not — only the
+    // reopened name is flagged, and it is reported on the second directive.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Style/SymbolProc\ny = 1\n# rubocop:disable Style/SymbolProc, Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Style/SymbolProc, Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reopened_multi", &body);
+
+    let lines: Vec<_> = diagnostics.iter().map(|d| d.location.line).collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.location.line == 3 && d.message.contains("Style/SymbolProc")),
+        "expected the reopened cop at line 3, got: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("Layout/LineLength")),
+        "LineLength suppresses a real offense: {diagnostics:?}"
+    );
+    assert!(!lines.contains(&5), "enable directives are a different cop");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reenabled_cop_can_be_disabled_again() {
+    // Control: an `enable` closes the first range, so the second `disable` is
+    // a fresh range and is only judged on whether it suppressed anything.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = \"{long}\"\n# rubocop:enable Layout/LineLength\nw = 1\n# rubocop:disable Layout/LineLength\nz = \"{long}\"\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_reenabled", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn inline_disable_inside_open_range_is_not_already_disabled() {
+    // An inline directive produces a single-line range that does not start
+    // where the open block range ends, so RuboCop's `followed_ranges?` is
+    // false and the usual offense check applies — here it suppresses a real
+    // offense, so nothing is reported.
+    let long = "x".repeat(150);
+    let body = format!(
+        "# rubocop:disable Layout/LineLength\ny = 1\nz = \"{long}\" # rubocop:disable Layout/LineLength\n# rubocop:enable Layout/LineLength\n"
+    );
+    let (dir, diagnostics) = redundant_directives("redundant_disable_inline_inside", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}

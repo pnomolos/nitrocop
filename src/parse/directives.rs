@@ -90,6 +90,15 @@ pub struct DisableDirective {
     pub range: (usize, usize),
     /// Whether this directive actually suppressed at least one diagnostic.
     pub used: bool,
+    /// Whether this directive re-opens a range that was already open for the
+    /// same cop (no intervening `# rubocop:enable`).
+    ///
+    /// Mirrors `RedundantCopDisableDirective#each_already_disabled`, which
+    /// walks consecutive disabled line ranges and flags the second whenever
+    /// `previous_range.end == range.begin`. Such a directive is redundant
+    /// "whether there are offenses or not", so it bypasses the usual
+    /// did-it-suppress-anything test.
+    pub already_disabled: bool,
 }
 
 impl DisableDirective {
@@ -354,12 +363,18 @@ impl DisabledRanges {
                                 is_inline: true,
                                 range,
                                 used: false,
+                                // An inline directive is a single-line range
+                                // that never starts where the enclosing block
+                                // range ends, so RuboCop's `followed_ranges?`
+                                // is false for it.
+                                already_disabled: false,
                             });
                         } else {
                             // Close any existing open disable for the same cop
                             // before opening a new one. This handles duplicate
                             // `# rubocop:disable Cop` without an intervening
                             // `# rubocop:enable Cop`.
+                            let mut already_disabled = false;
                             if let Some((prev_start, _prev_col, prev_idx)) =
                                 open_disables.remove(key)
                             {
@@ -368,6 +383,10 @@ impl DisabledRanges {
                                 if prev_idx < directives.len() {
                                     directives[prev_idx].range = range;
                                 }
+                                // The previous range ends on this line and the
+                                // new one begins on it, which is exactly
+                                // RuboCop's `followed_ranges?` condition.
+                                already_disabled = true;
                             }
                             let directive_idx = directives.len();
                             directives.push(DisableDirective {
@@ -378,6 +397,7 @@ impl DisabledRanges {
                                 is_inline: false,
                                 range: (line, usize::MAX), // placeholder, updated on enable/EOF
                                 used: false,
+                                already_disabled,
                             });
                             open_disables.insert(key.to_string(), (line, col, directive_idx));
                         }
@@ -557,6 +577,15 @@ impl DisabledRanges {
     /// Return all unused disable directives (those that didn't suppress any diagnostic).
     pub fn unused_directives(&self) -> impl Iterator<Item = &DisableDirective> {
         self.directives.iter().filter(|d| !d.used)
+    }
+
+    /// Directives that `Lint/RedundantCopDisableDirective` has to consider:
+    /// the unused ones, plus re-opened ranges, which are redundant even when
+    /// they suppressed something.
+    pub fn redundancy_candidates(&self) -> impl Iterator<Item = &DisableDirective> {
+        self.directives
+            .iter()
+            .filter(|d| !d.used || d.already_disabled)
     }
 
     pub fn is_empty(&self) -> bool {
