@@ -36,7 +36,9 @@ impl Cop for CollectionLiteralLength {
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
-        let max = config.get_usize("LengthThreshold", 250);
+        // Renamed LengthThreshold -> Max in rubocop 1.9x (config/obsoletion.yml warns
+        // on the old name but does not translate its value; matches real RuboCop).
+        let max = config.get_usize("Max", 250);
 
         // Check ArrayNode
         if let Some(array) = node.as_array_node() {

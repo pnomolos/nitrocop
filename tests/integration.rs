@@ -2630,6 +2630,10 @@ fn config_audit() {
         "DocumentationBaseURL",
         "inherit_mode",
         "Severity",
+        // Rubocop 1.85+: preview of the option's value in the NEXT major release,
+        // opt-in only via `AllCops: Preview: true` (or per-cop). Doesn't change
+        // default output today, so it isn't a config option cops need to read.
+        "Preview",
     ]
     .into_iter()
     .collect();

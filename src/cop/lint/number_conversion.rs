@@ -223,9 +223,11 @@ impl NumberConversion {
             }
         }
 
-        // Skip ignored classes - check the receiver and walk one level deeper
+        // Skip ignored classes - check the receiver and walk one level deeper.
+        // Renamed IgnoredClasses -> AllowedClasses in rubocop 1.9x (config/obsoletion.yml
+        // warns on the old name but does not translate its value; matches real RuboCop).
         let ignored_classes = config
-            .get_string_array("IgnoredClasses")
+            .get_string_array("AllowedClasses")
             .unwrap_or_else(|| vec!["Time".to_string(), "DateTime".to_string()]);
         if is_ignored_class(receiver, &ignored_classes) {
             return;

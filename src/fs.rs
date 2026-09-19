@@ -135,15 +135,16 @@ fn tracked_ruby_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// RuboCop-compatible Ruby file extensions (from AllCops.Include defaults).
+///
+/// rubocop 1.91.0 dropped `fcgi`, `god`, `rbuild`, `rbx`, and `watchr` from its
+/// `AllCops.Include` defaults (obsolete build-tool extensions); kept in sync here.
 const RUBY_EXTENSIONS: &[&str] = &[
     "rb",
     "arb",
     "axlsx",
     "builder",
-    "fcgi",
     "gemfile",
     "gemspec",
-    "god",
     "jb",
     "jbuilder",
     "mspec",
@@ -152,18 +153,18 @@ const RUBY_EXTENSIONS: &[&str] = &[
     "podspec",
     "rabl",
     "rake",
-    "rbuild",
     "rbw",
-    "rbx",
     "ru",
     "ruby",
     "schema",
     "spec",
     "thor",
-    "watchr",
 ];
 
 /// Extensionless filenames that RuboCop treats as Ruby (from AllCops.Include defaults).
+///
+/// rubocop 1.91.0 dropped `Cheffile` and fixed a long-standing typo: the old default
+/// had both `Vagabondfile` (typo) and `Vagrantfile`; only `Vagrantfile` remains.
 const RUBY_FILENAMES: &[&str] = &[
     ".irbrc",
     ".pryrc",
@@ -174,7 +175,6 @@ const RUBY_FILENAMES: &[&str] = &[
     "Brewfile",
     "Buildfile",
     "Capfile",
-    "Cheffile",
     "Dangerfile",
     "Deliverfile",
     "Fastfile",
@@ -190,7 +190,6 @@ const RUBY_FILENAMES: &[&str] = &[
     "Snapfile",
     "Steepfile",
     "Thorfile",
-    "Vagabondfile",
     "Vagrantfile",
 ];
 
