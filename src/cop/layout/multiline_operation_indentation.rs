@@ -1,145 +1,186 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use ruby_prism::Visit;
 
-use crate::cop::shared::method_identifier_predicates;
-use crate::cop::shared::node_type::{AND_NODE, CALL_NODE, OR_NODE};
-use crate::cop::shared::util::{
-    begins_its_line, indentation_of, is_modifier_if, is_modifier_unless,
-};
+use crate::cop::shared::method_identifier_predicates::is_setter_method;
+use crate::cop::shared::util::{begins_its_line, is_modifier_if, is_modifier_unless, is_ternary};
 use crate::cop::{Cop, CopConfig};
 use crate::diagnostic::Diagnostic;
 use crate::parse::source::SourceFile;
 
-/// Checks indentation of multiline binary operations.
+/// Checks the indentation of the right hand side operand in binary operations
+/// that span more than one line.
 ///
-/// Key fix (2026-04-01): removed blanket skip for nested boolean chains
-/// (And/Or as left operand) which was the root cause of ~39k FN.  Added
-/// RuboCop-compatible `begins_its_line?` guard that skips leading-operator
-/// patterns like `expr \n  && other_expr`, fixing the confirmed FP class.
-/// Tightened the `is_ok` check for And/Or nodes: in non-keyword contexts
-/// only `left_indent + width` is accepted (not `left_col`); in keyword
-/// conditions with aligned style, alignment with `left_col` or double-width
-/// `kw_expected` are accepted.
+/// ## Corpus fix (2026-09-19) — faithful port pass
 ///
-/// Key fix (2026-04-04): CallNode (`+`, `-`, etc.) now delegates to
-/// `check_binary_node` with `accept_left_alignment=true`. This adds
-/// assignment/keyword context awareness (fixing FN where RuboCop requires
-/// alignment but old code accepted wrong indentation), while accepting
-/// same-column alignment as a fallback for operator calls. The fallback
-/// is needed because RuboCop's `argument_in_method_call` (which requires
-/// AST parent traversal) accepts alignment in method-arg and nested-if
-/// contexts that we cannot detect from Prism without parent pointers.
+/// Starting point (fresh-fork oracle): default `aligned` 19 FP / 39 FN over
+/// 47,080 matches; `EnforcedStyle: indented` 7 FP / 14 FN over 8,663 matches.
 ///
-/// Key fix (2026-04-16): the operator-call fallback above only matches
-/// RuboCop's `aligned` style. Under `EnforcedStyle=indented`, RuboCop
-/// requires `left_indent + width` for ordinary multiline operator calls,
-/// so same-column chains like the bottles examples must be offenses.
+/// This cop shares RuboCop's `MultilineExpressionIndentation` mixin with
+/// `Layout/MultilineMethodCallIndentation`, and — like that cop before its own
+/// port pass — everything here had accumulated as text heuristics standing in
+/// for mixin code that translates directly once the Prism/parser-gem node shape
+/// differences are spelled out. The cop is now a line-by-line port of
+/// `vendor/rubocop/lib/rubocop/cop/layout/multiline_operation_indentation.rb`
+/// plus `lib/rubocop/cop/mixin/multiline_expression_indentation.rb`.
 ///
-/// Key fix (2026-04-16): under `EnforcedStyle=indented`, RuboCop still
-/// accepts same-column continuations when the assignment RHS starts on the
-/// next line via a trailing `\` on the assignment line, and it still applies
-/// keyword-condition indentation to nested operator calls under `if`/`while`
-/// continuations (for example `if lhs &&\n     rhs >=\n       value`).
-/// We mirror both quirks here and include `===`, `=~`, and `!~` in the
-/// operator-method set so regex/case-equality conditions are checked too.
+/// The whole algorithm fits in a paragraph:
 ///
-/// Key fix (2026-04-17): aligned style was still treating every multiline
-/// operator call like RuboCop's `argument_in_method_call`, which hid plain
-/// same-column chains in method bodies (`"a" +\n"b"`) and bottle-style string
-/// concatenations. We now cache a small ancestor-derived context per file and
-/// keep the same-column fallback only when the operator call is genuinely
-/// nested inside a method argument, so `raise Error,\n"..." +` stays accepted
-/// while ordinary method-body chains become offenses again.
+/// ```text
+/// offending_range(node, lhs, rhs, style):
+///   return false unless begins_its_line?(rhs)
+///   return false if not_for_this_cop?(node)
+///   correct_column = should_align?(node, rhs, style)
+///                      ? node.loc.column
+///                      : indentation(lhs) + correct_indentation(node)
+///   rhs unless correct_column == rhs.column
+/// ```
 ///
-/// Key fix (2026-04-20): that cached method-argument context was still too
-/// permissive in aligned style because operator calls whose left operand started
-/// after earlier method arguments (for example `puts a, 1 +\n  2` or
-/// `UI.warn "..." +\n  rhs`) fell through the generic `left_col > left_indent`
-/// branch and accepted normal `+2` indentation. RuboCop aligns actual method
-/// arguments in this situation, so the method-argument branch now wins first
-/// and only accepts `right_col == left_col`.
+/// Findings that drove the divergence, in rough order of corpus weight:
 ///
-/// Key fix (2026-04-25): boolean operators inside method-call arguments use
-/// RuboCop's same argument-alignment rule as operator method calls, while
-/// assignment context is now derived from AST ancestors instead of only from a
-/// same-line `=`. This catches RSpec keyword-argument conditions and case-branch
-/// concatenations assigned to a variable, and removes the broad left-column
-/// fallback that hid over-indented block-body boolean chains.
+/// * **`indentation(node)` is `source_line =~ /\S/`, which counts tabs.**
+///   `shared::util::indentation_of` counts spaces only, so every continuation
+///   line in a tab-indented file was measured against column 0. This is the
+///   whole metasm / mamiya / txt2html FN cluster (25 of the 39 default FNs):
+///   those files indent with hard tabs, so RuboCop's expected column was
+///   `1 (tab) + 2` while nitrocop computed `0 + 2` and then accepted the actual
+///   column. Same root cause as the sibling cop's cluster 2.
+/// * **`left_hand_side` is the identity for this cop.** It climbs
+///   `while lhs.parent&.call_type? && lhs.parent.loc.dot`, and the parent of
+///   `node.receiver` is always `node` itself, which by `relevant_node?` has no
+///   dot. So `lhs` is literally `node.receiver` (sends) or `node.lhs`
+///   (`and`/`or`), and `indentation(lhs)` is the indentation of the line that
+///   operand starts on — no walking up visually continued lines, no
+///   "previous continuation anchor", in any `EnforcedStyle`.
+/// * **`should_align?` has no "method argument" *fallback*; it has an
+///   `argument_in_method_call` *rule*, and it is the last one.** The old code
+///   ordered it first and then only accepted `right_col == left_col`, which
+///   both over- and under-fired. Ported order: assignment-RHS-begins-its-line
+///   (in every style) → style must be `aligned` → keyword ancestor or
+///   assignment ancestor → `argument_in_method_call` that is not a
+///   `def` modifier.
+/// * **`postfix_conditional?` is `node.if_type? && node.modifier_form?`.**
+///   Modifier `while`/`until` are *not* postfix for this purpose, so
+///   `foo while a &&\n  b` still gets the doubled `IndentationWidth`.
+/// * **`UNALIGNED_RHS_TYPES` is `if while until for return array kwbegin`** —
+///   `case` / `case ... in` are deliberately absent, so an assigned `case`
+///   pulls its assignment base into the `when` branches. `kwbegin` is only a
+///   real `begin ... end`: Prism also produces a `BeginNode` for a `def` or
+///   block body that carries `rescue`/`ensure`, where the parser gem has no
+///   wrapper node at all, so the port must require `begin_keyword_loc`.
+/// * **`not_for_this_cop?`**: `grouped_expression?` is any `begin` node with a
+///   `begin` location — Prism's `ParenthesesNode` *and* `EmbeddedStatementsNode`
+///   (`#{ ... }`). `inside_arg_list_parentheses?` is `ancestor.send_type? &&
+///   ancestor.parenthesized?`, i.e. a real `(` argument list only, never
+///   `[...]`; Prism reports `opening_loc` for index calls too, so the delimiter
+///   byte has to be checked. This replaces the source-scanning paren finder
+///   that `EnforcedStyle: indented` still used, which counted parentheses
+///   inside comments and string literals (the treetop and sup FPs).
+/// * **`kw_node_with_special_indentation` skips ternaries** and matches only
+///   when the node is inside `indented_keyword_expression(ancestor)` — the
+///   condition for `if`/`unless`/`while`/`until`, the collection for `for`, the
+///   arguments for `return`. It is an AST ancestor walk; the old lexical
+///   "does the line start with `if `" scan produced the `elsif` / modifier
+///   confusion behind the jenkins_api_client and mongoid_denormalize FNs.
+/// * **`argument_in_method_call` breaks at the first `block` ancestor.** In
+///   Prism a call carrying a block is one `CallNode` with a `BlockNode` child,
+///   so the `BlockNode` is still reached first from inside the body and the
+///   break is equivalent — but `numblock` / `itblock` are *separate parser
+///   types* that `each_ancestor(:send, :block)` does not match, so a Prism
+///   `BlockNode` whose parameters are `NumberedParametersNode` /
+///   `ItParametersNode` must not break the walk (the same applies to
+///   `disqualified_rhs?`'s `block_type?` test).
+/// * **Messages**: `used_indentation` is `rhs.column - indentation(lhs)` and
+///   may be negative; `correct_indentation(node)` is the bare number (`Width`,
+///   or `Width + Layout/IndentationWidth Width` for prefix keywords), not an
+///   absolute column. `keyword_message_tail` uses `node.loc.keyword.source`, so
+///   an `elsif` reports as `` `elsif` ``, and `return` reports as "a condition
+///   in a `return` statement" (RuboCop only special-cases `for`).
 ///
-/// Key fix (2026-04-27): the default aligned-style `not_for_this_cop?` path is
-/// now based on Prism ancestors instead of scanning raw source for any unmatched
-/// parenthesis. The source scan skipped valid full-file offenses when an
-/// unrelated comment or earlier method signature contained `(`, while AST-based
-/// `ParenthesesNode` and parenthesized call-argument checks still preserve
-/// RuboCop's grouped-expression exclusions. `EnforcedStyle=indented` keeps the
-/// historical source-scan guard to avoid broad variant corpus churn. The same
-/// pass also stops treating hash rockets (`=>`) as assignment operators, so
-/// direct method-return hash values use ordinary continuation indentation
-/// instead of assignment alignment.
+/// ### Removed as redundant
+///
+/// `is_inside_parentheses_by_source_scan`, `keyword_context_on_line`,
+/// `modifier_keyword`, `line_ends_with_assignment_operator`,
+/// `has_assignment_before_col`, `line_ends_with_logical_operator`, the
+/// `OPERATOR_METHODS` allow-list and the `OperatorContext` thread-local cache
+/// they fed have no RuboCop counterpart and are subsumed by the ported ancestor
+/// walks. The operator allow-list in particular was wrong in both directions:
+/// RuboCop's filter is "a send with a receiver, no dot, and a first argument",
+/// which also covers `[]=` and any user-defined operator. Do not reintroduce
+/// them without corpus evidence.
 pub struct MultilineOperationIndentation;
 
-const OPERATOR_METHODS: &[&[u8]] = &[
-    b"+", b"-", b"*", b"/", b"%", b"**", b"==", b"===", b"!=", b"=~", b"!~", b"<", b">", b"<=",
-    b">=", b"<=>", b"&", b"|", b"^", b"<<", b">>",
-];
+/// `correct_indentation` adds `Layout/IndentationWidth`'s `Width` on top of
+/// this cop's own `IndentationWidth` for prefix keywords. nitrocop cops do not
+/// see other cops' configuration; the corpus baseline and RuboCop's own default
+/// both use 2. Same constant as the sibling cop uses for the same reason.
+const LAYOUT_INDENTATION_WIDTH: usize = 2;
 
-#[derive(Clone, Copy, Default)]
-struct OperatorContext {
-    /// The operator is a method-call argument (no block in between). Used as a
-    /// fallback to accept same-column alignment in aligned style.
-    method_argument: bool,
-    /// AST-detected keyword ancestor where the operator sits inside the
-    /// keyword's indented expression (predicate/return value/for collection).
-    /// Walks across blocks like RuboCop's `kw_node_with_special_indentation`.
-    keyword: Option<KeywordCtx>,
-    /// True when an enclosing block body sits between the operator and any
-    /// outer assignment ancestor — disqualifies lexical assignment-context
-    /// detection (mirrors RuboCop's `disqualified_rhs?` block-body rule and
-    /// the UNALIGNED_RHS_TYPES list).
-    block_disqualifies_assignment: bool,
-    /// Start offset of the AST-detected assignment RHS containing the operator.
-    /// Used to mirror RuboCop's `part_of_assignment_rhs` without parent links
-    /// during the actual node check.
-    assignment_rhs_start: Option<usize>,
-    /// Mirrors RuboCop's `not_for_this_cop?`: operators inside grouped
-    /// expressions or parenthesized method argument lists are excluded.
-    not_for_this_cop: bool,
+impl Cop for MultilineOperationIndentation {
+    fn name(&self) -> &'static str {
+        "Layout/MultilineOperationIndentation"
+    }
+
+    fn check_source(
+        &self,
+        source: &SourceFile,
+        parse_result: &ruby_prism::ParseResult<'_>,
+        _code_map: &crate::parse::codemap::CodeMap,
+        config: &CopConfig,
+        diagnostics: &mut Vec<Diagnostic>,
+        _corrections: Option<&mut Vec<crate::correction::Correction>>,
+    ) {
+        let mut visitor = OperationVisitor {
+            cop: self,
+            source,
+            aligned_style: config.get_str("EnforcedStyle", "aligned") == "aligned",
+            width: config.get_usize("IndentationWidth", LAYOUT_INDENTATION_WIDTH),
+            diagnostics: Vec::new(),
+            ancestors: Vec::new(),
+        };
+        visitor.visit(&parse_result.node());
+        diagnostics.extend(visitor.diagnostics);
+    }
 }
 
+struct OperationVisitor<'a, 'pr> {
+    cop: &'a MultilineOperationIndentation,
+    source: &'a SourceFile,
+    aligned_style: bool,
+    width: usize,
+    diagnostics: Vec<Diagnostic>,
+    ancestors: Vec<ruby_prism::Node<'pr>>,
+}
+
+/// A byte range, standing in for a parser `Source::Range`.
 #[derive(Clone, Copy)]
-struct KeywordCtx {
-    keyword: &'static str,
-    /// True for postfix conditionals (`expr if cond`); RuboCop uses
-    /// `width` (not `2 * width`) in that case.
-    postfix: bool,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct OpKey {
+struct Span {
     start: usize,
     end: usize,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct CacheKey {
-    parse_result_ptr: usize,
-    source_ptr: usize,
-    source_len: usize,
+impl Span {
+    fn of(node: &ruby_prism::Node<'_>) -> Self {
+        let loc = node.location();
+        Span {
+            start: loc.start_offset(),
+            end: loc.end_offset(),
+        }
+    }
+
+    /// RuboCop's `within_node?(inner, outer)`, as `outer.contains(inner)`.
+    fn contains(&self, inner: Span) -> bool {
+        inner.start >= self.start && inner.end <= self.end
+    }
 }
 
-thread_local! {
-    static OPERATOR_CONTEXT_CACHE: RefCell<Option<(CacheKey, HashMap<OpKey, OperatorContext>)>> =
-        const { RefCell::new(None) };
+/// The keyword ancestor found by `kw_node_with_special_indentation`.
+struct KeywordNode {
+    keyword: String,
+    /// `postfix_conditional?`: `node.if_type? && node.modifier_form?`. Note
+    /// that modifier `while` / `until` are *not* postfix conditionals.
+    postfix: bool,
 }
 
-struct OperatorContextVisitor<'pr> {
-    ancestors: Vec<ruby_prism::Node<'pr>>,
-    contexts: HashMap<OpKey, OperatorContext>,
-}
-
-impl<'pr> Visit<'pr> for OperatorContextVisitor<'pr> {
+impl<'pr> Visit<'pr> for OperationVisitor<'_, 'pr> {
     fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.ancestors.push(node);
     }
@@ -151,856 +192,512 @@ impl<'pr> Visit<'pr> for OperatorContextVisitor<'pr> {
     fn visit_leaf_node_enter(&mut self, _node: ruby_prism::Node<'pr>) {}
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-        if OPERATOR_METHODS.contains(&node.name().as_slice()) {
-            let current = node.as_node();
-            self.contexts
-                .insert(op_key(&current), build_context(&self.ancestors, &current));
-        }
-
+        self.check_send(node);
         ruby_prism::visit_call_node(self, node);
     }
 
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        // `on_and` → `check_and_or`: the LHS is used verbatim, not run through
+        // `left_hand_side`.
         let current = node.as_node();
-        self.contexts
-            .insert(op_key(&current), build_context(&self.ancestors, &current));
+        self.check(&current, &node.left(), Span::of(&node.right()));
         ruby_prism::visit_and_node(self, node);
     }
 
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         let current = node.as_node();
-        self.contexts
-            .insert(op_key(&current), build_context(&self.ancestors, &current));
+        self.check(&current, &node.left(), Span::of(&node.right()));
         ruby_prism::visit_or_node(self, node);
     }
 }
 
-fn op_key(node: &ruby_prism::Node<'_>) -> OpKey {
-    let loc = node.location();
-    OpKey {
-        start: loc.start_offset(),
-        end: loc.end_offset(),
+impl OperationVisitor<'_, '_> {
+    /// `MultilineExpressionIndentation#on_send` plus this cop's
+    /// `relevant_node?` and `right_hand_side`.
+    fn check_send(&mut self, node: &ruby_prism::CallNode<'_>) {
+        // `return if !node.receiver || node.method?(:[])`
+        let Some(receiver) = node.receiver() else {
+            return;
+        };
+        if node.name().as_slice() == b"[]" {
+            return;
+        }
+        // `relevant_node?`: `!node.loc.dot`. Unary operations are excluded
+        // explicitly there, but they carry no argument so the
+        // `right_hand_side` guard below already covers them.
+        if node.call_operator_loc().is_some() {
+            return;
+        }
+        // `Builders::Default#match_op` emits `match_with_lvasgn`, not `send`,
+        // whenever the left operand is a *static* regexp literal — the captured
+        // names are declared as local variables, and an empty name list is
+        // still truthy in Ruby, so this covers every non-interpolated regexp,
+        // not just the ones with named captures. `on_send` never sees those,
+        // while Prism keeps a plain `CallNode` unless there are named captures
+        // (when it wraps it in a `MatchWriteNode`).
+        if node.name().as_slice() == b"=~" && receiver.as_regular_expression_node().is_some() {
+            return;
+        }
+        // `right_hand_side(send_node)` is `send_node.first_argument`.
+        let Some(first_argument) = parser_arguments(node).into_iter().next() else {
+            return;
+        };
+
+        let current = node.as_node();
+        // `left_hand_side(node.receiver)` climbs
+        // `while lhs.parent&.call_type? && lhs.parent.loc.dot` — the parent of
+        // `node.receiver` is `node`, which has no dot, so the loop never runs.
+        self.check(&current, &receiver, Span::of(&first_argument));
+    }
+
+    /// `offending_range` + `check` + `message`.
+    fn check(&mut self, node: &ruby_prism::Node<'_>, lhs: &ruby_prism::Node<'_>, rhs: Span) {
+        if !begins_its_line(self.source, rhs.start) {
+            return;
+        }
+        if self.not_for_this_cop(node) {
+            return;
+        }
+
+        let (rhs_line, rhs_col) = self.source.offset_to_line_col(rhs.start);
+        let lhs_indent = self.indentation(lhs);
+        let should_align = self.should_align(node, rhs);
+        let correct_indentation = self.correct_indentation(node);
+        let correct_column = if should_align {
+            self.source
+                .offset_to_line_col(node.location().start_offset())
+                .1
+        } else {
+            lhs_indent + correct_indentation
+        };
+        if correct_column == rhs_col {
+            return;
+        }
+
+        let what = self.operation_description(node, rhs);
+        let message = if should_align {
+            format!("Align the operands of {what} spanning multiple lines.")
+        } else {
+            let used = rhs_col as isize - lhs_indent as isize;
+            format!(
+                "Use {correct_indentation} (not {used}) spaces for indenting {what} spanning multiple lines."
+            )
+        };
+        self.diagnostics
+            .push(self.cop.diagnostic(self.source, rhs_line, rhs_col, message));
+    }
+
+    /// `Alignment#indentation(node)` → `node.source_range.source_line =~ /\S/`.
+    /// Tabs count as one character, exactly like a parser-gem column.
+    fn indentation(&self, node: &ruby_prism::Node<'_>) -> usize {
+        let (line, _) = self
+            .source
+            .offset_to_line_col(node.location().start_offset());
+        let bytes = self.source.lines().nth(line - 1).unwrap_or(b"");
+        bytes
+            .iter()
+            .position(|&b| b != b' ' && b != b'\t')
+            .unwrap_or(0)
+    }
+
+    /// `MultilineExpressionIndentation#correct_indentation`.
+    fn correct_indentation(&self, node: &ruby_prism::Node<'_>) -> usize {
+        match self.kw_node_with_special_indentation(node) {
+            Some(kw) if !kw.postfix => self.width + LAYOUT_INDENTATION_WIDTH,
+            _ => self.width,
+        }
+    }
+
+    /// `MultilineOperationIndentation#should_align?`.
+    fn should_align(&self, node: &ruby_prism::Node<'_>, rhs: Span) -> bool {
+        let assignment_node = self.part_of_assignment_rhs(rhs);
+        if let Some(assignment) = &assignment_node {
+            // `CheckAssignment.extract_rhs`.
+            if let Some(assignment_rhs) = extract_rhs(assignment) {
+                if begins_its_line(self.source, assignment_rhs.start) {
+                    return true;
+                }
+            }
+        }
+
+        if !self.aligned_style {
+            return false;
+        }
+        if assignment_node.is_some() || self.kw_node_with_special_indentation(node).is_some() {
+            return true;
+        }
+
+        // `argument_in_method_call(node, :with_or_without_parentheses)` followed
+        // by `node.respond_to?(:def_modifier?) && !node.def_modifier?` — `nil`
+        // and the `false` produced by the `block` break both answer `false`.
+        self.argument_in_method_call(node)
+            .is_some_and(|call| !is_def_modifier(&call))
+    }
+
+    /// `MultilineExpressionIndentation#operation_description`.
+    fn operation_description(&self, node: &ruby_prism::Node<'_>, rhs: Span) -> String {
+        if let Some(kw) = self.kw_node_with_special_indentation(node) {
+            // `keyword_message_tail`.
+            let kind = if kw.keyword == "for" {
+                "collection"
+            } else {
+                "condition"
+            };
+            let article = if kw.keyword.starts_with('i') || kw.keyword.starts_with('u') {
+                "an"
+            } else {
+                "a"
+            };
+            return format!("a {kind} in {article} `{}` statement", kw.keyword);
+        }
+        if self.part_of_assignment_rhs(rhs).is_some() {
+            return "an expression in an assignment".to_string();
+        }
+        "an expression".to_string()
+    }
+
+    /// `MultilineExpressionIndentation#not_for_this_cop?`.
+    fn not_for_this_cop(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let span = Span::of(node);
+        self.ancestors.iter().rev().skip(1).any(|ancestor| {
+            is_grouped_expression(ancestor) || self.inside_arg_list_parentheses(span, ancestor)
+        })
+    }
+
+    /// `inside_arg_list_parentheses?`: `ancestor.send_type? &&
+    /// ancestor.parenthesized?`, and strictly inside the parentheses.
+    ///
+    /// Prism reports `opening_loc` / `closing_loc` for `foo[bar]` and
+    /// `foo[bar] = baz` as well, so the delimiter byte has to be checked —
+    /// `SendNode#parenthesized?` is `loc.begin&.is?('(')`.
+    fn inside_arg_list_parentheses(&self, span: Span, ancestor: &ruby_prism::Node<'_>) -> bool {
+        let Some(call) = ancestor.as_call_node() else {
+            return false;
+        };
+        let (Some(opening), Some(closing)) = (call.opening_loc(), call.closing_loc()) else {
+            return false;
+        };
+        if self.source.as_bytes().get(opening.start_offset()) != Some(&b'(') {
+            return false;
+        }
+        span.start > opening.start_offset() && span.end < closing.end_offset()
+    }
+
+    /// `MultilineExpressionIndentation#kw_node_with_special_indentation`.
+    fn kw_node_with_special_indentation(&self, node: &ruby_prism::Node<'_>) -> Option<KeywordNode> {
+        let span = Span::of(node);
+        for ancestor in self.ancestors.iter().rev().skip(1) {
+            if let Some(if_node) = ancestor.as_if_node() {
+                if is_ternary(&if_node) {
+                    continue;
+                }
+                if Span::of(&if_node.predicate()).contains(span) {
+                    return Some(KeywordNode {
+                        keyword: self.keyword_source(if_node.if_keyword_loc()),
+                        postfix: is_modifier_if(&if_node),
+                    });
+                }
+            } else if let Some(unless_node) = ancestor.as_unless_node() {
+                if Span::of(&unless_node.predicate()).contains(span) {
+                    return Some(KeywordNode {
+                        keyword: "unless".to_string(),
+                        postfix: is_modifier_unless(&unless_node),
+                    });
+                }
+            } else if let Some(while_node) = ancestor.as_while_node() {
+                if Span::of(&while_node.predicate()).contains(span) {
+                    return Some(KeywordNode {
+                        keyword: "while".to_string(),
+                        postfix: false,
+                    });
+                }
+            } else if let Some(until_node) = ancestor.as_until_node() {
+                if Span::of(&until_node.predicate()).contains(span) {
+                    return Some(KeywordNode {
+                        keyword: "until".to_string(),
+                        postfix: false,
+                    });
+                }
+            } else if let Some(for_node) = ancestor.as_for_node() {
+                if Span::of(&for_node.collection()).contains(span) {
+                    return Some(KeywordNode {
+                        keyword: "for".to_string(),
+                        postfix: false,
+                    });
+                }
+            } else if let Some(return_node) = ancestor.as_return_node() {
+                // `indented_keyword_expression` is `node.children.first`, which
+                // for a `return` is the single value, or the implicit `array`
+                // of values — both have the span of Prism's `ArgumentsNode`.
+                if let Some(arguments) = return_node.arguments() {
+                    if Span::of(&arguments.as_node()).contains(span) {
+                        return Some(KeywordNode {
+                            keyword: "return".to_string(),
+                            postfix: false,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn keyword_source(&self, loc: Option<ruby_prism::Location<'_>>) -> String {
+        loc.map(|l| {
+            String::from_utf8_lossy(&self.source.as_bytes()[l.start_offset()..l.end_offset()])
+                .into_owned()
+        })
+        .unwrap_or_else(|| "if".to_string())
+    }
+
+    /// `MultilineExpressionIndentation#part_of_assignment_rhs`. Returns the
+    /// assignment-like ancestor, as a `(kind, span)` pair so the borrow of the
+    /// ancestor stack does not escape.
+    fn part_of_assignment_rhs(&self, candidate: Span) -> Option<AssignmentAncestor> {
+        for ancestor in self.ancestors.iter().rev().skip(1) {
+            if disqualified_rhs(candidate, ancestor) {
+                return None;
+            }
+            if let Some(found) = valid_rhs(candidate, ancestor) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// `MultilineExpressionIndentation#argument_in_method_call`, reduced to the
+    /// `:with_or_without_parentheses` kind this cop uses. Returns the span of
+    /// the enclosing call so the borrow does not escape.
+    fn argument_in_method_call(&self, node: &ruby_prism::Node<'_>) -> Option<MethodCallArgument> {
+        let span = Span::of(node);
+        for ancestor in self.ancestors.iter().rev().skip(1) {
+            if is_parser_block(ancestor) {
+                // `break false if a.block_type?`
+                return None;
+            }
+            let Some(call) = ancestor.as_call_node() else {
+                continue;
+            };
+            if is_setter_method(call.name().as_slice()) {
+                continue;
+            }
+            let contains = parser_arguments(&call)
+                .iter()
+                .any(|arg| Span::of(arg).contains(span));
+            if contains {
+                return Some(MethodCallArgument {
+                    receiverless: call.receiver().is_none(),
+                    first_argument_is_def: first_argument_chain_is_def(&call),
+                });
+            }
+        }
+        None
     }
 }
 
-fn node_within_node(inner: &ruby_prism::Node<'_>, outer: &ruby_prism::Node<'_>) -> bool {
-    let inner_loc = inner.location();
-    let outer_loc = outer.location();
-    inner_loc.start_offset() >= outer_loc.start_offset()
-        && inner_loc.end_offset() <= outer_loc.end_offset()
+/// What `part_of_assignment_rhs` needs to report back: enough to answer
+/// `CheckAssignment.extract_rhs` without keeping the node borrow alive.
+struct AssignmentAncestor {
+    /// Span of `extract_rhs(assignment_node)`, when there is one.
+    rhs: Option<Span>,
 }
 
-/// Returns true if `node` is one of RuboCop's `UNALIGNED_RHS_TYPES`
-/// (`if`, `while`, `until`, `for`, `return`, `array`, `kwbegin`).
+/// What `should_align?` needs from `argument_in_method_call`.
+struct MethodCallArgument {
+    receiverless: bool,
+    first_argument_is_def: bool,
+}
+
+fn extract_rhs(assignment: &AssignmentAncestor) -> Option<Span> {
+    assignment.rhs
+}
+
+/// `MethodDispatchNode#def_modifier?`: `private def foo; end`. The receiver
+/// must be absent and the first argument must be a `def`/`defs`, possibly
+/// through further modifier sends.
+fn is_def_modifier(call: &MethodCallArgument) -> bool {
+    call.receiverless && call.first_argument_is_def
+}
+
+/// `SendNode#arguments`. The parser gem keeps a block-pass argument (`&blk`) in
+/// the argument list, where Prism moves it out to `CallNode#block` as a
+/// `BlockArgumentNode`. `argument_in_method_call` checks `a.arguments.any?`, so
+/// `inputs.map &a >>\n  b` has to see the block-pass as an argument of `map`.
+fn parser_arguments<'pr>(call: &ruby_prism::CallNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut arguments: Vec<ruby_prism::Node<'pr>> = call
+        .arguments()
+        .map(|args| args.arguments().iter().collect())
+        .unwrap_or_default();
+    if let Some(block) = call.block() {
+        if block.as_block_argument_node().is_some() {
+            arguments.push(block);
+        }
+    }
+    arguments
+}
+
+fn first_argument_chain_is_def(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(arg) = parser_arguments(call).into_iter().next() else {
+        return false;
+    };
+    if arg.as_def_node().is_some() {
+        return true;
+    }
+    let Some(inner) = arg.as_call_node() else {
+        return false;
+    };
+    if inner.receiver().is_some() {
+        return false;
+    }
+    first_argument_chain_is_def(&inner)
+}
+
+/// `grouped_expression?`: a parser `begin` node that has a `begin` location.
+/// That is `( ... )` grouping and `#{ ... }` interpolation. A `begin ... end`
+/// block is a `kwbegin` node and does not qualify.
+fn is_grouped_expression(node: &ruby_prism::Node<'_>) -> bool {
+    node.as_parentheses_node().is_some() || node.as_embedded_statements_node().is_some()
+}
+
+/// `disqualified_rhs?`.
+fn disqualified_rhs(candidate: Span, ancestor: &ruby_prism::Node<'_>) -> bool {
+    if is_unaligned_rhs_type(ancestor) {
+        return true;
+    }
+    // `ancestor.block_type? && part_of_block_body?(candidate, ancestor)`
+    if let Some(body) = parser_block_body(ancestor) {
+        return Span::of(&body).contains(candidate);
+    }
+    false
+}
+
+/// `UNALIGNED_RHS_TYPES = %i[if while until for return array kwbegin]`.
+///
+/// `case` and `case ... in` are deliberately absent, so the assignment base of
+/// `x = case k ... when ... "a" +\n"b"` reaches the `when` branches.
 fn is_unaligned_rhs_type(node: &ruby_prism::Node<'_>) -> bool {
-    node.as_if_node().is_some()
+    if node.as_if_node().is_some()
         || node.as_unless_node().is_some()
         || node.as_while_node().is_some()
         || node.as_until_node().is_some()
         || node.as_for_node().is_some()
         || node.as_return_node().is_some()
         || node.as_array_node().is_some()
-        || node.as_begin_node().is_some()
+    {
+        return true;
+    }
+    // `kwbegin` is only a literal `begin ... end`. Prism also uses `BeginNode`
+    // for a `def` or block body carrying `rescue` / `ensure`, which the parser
+    // gem represents with no wrapper node at all.
+    node.as_begin_node()
+        .is_some_and(|begin_node| begin_node.begin_keyword_loc().is_some())
 }
 
-/// Returns true if `node` is a Prism block-like construct (regular block or
-/// lambda). Both are RuboCop `block_type?` for `disqualified_rhs?`.
-fn is_block_like(node: &ruby_prism::Node<'_>) -> bool {
-    node.as_block_node().is_some() || node.as_lambda_node().is_some()
-}
-
-/// True if the keyword ancestor's "indented expression" — predicate for
-/// `if`/`unless`/`while`/`until`, collection for `for`, value for `return` —
-/// contains `current`.
-fn within_indented_keyword_expression(
-    ancestor: &ruby_prism::Node<'_>,
-    current: &ruby_prism::Node<'_>,
-) -> Option<KeywordCtx> {
-    if let Some(if_node) = ancestor.as_if_node() {
-        // Skip ternaries — RuboCop excludes them (`ancestor.if_type? && ancestor.ternary?`).
-        // Prism encodes ternaries as IfNode but with `if_keyword_loc()` absent
-        // and `then_keyword_loc()` representing the `?`.
-        if_node.if_keyword_loc()?;
-        let predicate = if_node.predicate();
-        if node_within_node(current, &predicate) {
-            return Some(KeywordCtx {
-                keyword: "if",
-                postfix: is_modifier_if(&if_node),
-            });
+/// The body of a parser `block` node, or `None` when `node` is not one.
+///
+/// A parser `block` is Prism's `BlockNode` (`{ ... }` / `do ... end`) or
+/// `LambdaNode` (`-> { ... }`). Blocks using numbered parameters or `it` are
+/// `numblock` / `itblock` in the parser gem — separate types that neither
+/// `disqualified_rhs?` nor `argument_in_method_call` match.
+fn parser_block_body<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(block) = node.as_block_node() {
+        if has_implicit_block_parameters(&block.parameters()) {
+            return None;
         }
-        return None;
+        return block.body();
     }
-    if let Some(unless_node) = ancestor.as_unless_node() {
-        let predicate = unless_node.predicate();
-        if node_within_node(current, &predicate) {
-            return Some(KeywordCtx {
-                keyword: "unless",
-                postfix: is_modifier_unless(&unless_node),
-            });
-        }
-        return None;
-    }
-    if let Some(while_node) = ancestor.as_while_node() {
-        let predicate = while_node.predicate();
-        if node_within_node(current, &predicate) {
-            // While modifiers (`expr while cond`) get postfix indentation.
-            let postfix =
-                while_node.do_keyword_loc().is_none() && while_node.closing_loc().is_none();
-            return Some(KeywordCtx {
-                keyword: "while",
-                postfix,
-            });
-        }
-        return None;
-    }
-    if let Some(until_node) = ancestor.as_until_node() {
-        let predicate = until_node.predicate();
-        if node_within_node(current, &predicate) {
-            let postfix =
-                until_node.do_keyword_loc().is_none() && until_node.closing_loc().is_none();
-            return Some(KeywordCtx {
-                keyword: "until",
-                postfix,
-            });
-        }
-        return None;
-    }
-    if let Some(for_node) = ancestor.as_for_node() {
-        let collection = for_node.collection();
-        if node_within_node(current, &collection) {
-            return Some(KeywordCtx {
-                keyword: "for",
-                postfix: false,
-            });
-        }
-        return None;
-    }
-    if let Some(return_node) = ancestor.as_return_node() {
-        if let Some(args) = return_node.arguments() {
-            let args_node = args.as_node();
-            if node_within_node(current, &args_node) {
-                return Some(KeywordCtx {
-                    keyword: "return",
-                    postfix: false,
-                });
-            }
-        }
-        return None;
+    if let Some(lambda) = node.as_lambda_node() {
+        return lambda.body();
     }
     None
 }
 
-fn build_context(
-    ancestors: &[ruby_prism::Node<'_>],
-    current: &ruby_prism::Node<'_>,
-) -> OperatorContext {
-    let mut method_argument = false;
-    let mut method_argument_locked = false;
-    let mut keyword: Option<KeywordCtx> = None;
-    let mut block_disqualifies_assignment = false;
-    let mut assignment_rhs_start = None;
-    let mut assignment_resolved = false;
-    let mut not_for_this_cop = false;
-    let current_key = op_key(current);
-
-    for ancestor in ancestors.iter().rev() {
-        if op_key(ancestor) == current_key {
-            continue;
-        }
-
-        if !not_for_this_cop && ancestor_excludes_from_this_cop(ancestor, current) {
-            not_for_this_cop = true;
-        }
-
-        // method_argument: stop at first block-like or first matching call.
-        if !method_argument_locked {
-            if is_block_like(ancestor) {
-                method_argument_locked = true;
-            } else if let Some(call) = ancestor.as_call_node() {
-                if !method_identifier_predicates::is_setter_method(call.name().as_slice()) {
-                    let arg_context = call.arguments().and_then(|args| {
-                        args.arguments()
-                            .iter()
-                            .find(|arg| node_within_node(current, arg))
-                    });
-                    if let Some(arg) = arg_context {
-                        method_argument = arg.as_def_node().is_none();
-                        method_argument_locked = true;
-                    }
-                }
-            }
-        }
-
-        // assignment_rhs disqualification: walk ancestors until we hit an
-        // assignment (no disqualification) or a disqualifier (block body or
-        // UNALIGNED_RHS_TYPES). RuboCop's `part_of_assignment_rhs` with
-        // `disqualified_rhs?` and `valid_rhs?`.
-        if !assignment_resolved {
-            if is_block_like(ancestor) {
-                block_disqualifies_assignment = true;
-                assignment_resolved = true;
-            } else if is_unaligned_rhs_type(ancestor) {
-                // Unaligned RHS types break the assignment search before any
-                // outer assignment can be reached.
-                block_disqualifies_assignment = true;
-                assignment_resolved = true;
-            } else if let Some(rhs) = assignment_rhs_node(ancestor) {
-                if node_within_node(current, &rhs) {
-                    assignment_rhs_start = Some(rhs.location().start_offset());
-                    assignment_resolved = true;
-                }
-            }
-        }
-
-        // keyword_special_indentation: closest keyword ancestor where current
-        // is inside the indented expression. Walks across blocks.
-        if keyword.is_none() {
-            keyword = within_indented_keyword_expression(ancestor, current);
-        }
+fn is_parser_block(node: &ruby_prism::Node<'_>) -> bool {
+    if let Some(block) = node.as_block_node() {
+        return !has_implicit_block_parameters(&block.parameters());
     }
-
-    OperatorContext {
-        method_argument,
-        keyword,
-        block_disqualifies_assignment,
-        assignment_rhs_start,
-        not_for_this_cop,
-    }
+    node.as_lambda_node().is_some()
 }
 
-fn ancestor_excludes_from_this_cop(
-    ancestor: &ruby_prism::Node<'_>,
-    current: &ruby_prism::Node<'_>,
-) -> bool {
-    if ancestor.as_parentheses_node().is_some() {
-        return node_within_node(current, ancestor);
-    }
-
-    let Some(call) = ancestor.as_call_node() else {
-        return false;
-    };
-    let (Some(opening), Some(closing)) = (call.opening_loc(), call.closing_loc()) else {
-        return false;
-    };
-
-    let current_loc = current.location();
-    current_loc.start_offset() > opening.start_offset()
-        && current_loc.end_offset() < closing.end_offset()
-}
-
-/// Returns the RHS for assignment-like ancestors. Mirrors RuboCop's
-/// `assignment_rhs`: assignment nodes use their value/expression, while setter
-/// calls (`obj.foo = bar`) use the last argument.
-fn assignment_rhs_node<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
-    if let Some(n) = node.as_local_variable_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_local_variable_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_local_variable_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_local_variable_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_instance_variable_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_instance_variable_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_instance_variable_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_instance_variable_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_class_variable_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_class_variable_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_class_variable_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_class_variable_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_global_variable_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_global_variable_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_global_variable_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_global_variable_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_path_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_path_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_path_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_constant_path_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_index_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_index_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_index_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_call_operator_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_call_and_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_call_or_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_multi_write_node() {
-        return Some(n.value());
-    }
-    if let Some(n) = node.as_match_write_node() {
-        return Some(n.call().as_node());
-    }
-    if let Some(call) = node.as_call_node() {
-        if method_identifier_predicates::is_setter_method(call.name().as_slice()) {
-            return call.arguments().and_then(|args| args.arguments().last());
-        }
-    }
-    None
-}
-
-fn operator_context(
-    parse_result: &ruby_prism::ParseResult<'_>,
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-) -> OperatorContext {
-    let cache_key = CacheKey {
-        parse_result_ptr: parse_result as *const _ as usize,
-        source_ptr: source.as_bytes().as_ptr() as usize,
-        source_len: source.as_bytes().len(),
-    };
-
-    OPERATOR_CONTEXT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let needs_rebuild = !matches!(cache.as_ref(), Some((key, _)) if *key == cache_key);
-
-        if needs_rebuild {
-            let mut visitor = OperatorContextVisitor {
-                ancestors: Vec::new(),
-                contexts: HashMap::new(),
-            };
-            visitor.visit(&parse_result.node());
-            *cache = Some((cache_key, visitor.contexts));
-        }
-
-        cache
-            .as_ref()
-            .and_then(|(_, contexts)| contexts.get(&op_key(node)).copied())
-            .unwrap_or_default()
+fn has_implicit_block_parameters(parameters: &Option<ruby_prism::Node<'_>>) -> bool {
+    parameters.as_ref().is_some_and(|params| {
+        params.as_numbered_parameters_node().is_some() || params.as_it_parameters_node().is_some()
     })
 }
 
-impl Cop for MultilineOperationIndentation {
-    fn name(&self) -> &'static str {
-        "Layout/MultilineOperationIndentation"
-    }
-
-    fn interested_node_types(&self) -> &'static [u8] {
-        &[AND_NODE, CALL_NODE, OR_NODE]
-    }
-
-    fn check_node(
-        &self,
-        source: &SourceFile,
-        node: &ruby_prism::Node<'_>,
-        parse_result: &ruby_prism::ParseResult<'_>,
-        config: &CopConfig,
-        diagnostics: &mut Vec<Diagnostic>,
-        _corrections: Option<&mut Vec<crate::correction::Correction>>,
-    ) {
-        let style = config.get_str("EnforcedStyle", "aligned");
-
-        // Check CallNode with operator methods (binary operators are parsed as calls)
-        if let Some(call_node) = node.as_call_node() {
-            let method_name = call_node.name().as_slice();
-
-            if !OPERATOR_METHODS.contains(&method_name) {
-                return;
-            }
-
-            let ctx = operator_context(parse_result, source, node);
-            if excluded_from_this_cop(source, node, style, ctx) {
-                return;
-            }
-
-            let receiver = match call_node.receiver() {
-                Some(r) => r,
-                None => return,
-            };
-
-            let args_node = match call_node.arguments() {
-                Some(a) => a,
-                None => return,
-            };
-
-            let args: Vec<_> = args_node.arguments().iter().collect();
-            if args.is_empty() {
-                return;
-            }
-
-            let first_arg = &args[0];
-            diagnostics
-                .extend(self.check_binary_node(source, &receiver, first_arg, config, style, ctx));
-            return;
+/// `valid_rhs?`.
+fn valid_rhs(candidate: Span, ancestor: &ruby_prism::Node<'_>) -> Option<AssignmentAncestor> {
+    if let Some(call) = ancestor.as_call_node() {
+        // `valid_method_rhs_candidate?`: `node.setter_method? &&
+        // valid_rhs_candidate?(candidate, node.last_argument)`. For a setter
+        // call, `CheckAssignment.extract_rhs` is also `last_argument`.
+        if !is_setter_method(call.name().as_slice()) {
+            return None;
         }
-
-        // Check AndNode
-        if let Some(and_node) = node.as_and_node() {
-            let ctx = operator_context(parse_result, source, node);
-            if excluded_from_this_cop(source, node, style, ctx) {
-                return;
-            }
-            diagnostics.extend(self.check_binary_node(
-                source,
-                &and_node.left(),
-                &and_node.right(),
-                config,
-                style,
-                ctx,
-            ));
-            return;
-        }
-
-        // Check OrNode
-        if let Some(or_node) = node.as_or_node() {
-            let ctx = operator_context(parse_result, source, node);
-            if excluded_from_this_cop(source, node, style, ctx) {
-                return;
-            }
-            diagnostics.extend(self.check_binary_node(
-                source,
-                &or_node.left(),
-                &or_node.right(),
-                config,
-                style,
-                ctx,
-            ));
-        }
+        let last = parser_arguments(&call).pop()?;
+        let last_span = Span::of(&last);
+        return last_span.contains(candidate).then_some(AssignmentAncestor {
+            rhs: Some(last_span),
+        });
     }
+    let rhs = assignment_rhs(ancestor)?;
+    let rhs_span = Span::of(&rhs);
+    rhs_span.contains(candidate).then_some(AssignmentAncestor {
+        rhs: Some(rhs_span),
+    })
 }
 
-fn excluded_from_this_cop(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-    style: &str,
-    ctx: OperatorContext,
-) -> bool {
-    if style == "indented" {
-        return is_inside_parentheses_by_source_scan(source, node);
-    }
-
-    ctx.not_for_this_cop
-}
-
-/// Historical parenthesis guard used for `EnforcedStyle=indented` corpus
-/// compatibility. The default aligned style uses AST ancestors instead.
-fn is_inside_parentheses_by_source_scan(source: &SourceFile, node: &ruby_prism::Node<'_>) -> bool {
-    let bytes = source.as_bytes();
-    let node_start = node.location().start_offset();
-    let node_end = node.location().end_offset();
-
-    let mut depth = 0i32;
-    let mut pos = node_start;
-    while pos > 0 {
-        pos -= 1;
-        match bytes[pos] {
-            b')' => depth += 1,
-            b'(' => {
-                if depth > 0 {
-                    depth -= 1;
-                } else {
-                    let mut fwd_depth = 0i32;
-                    for &b in &bytes[node_end..] {
-                        match b {
-                            b'(' => fwd_depth += 1,
-                            b')' => {
-                                if fwd_depth > 0 {
-                                    fwd_depth -= 1;
-                                } else {
-                                    return true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return false;
+/// `assignment_rhs(node)` for parser `assignment?` nodes — every one of them is
+/// a Prism write node whose `value` is the right hand side, which is also what
+/// `CheckAssignment.extract_rhs`'s `node.expression` returns.
+///
+/// `ASSIGNMENTS = %i[lvasgn ivasgn cvasgn gvasgn casgn masgn op_asgn or_asgn
+/// and_asgn]`. Prism splits `op_asgn` / `or_asgn` / `and_asgn` per target kind,
+/// so the list below is that cross product.
+fn assignment_rhs<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    macro_rules! try_write {
+        ($($accessor:ident),* $(,)?) => {
+            $(
+                if let Some(write) = node.$accessor() {
+                    return Some(write.value());
                 }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Count leading whitespace bytes (spaces and tabs) on a line.
-/// Unlike `shared::util::indentation_of` which only counts spaces, this
-/// also counts tabs — needed for finding the first non-whitespace token
-/// in keyword context detection.
-fn leading_whitespace_len_with_tabs(line: &[u8]) -> usize {
-    line.iter()
-        .take_while(|&&b| b == b' ' || b == b'\t')
-        .count()
-}
-
-#[derive(Clone, Copy)]
-struct KeywordContext {
-    keyword: &'static str,
-    special_indentation: bool,
-}
-
-#[derive(Clone, Copy)]
-struct AssignmentContext {
-    rhs_begins_line: bool,
-}
-
-fn last_significant_index(line_bytes: &[u8]) -> Option<usize> {
-    line_bytes
-        .iter()
-        .rposition(|&b| b != b' ' && b != b'\t' && b != b'\r' && b != b'\n')
-}
-
-fn is_assignment_operator(bytes: &[u8], idx: usize) -> bool {
-    if bytes.get(idx) != Some(&b'=') {
-        return false;
-    }
-    if bytes.get(idx + 1) == Some(&b'=') {
-        return false;
-    }
-    if bytes.get(idx + 1) == Some(&b'>') {
-        return false;
-    }
-    !matches!(
-        idx.checked_sub(1).and_then(|i| bytes.get(i)),
-        Some(b'=' | b'!' | b'<' | b'>')
-    )
-}
-
-fn has_assignment_before_col(line_bytes: &[u8], col: usize) -> bool {
-    let end = col.min(line_bytes.len());
-    (0..end)
-        .rev()
-        .find(|&idx| line_bytes[idx] == b'=')
-        .is_some_and(|idx| is_assignment_operator(line_bytes, idx))
-}
-
-fn line_ends_with_assignment_operator(line_bytes: &[u8]) -> bool {
-    let mut idx = match last_significant_index(line_bytes) {
-        Some(idx) => idx,
-        None => return false,
-    };
-
-    if line_bytes[idx] == b'\\' {
-        idx = match last_significant_index(&line_bytes[..idx]) {
-            Some(idx) => idx,
-            None => return false,
+            )*
         };
     }
-
-    is_assignment_operator(line_bytes, idx)
-}
-
-fn line_ends_with_logical_operator(line_bytes: &[u8]) -> bool {
-    let Some(idx) = last_significant_index(line_bytes) else {
-        return false;
-    };
-    let trimmed = &line_bytes[..=idx];
-    trimmed.ends_with(b"&&")
-        || trimmed.ends_with(b"||")
-        || trimmed.ends_with(b" and")
-        || trimmed.ends_with(b" or")
-}
-
-fn modifier_keyword(before_expr: &[u8]) -> Option<&'static str> {
-    if before_expr.windows(8).any(|w| w == b" unless ")
-        || before_expr.windows(8).any(|w| w == b" unless(")
-    {
-        Some("unless")
-    } else if before_expr.windows(7).any(|w| w == b" while ")
-        || before_expr.windows(7).any(|w| w == b" while(")
-    {
-        Some("while")
-    } else if before_expr.windows(7).any(|w| w == b" until ")
-        || before_expr.windows(7).any(|w| w == b" until(")
-    {
-        Some("until")
-    } else if before_expr.windows(4).any(|w| w == b" if ")
-        || before_expr.windows(4).any(|w| w == b" if(")
-    {
-        Some("if")
-    } else {
-        None
-    }
-}
-
-fn keyword_context_on_line(
-    source: &SourceFile,
-    line: usize,
-    expr_col: usize,
-) -> Option<KeywordContext> {
-    fn extract(line_bytes: &[u8], expr_col: usize) -> Option<KeywordContext> {
-        let start = leading_whitespace_len_with_tabs(line_bytes);
-        let end = expr_col.min(line_bytes.len());
-        let before_expr = &line_bytes[start..end];
-
-        if before_expr.starts_with(b"elsif ") {
-            return Some(KeywordContext {
-                keyword: "elsif",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"if ") || before_expr.starts_with(b"if(") {
-            return Some(KeywordContext {
-                keyword: "if",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"unless ") || before_expr.starts_with(b"unless(") {
-            return Some(KeywordContext {
-                keyword: "unless",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"while ") || before_expr.starts_with(b"while(") {
-            return Some(KeywordContext {
-                keyword: "while",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"until ") || before_expr.starts_with(b"until(") {
-            return Some(KeywordContext {
-                keyword: "until",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"for ") {
-            return Some(KeywordContext {
-                keyword: "for",
-                special_indentation: true,
-            });
-        }
-        if before_expr.starts_with(b"return ") {
-            if let Some(keyword) = modifier_keyword(before_expr) {
-                return Some(KeywordContext {
-                    keyword,
-                    special_indentation: false,
-                });
-            }
-            return Some(KeywordContext {
-                keyword: "return",
-                special_indentation: true,
-            });
-        }
-        modifier_keyword(before_expr).map(|keyword| KeywordContext {
-            keyword,
-            special_indentation: false,
-        })
-    }
-
-    let line_bytes = source.lines().nth(line - 1).unwrap_or(b"");
-    if let Some(ctx) = extract(line_bytes, expr_col) {
-        return Some(ctx);
-    }
-
-    if line > 1 {
-        let prev_line = source.lines().nth(line - 2).unwrap_or(b"");
-        if last_significant_index(prev_line).is_some_and(|idx| prev_line[idx] == b'\\') {
-            return extract(prev_line, prev_line.len());
-        }
-
-        let line_indent = leading_whitespace_len_with_tabs(line_bytes);
-        let prev_indent = leading_whitespace_len_with_tabs(prev_line);
-        if prev_indent < line_indent && line_ends_with_logical_operator(prev_line) {
-            if let Some(ctx) = extract(prev_line, prev_line.len()) {
-                return Some(ctx);
-            }
-        }
-    }
+    try_write!(
+        as_local_variable_write_node,
+        as_local_variable_operator_write_node,
+        as_local_variable_and_write_node,
+        as_local_variable_or_write_node,
+        as_instance_variable_write_node,
+        as_instance_variable_operator_write_node,
+        as_instance_variable_and_write_node,
+        as_instance_variable_or_write_node,
+        as_class_variable_write_node,
+        as_class_variable_operator_write_node,
+        as_class_variable_and_write_node,
+        as_class_variable_or_write_node,
+        as_global_variable_write_node,
+        as_global_variable_operator_write_node,
+        as_global_variable_and_write_node,
+        as_global_variable_or_write_node,
+        as_constant_write_node,
+        as_constant_operator_write_node,
+        as_constant_and_write_node,
+        as_constant_or_write_node,
+        as_constant_path_write_node,
+        as_constant_path_operator_write_node,
+        as_constant_path_and_write_node,
+        as_constant_path_or_write_node,
+        as_index_operator_write_node,
+        as_index_and_write_node,
+        as_index_or_write_node,
+        as_call_operator_write_node,
+        as_call_and_write_node,
+        as_call_or_write_node,
+        as_multi_write_node,
+    );
     None
-}
-
-fn assignment_context(
-    source: &SourceFile,
-    left_line: usize,
-    left_col: usize,
-) -> Option<AssignmentContext> {
-    let left_line_bytes = source.lines().nth(left_line - 1).unwrap_or(b"");
-    if has_assignment_before_col(left_line_bytes, left_col) {
-        return Some(AssignmentContext {
-            rhs_begins_line: false,
-        });
-    }
-
-    if left_line > 1 {
-        let prev_line = source.lines().nth(left_line - 2).unwrap_or(b"");
-        // RuboCop only treats the expression as "assignment-aligned" when the
-        // operation itself begins the continued RHS line. Nested keyword/body
-        // expressions on that line (for example `value = \n  if a ||\n     b`)
-        // still use their own indentation rules.
-        if line_ends_with_assignment_operator(prev_line)
-            && left_col == leading_whitespace_len_with_tabs(left_line_bytes)
-        {
-            return Some(AssignmentContext {
-                rhs_begins_line: true,
-            });
-        }
-    }
-    None
-}
-
-fn operation_description(
-    keyword_context: Option<KeywordContext>,
-    assignment_context: Option<AssignmentContext>,
-) -> String {
-    if let Some(ctx) = keyword_context {
-        let kind = if ctx.keyword == "for" {
-            "collection"
-        } else {
-            "condition"
-        };
-        let article = if ctx.keyword.starts_with('i') || ctx.keyword.starts_with('u') {
-            "an"
-        } else {
-            "a"
-        };
-        format!("a {kind} in {article} `{}` statement", ctx.keyword)
-    } else if assignment_context.is_some() {
-        "an expression in an assignment".to_string()
-    } else {
-        "an expression".to_string()
-    }
-}
-
-impl MultilineOperationIndentation {
-    fn check_binary_node(
-        &self,
-        source: &SourceFile,
-        left: &ruby_prism::Node<'_>,
-        right: &ruby_prism::Node<'_>,
-        config: &CopConfig,
-        style: &str,
-        ctx: OperatorContext,
-    ) -> Vec<Diagnostic> {
-        let (left_line, left_col) = source.offset_to_line_col(left.location().start_offset());
-        let (left_end_line, _) = source.offset_to_line_col(left.location().end_offset());
-        let (right_line, right_col) = source.offset_to_line_col(right.location().start_offset());
-
-        // Use end of left operand for same-line check. For chained ||/&&
-        // like `a || b || c`, the outer Or has left=Or(a,b) spanning lines
-        // but `c` may be on the same line as `b` (the end of the left subtree).
-        if right_line == left_end_line {
-            return Vec::new();
-        }
-
-        // RuboCop's `begins_its_line?` — only check if the right operand is
-        // the first non-whitespace on its line. When the operator is leading
-        // (e.g., `expr \n  && other_expr`), the right operand is NOT the first
-        // token on the line and RuboCop skips the check.
-        if !begins_its_line(source, right.location().start_offset()) {
-            return Vec::new();
-        }
-
-        let width = config.get_usize("IndentationWidth", 2);
-
-        // For chained boolean expressions like And(And(a,b), c), the left
-        // operand's start_offset points to `a`'s position (the root of the
-        // chain). This gives us the correct base indentation.
-        let left_line_bytes = source.lines().nth(left_line - 1).unwrap_or(b"");
-        let left_indent = indentation_of(left_line_bytes);
-        let lexical_keyword = keyword_context_on_line(source, left_line, left_col);
-        // AST-derived keyword wins when it disagrees: the ancestor walk catches
-        // multi-line keyword conditions (`return [] unless\n  cond1 && cond2`)
-        // that lexical scanning of the same line would miss.
-        let keyword_context = ctx.keyword.map_or(lexical_keyword, |kw| {
-            Some(KeywordContext {
-                keyword: kw.keyword,
-                special_indentation: !kw.postfix,
-            })
-        });
-        let lexical_assignment = assignment_context(source, left_line, left_col);
-        let ast_assignment = ctx.assignment_rhs_start.map(|start| AssignmentContext {
-            rhs_begins_line: begins_its_line(source, start),
-        });
-        // Block-body or UNALIGNED_RHS_TYPES ancestors disqualify the lexical `=`
-        // detection from being treated as the operator's own assignment context
-        // — mirrors RuboCop's `disqualified_rhs?` (`block_type? && part_of_block_body?`
-        // and the UNALIGNED_RHS_TYPES list).
-        let assignment_context = if ctx.block_disqualifies_assignment {
-            None
-        } else {
-            ast_assignment.or(lexical_assignment)
-        };
-        let should_align = assignment_context.is_some_and(|c| c.rhs_begins_line)
-            || (style == "aligned" && (keyword_context.is_some() || assignment_context.is_some()));
-        let align_only = should_align || (ctx.method_argument && style == "aligned");
-        let expected_indent = left_indent
-            + if keyword_context.is_some_and(|c| c.special_indentation) {
-                2 * width
-            } else {
-                width
-            };
-
-        let is_ok = if align_only {
-            right_col == left_col
-        } else {
-            right_col == expected_indent
-        };
-
-        if !is_ok {
-            let message = if align_only {
-                format!(
-                    "Align the operands of {} spanning multiple lines.",
-                    operation_description(keyword_context, assignment_context)
-                )
-            } else {
-                let used = right_col.saturating_sub(left_indent);
-                format!(
-                    "Use {} (not {used}) spaces for indenting {} spanning multiple lines.",
-                    expected_indent.saturating_sub(left_indent),
-                    operation_description(keyword_context, assignment_context)
-                )
-            };
-            return vec![self.diagnostic(source, right_line, right_col, message)];
-        }
-
-        Vec::new()
-    }
 }
 
 #[cfg(test)]
@@ -1054,19 +751,15 @@ mod tests {
     }
 
     #[test]
-    fn nested_and_or_deep_indent_no_offense() {
-        let src = b"        def implicit_block?(node)\n          return false unless node.arguments.any?\n\n          node.last_argument.block_pass_type? ||\n            (node.last_argument.sym_type? &&\n            methods_accepting_symbol.include?(node.method_name.to_s))\n        end\n";
+    fn tab_indented_continuation_measures_from_the_tab() {
+        // `indentation` is `source_line =~ /\S/`, so a leading tab counts as
+        // one column and the expected indentation here is 1 + 2 = 3.
+        let src = b"def foo\n\tbaz ||\n\t  qux\nend\n";
         let diags = run_cop_full(&MultilineOperationIndentation, src);
         assert!(
             diags.is_empty(),
-            "nested && inside || with aligned continuation should not flag, got: {:?}",
-            diags
-                .iter()
-                .map(|d| format!(
-                    "line {} col {} {}",
-                    d.location.line, d.location.column, d.message
-                ))
-                .collect::<Vec<_>>()
+            "tab-indented continuation should measure from the tab, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
@@ -1104,24 +797,14 @@ mod tests {
 
         // Assignment RHS uses aligned operands in aligned style.
         let src3 = b"x = a &&\n    b\n";
-        let diags3 = run_cop_full_with_config(&MultilineOperationIndentation, src3, config);
+        let diags3 = run_cop_full_with_config(&MultilineOperationIndentation, src3, config.clone());
         assert!(
             diags3.is_empty(),
             "aligned style should accept operand-aligned continuation in assignments"
         );
 
         let src4 = b"x = a &&\n  b\n";
-        let diags4 = run_cop_full_with_config(
-            &MultilineOperationIndentation,
-            src4,
-            CopConfig {
-                options: HashMap::from([(
-                    "EnforcedStyle".into(),
-                    serde_yml::Value::String("aligned".into()),
-                )]),
-                ..CopConfig::default()
-            },
-        );
+        let diags4 = run_cop_full_with_config(&MultilineOperationIndentation, src4, config);
         assert_eq!(
             diags4.len(),
             1,
