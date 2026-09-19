@@ -397,6 +397,11 @@ fn name_of<'pr>(node: &ruby_prism::Node<'pr>) -> Value<'pr> {
             .value_loc()
             .map_or(Value::Nil, |loc| Value::Sym(Cow::Borrowed(loc.as_slice())));
     }
+    // The implicit `it` of a `{ it }` block is `(lvar :it)` to Parser, so its
+    // name is `it`; Prism's node has no name accessor to read it from.
+    if node.as_it_local_variable_read_node().is_some() {
+        return Value::Sym(Cow::Borrowed(b"it"));
+    }
     Value::Nil
 }
 
@@ -776,9 +781,14 @@ mod tests {
                 .expect("the pattern matched above"),
         ));
 
+        // The runtime hands the matcher the document's own resolver, so a
+        // `matches:` sees `#helper` and `%TABLE` exactly as the loader did.
+        let resolver: &'static _ =
+            Box::leak(Box::new(crate::cop::ir::expr::DocResolver(&cop.compiled)));
         let ctx = EvalCtx::new(&node, src, &cop.compiled)
             .with_ancestors(ancestors)
-            .with_captures(captures);
+            .with_captures(captures)
+            .with_params(&EMPTY_PARAMS, resolver);
         let when = cop.compiled.hooks[0]
             .when
             .as_ref()
@@ -869,6 +879,18 @@ mod tests {
             .more("  konst:\n    pattern: \"(const nil? :Time)\"\n"),
             Case::new("Time.new", TIME_NEW, "{ matches: [node, \"is_new\"] }")
                 .extra("predicates:\n  is_new:\n    expr: { eq: [node.method_name, \":new\"] }\n"),
+            // `%CONST` inside a matcher resolves against the document's own
+            // `constants:` — upstream's `%KIND_METHODS` spelling, verbatim.
+            Case::new("x.is_a?(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: { \"is_a?\": true, \"kind_of?\": true }\n"),
+            Case::new("x.foo(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: { \"is_a?\": true, \"kind_of?\": true }\n")
+                .falsey(),
+            // Prism's `ItLocalVariableReadNode` is Parser's `(lvar :it)`.
+            Case::new("array.max_by { it }", "(itblock _ _ $_)", "{ eq: [$v.name, \":it\"] }")
+                .captures("[v]"),
             Case::new("Time.new", TIME_NEW, "{ regex: [node.source, \"\\\\ATime\"] }"),
             Case::new("Time.new", TIME_NEW, "{ regex: [node.source, \"^time\", \"i\"] }"),
             Case::new("Time.new", TIME_NEW, "{ regex: [node.source, \"\\\\ADate\"] }").falsey(),

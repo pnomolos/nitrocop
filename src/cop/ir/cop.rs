@@ -45,14 +45,14 @@ use crate::cop::{Cop, CopConfig};
 use crate::correction::Correction;
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::node_pattern::captures::{CaptureValue, Captures, dup_node};
-use crate::node_pattern::interpreter::{CompiledPattern, block_type_of, parser_type_for_node};
+use crate::node_pattern::interpreter::{block_type_of, parser_type_for_node};
 use crate::node_pattern::parser::PatternNode;
 use crate::node_pattern::predicates::Arg;
 use crate::node_pattern::resolve::{Params, Resolver};
 use crate::parse::source::SourceFile;
 
 use super::eval::{EvalCtx, Value, eval};
-use super::expr::{Attr, Collection, CompiledDoc, Expr, Intrinsic, Target};
+use super::expr::{Attr, Collection, CompiledDoc, DocResolver, Expr, Intrinsic, Target};
 use super::load::{IrCop, IrError, IrErrorKind};
 use super::schema::{
     AutocorrectMode, ConfigType, CorrectionOp, EnabledDefault, LocationSpec, MatchSpec,
@@ -143,16 +143,6 @@ struct Anchor {
 enum AnchorRange {
     Whole(Anchor),
     Pair(Anchor, Anchor),
-}
-
-/// Resolves `#helper` inside a pattern against the document's own matchers.
-struct DocResolver<'a>(&'a CompiledDoc);
-
-impl Resolver for DocResolver<'_> {
-    fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
-        let index = self.0.matcher_names.iter().position(|n| n == name)?;
-        self.0.matchers.get(index)
-    }
 }
 
 impl IrCopRunner {

@@ -259,6 +259,14 @@ pub struct CompiledDoc {
     pub regexes: Vec<regex::Regex>,
     pub const_names: Vec<String>,
     pub consts: Vec<BTreeMap<String, ConstValue>>,
+    /// Each `constants:` table as the `Arg::Set` of its keys, indexed like
+    /// `const_names`.
+    ///
+    /// This is what a `%TABLE` reference inside a pattern resolves to, which is
+    /// how an upstream matcher that says `%KIND_METHODS` stays byte-identical:
+    /// upstream's constant is a frozen `Set` and `%CONST` matches it with
+    /// `===`, i.e. membership.
+    pub const_args: Vec<Arg>,
     pub config_names: Vec<String>,
     /// Declared `config:` defaults, indexed like `config_names`. The runtime
     /// overrides these from `CopConfig`; tests evaluate against them directly.
@@ -276,17 +284,48 @@ impl CompiledDoc {
     }
 }
 
-/// Resolves `#helper` against the matchers compiled so far.
-struct DocResolver<'a> {
+/// Resolves `#helper` against the matchers compiled so far, and `%TABLE`
+/// against the document's `constants:`.
+struct MatcherResolver<'a> {
     names: &'a [String],
     compiled: &'a [CompiledPattern],
+    const_names: &'a [String],
+    const_args: &'a [Arg],
 }
 
-impl Resolver for DocResolver<'_> {
+impl Resolver for MatcherResolver<'_> {
     fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
         let index = self.names.iter().position(|n| n == name)?;
         self.compiled.get(index)
     }
+
+    fn constant(&self, name: &str) -> Option<&Arg> {
+        let index = self.const_names.iter().position(|n| n == name)?;
+        self.const_args.get(index)
+    }
+}
+
+/// The same resolution, against a document that is already compiled: what the
+/// runtime hands the matcher so `#helper` and `%TABLE` mean the same thing at
+/// match time as they did at load time.
+pub struct DocResolver<'a>(pub &'a CompiledDoc);
+
+impl Resolver for DocResolver<'_> {
+    fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
+        let index = self.0.matcher_names.iter().position(|n| n == name)?;
+        self.0.matchers.get(index)
+    }
+
+    fn constant(&self, name: &str) -> Option<&Arg> {
+        let index = self.0.const_names.iter().position(|n| n == name)?;
+        self.0.const_args.get(index)
+    }
+}
+
+/// A `constants:` table as the set of its keys.
+#[must_use]
+pub fn const_table_arg(table: &BTreeMap<String, ConstValue>) -> Arg {
+    Arg::Set(table.keys().map(|key| Arg::Symbol(key.clone())).collect())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -314,6 +353,7 @@ pub struct CompileCtx<'a> {
     pred_state: Vec<PredState>,
     regexes: Vec<regex::Regex>,
     const_names: Vec<String>,
+    const_args: Vec<Arg>,
     config_names: Vec<String>,
     /// Quantifier variables currently in scope, innermost last.
     vars: Vec<String>,
@@ -349,6 +389,7 @@ impl<'a> CompileCtx<'a> {
             pred_state: vec![PredState::Unvisited; doc.predicates.len()],
             regexes: Vec::new(),
             const_names: doc.constants.keys().cloned().collect(),
+            const_args: doc.constants.values().map(const_table_arg).collect(),
             config_names: doc.config.keys().cloned().collect(),
             vars: Vec::new(),
             var_count: 0,
@@ -373,9 +414,11 @@ impl<'a> CompileCtx<'a> {
             if text.is_empty() {
                 cerr!(self, Pattern, "matcher `{name}`: empty pattern");
             }
-            let resolver = DocResolver {
+            let resolver = MatcherResolver {
                 names: &self.matcher_names,
                 compiled: &self.matchers,
+                const_names: &self.const_names,
+                const_args: &self.const_args,
             };
             let compiled = match CompiledPattern::compile_with(text, &resolver) {
                 Ok(compiled) => compiled,
@@ -455,6 +498,7 @@ impl<'a> CompileCtx<'a> {
             regexes: self.regexes,
             const_names: self.const_names,
             consts: self.doc.constants.values().cloned().collect(),
+            const_args: self.const_args,
             config_names: self.config_names,
             config_defaults: self
                 .doc
