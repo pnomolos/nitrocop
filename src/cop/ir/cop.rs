@@ -533,6 +533,13 @@ impl Cop for IrCopRunner {
         diagnostics: &mut Vec<Diagnostic>,
         mut corrections: Option<&mut Vec<Correction>>,
     ) {
+        // `minimum_target_ruby_version`: upstream registers the cop only when
+        // the target is new enough, so below it the cop reports nothing at all.
+        if let Some(minimum) = self.doc.document.min_target_ruby
+            && target_ruby_version(config) < minimum
+        {
+            return;
+        }
         let resolver = DocResolver(self.compiled());
         let owned_params = self.params(config);
         let params = owned_params.as_ref().unwrap_or(&self.const_params);
@@ -1135,6 +1142,16 @@ fn yaml_to_arg(value: &serde_yml::Value) -> Arg {
     }
 }
 
+/// `AllCops: TargetRubyVersion`, defaulting to RuboCop's own 2.7 — the same
+/// read every hand-written cop with a `minimum_target_ruby_version` does.
+fn target_ruby_version(config: &CopConfig) -> f64 {
+    config
+        .options
+        .get("TargetRubyVersion")
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)))
+        .unwrap_or(2.7)
+}
+
 fn severity_of(severity: IrSeverity) -> Severity {
     match severity {
         IrSeverity::Convention => Severity::Convention,
@@ -1374,6 +1391,29 @@ hooks:
         );
         let diags = run_cop_full_with_config(&cop, b"Thing.wrap(1)\n", config);
         assert_eq!(diags[0].message, "X/yes: wrap 1 %");
+    }
+
+    /// `min_target_ruby:` is upstream's `minimum_target_ruby_version`: below
+    /// it the cop is not registered at all, so it reports nothing.
+    #[test]
+    fn min_target_ruby_gates_the_whole_cop() {
+        let cop = runner(&ANCHORS.replace(
+            "autocorrect: safe",
+            "autocorrect: safe\nmin_target_ruby: 3.2",
+        ));
+        let with_target = |version: f64| {
+            let mut config = CopConfig::default();
+            config.options.insert(
+                "TargetRubyVersion".to_string(),
+                serde_yml::Value::Number(serde_yml::value::Number::from(version)),
+            );
+            run_cop_full_with_config(&cop, b"Thing.wrap(1)\n", config)
+        };
+        assert!(with_target(3.1).is_empty());
+        assert_eq!(with_target(3.2).len(), 1);
+        assert_eq!(with_target(3.4).len(), 1);
+        // No `TargetRubyVersion` at all reads as RuboCop's default 2.7.
+        assert!(run_cop_full(&cop, b"Thing.wrap(1)\n").is_empty());
     }
 
     #[test]

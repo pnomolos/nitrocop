@@ -38,6 +38,10 @@ pub struct IrDocument {
     pub tier: Tier,
     #[serde(default)]
     pub autocorrect: AutocorrectMode,
+    /// Upstream's `minimum_target_ruby_version`: the cop reports nothing when
+    /// `AllCops: TargetRubyVersion` is below this.
+    #[serde(default)]
+    pub min_target_ruby: Option<f64>,
     /// Default `Include` globs.
     #[serde(default)]
     pub include: Vec<String>,
