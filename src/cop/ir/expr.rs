@@ -32,14 +32,12 @@
 //! `UnknownMatcher`-style [`IrErrorKind::Pattern`] error rather than a cycle,
 //! which is how pattern-level acyclicity is enforced for free.
 
-use std::collections::BTreeMap;
-
 use regex::RegexBuilder;
 
 use crate::node_pattern::{Arg, Arity, CompiledPattern, Resolver, predicates};
 
 use super::load::{IrError, IrErrorKind};
-use super::schema::{ConstValue, ExprSyntax, IrDocument, MAX_EXPR_DEPTH};
+use super::schema::{ConfigType, ConstScalar, ConstTable, ExprSyntax, IrDocument, MAX_EXPR_DEPTH};
 
 /// Largest `descendants(N)` depth an expression may ask for.
 pub const MAX_DESCEND_DEPTH: u8 = 8;
@@ -299,7 +297,7 @@ pub enum Expr {
     },
     In {
         needle: Box<Expr>,
-        haystack: Vec<Expr>,
+        haystack: Haystack,
     },
     If {
         cond: Box<Expr>,
@@ -317,6 +315,21 @@ pub enum Expr {
         var: usize,
         body: Box<Expr>,
     },
+}
+
+/// What `in:` tests membership against.
+///
+/// A literal sequence is a list of expressions, one per member. The set forms
+/// name a whole collection instead — a `constants:` table or a `string_array`
+/// config key — so a cop can test against something a `.rubocop.yml` supplies
+/// without spelling its members in the document.
+#[derive(Debug, Clone)]
+pub enum Haystack {
+    /// `in: [x, [a, b, c]]`.
+    Items(Vec<Expr>),
+    /// `in: [x, consts.NAME]` / `in: [x, cfg.Key]` — an expression evaluating
+    /// to a list.
+    Set(Box<Expr>),
 }
 
 /// One hook's compiled expressions, positionally parallel to `IrDocument::hooks`.
@@ -337,8 +350,8 @@ pub struct CompiledDoc {
     pub predicates: Vec<Expr>,
     pub regexes: Vec<regex::Regex>,
     pub const_names: Vec<String>,
-    pub consts: Vec<BTreeMap<String, ConstValue>>,
-    /// Each `constants:` table as the `Arg::Set` of its keys, indexed like
+    pub consts: Vec<ConstTable>,
+    /// Each `constants:` table as the `Arg::Set` of its members, indexed like
     /// `const_names`.
     ///
     /// This is what a `%TABLE` reference inside a pattern resolves to, which is
@@ -401,10 +414,28 @@ impl Resolver for DocResolver<'_> {
     }
 }
 
-/// A `constants:` table as the set of its keys.
+/// A `constants:` table as the set of its members.
+///
+/// A string member becomes `Arg::Symbol` (with a leading `:` stripped, so
+/// `[":map", ":collect"]` and `[map, collect]` are the same set): upstream's
+/// set constants are `%i[…]` and `Arg::Symbol`/`Arg::Str` compare identically
+/// anyway (`predicates::Arg::accepts_value`). A bool member becomes its Ruby
+/// spelling, which is how `{true}` in a pattern reads it.
 #[must_use]
-pub fn const_table_arg(table: &BTreeMap<String, ConstValue>) -> Arg {
-    Arg::Set(table.keys().map(|key| Arg::Symbol(key.clone())).collect())
+pub fn const_table_arg(table: &ConstTable) -> Arg {
+    Arg::Set(
+        table
+            .members()
+            .into_iter()
+            .map(|member| match member {
+                ConstScalar::Str(text) => {
+                    Arg::Symbol(text.strip_prefix(':').unwrap_or(&text).to_string())
+                }
+                ConstScalar::Int(value) => Arg::Int(value),
+                ConstScalar::Bool(value) => Arg::Str(value.to_string()),
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -825,13 +856,40 @@ fn compile_op(
                 return Err(arity(ctx, "2"));
             }
             let needle = sub(0, ctx)?;
-            let Yaml::Sequence(members) = items[1] else {
-                cerr!(ctx, Expr, "`in`: the second operand must be a sequence");
+            let haystack = match items[1] {
+                Yaml::Sequence(members) => Haystack::Items(
+                    members
+                        .iter()
+                        .map(|member| compile_value(member, ctx, depth + 1))
+                        .collect::<Result<_, _>>()?,
+                ),
+                // A set-valued reference: the whole table or the whole config
+                // list is the haystack. Anything else — a bare literal, an
+                // operator — would silently degrade to a one-member test.
+                other => {
+                    let compiled = compile_value(other, ctx, depth + 1)?;
+                    match &compiled {
+                        Expr::Path(Target::Const(_)) => {}
+                        Expr::Path(Target::Cfg(slot)) => {
+                            let key = &ctx.config_names[*slot];
+                            let ty = ctx.doc.config[key].ty;
+                            if ty != ConfigType::StringArray {
+                                cerr!(
+                                    ctx,
+                                    Expr,
+                                    "`in`: config key `{key}` is `{ty}`, not `string_array`"
+                                );
+                            }
+                        }
+                        _ => cerr!(
+                            ctx,
+                            Expr,
+                            "`in`: the second operand must be a sequence, a `consts.<Table>` or a `string_array` `cfg.<Key>`"
+                        ),
+                    }
+                    Haystack::Set(Box::new(compiled))
+                }
             };
-            let haystack = members
-                .iter()
-                .map(|member| compile_value(member, ctx, depth + 1))
-                .collect::<Result<_, _>>()?;
             Ok(Expr::In {
                 needle: Box::new(needle),
                 haystack,
@@ -864,6 +922,14 @@ fn compile_op(
                     "`lookup`: the first operand must be a `consts.<Table>` reference"
                 );
             };
+            let name = &ctx.const_names[table];
+            if matches!(ctx.doc.constants[name], ConstTable::List(_)) {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`lookup`: `{name}` is a list, which has no values to look up; use `in:` to test membership"
+                );
+            }
             Ok(Expr::Lookup {
                 table,
                 key: Box::new(sub(1, ctx)?),

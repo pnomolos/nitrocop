@@ -54,9 +54,9 @@ pub struct IrDocument {
     /// Declared config keys, type-checked at load.
     #[serde(default)]
     pub config: BTreeMap<String, ConfigDecl>,
-    /// Frozen lookup tables (upstream's `FOO = {...}.freeze`).
+    /// Frozen tables (upstream's `FOO = {...}.freeze` / `FOO = %i[…].freeze`).
     #[serde(default)]
-    pub constants: BTreeMap<String, BTreeMap<String, ConstValue>>,
+    pub constants: BTreeMap<String, ConstTable>,
     /// Named NodePattern strings, copied verbatim from upstream.
     #[serde(default)]
     pub matchers: BTreeMap<String, MatcherDecl>,
@@ -175,6 +175,57 @@ pub enum ConstValue {
     Int(i64),
     Str(String),
     List(Vec<String>),
+}
+
+/// A scalar member of a list-valued `constants:` entry.
+///
+/// Deliberately narrower than [`ConstValue`]: a member is what `%NAME` compares
+/// against, so it has to have a value form, and a nested list has none.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum ConstScalar {
+    Bool(bool),
+    Int(i64),
+    Str(String),
+}
+
+/// One `constants:` entry.
+///
+/// Upstream writes a frozen constant two ways and the IR mirrors both:
+/// `FOO = { key => value }.freeze` is a lookup table ([`ConstTable::Map`]) and
+/// `FOO = %i[a b].to_set.freeze` is a membership set ([`ConstTable::List`]).
+/// Both bind `%FOO` inside a pattern to the same `Arg::Set` shape — a map's
+/// members are its *keys* — and both answer `in: consts.FOO`; only `lookup:`
+/// distinguishes them, because only a map has values to look up.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ConstTable {
+    /// `NAME: [a, b, c]`.
+    List(Vec<ConstScalar>),
+    /// `NAME: { key: value }`.
+    Map(BTreeMap<String, ConstValue>),
+}
+
+impl ConstTable {
+    /// The table's members: a list's entries, or a map's keys.
+    ///
+    /// This is what `%NAME` matches against and what `in: consts.NAME` tests,
+    /// so the two forms are interchangeable everywhere except `lookup:`.
+    pub fn members(&self) -> Vec<ConstScalar> {
+        match self {
+            Self::List(items) => items.clone(),
+            Self::Map(map) => map.keys().cloned().map(ConstScalar::Str).collect(),
+        }
+    }
+
+    /// The value `key` maps to, for `lookup:`. A list has none.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&ConstValue> {
+        match self {
+            Self::List(_) => None,
+            Self::Map(map) => map.get(key),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

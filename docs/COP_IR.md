@@ -40,7 +40,7 @@ loaded cop, because a silently dropped cop is an invisible false negative.
 | `include` / `exclude` | list of globs | `[]` | Become `default_include`/`default_exclude`. |
 | `restrict_on_send` | list of method names | `[]` | Requires at least one `send`/`csend` hook. |
 | `config` | map | `{}` | Declared config keys. |
-| `constants` | map of map | `{}` | Frozen lookup tables. |
+| `constants` | map | `{}` | Frozen tables: a map of values, or a list of members. |
 | `matchers` | map | `{}` | Named NodePattern strings. |
 | `predicates` | map | `{}` | Named expression guards, usable as `#name` in patterns. |
 
@@ -62,6 +62,29 @@ config:
 `string_map`, and maps onto `CopConfig::get_*`. `default` is required and must
 match the declared type; `values:` is required for, and only for, `type: enum`,
 and the default must be a member.
+
+## `constants:`
+
+Upstream freezes a constant two ways and the IR mirrors both:
+
+```yaml
+constants:
+  # `FOO = { 'is_a?' => :Integer }.freeze` — a lookup table.
+  REPLACEMENTS: { "is_a?": "kind_of?" }
+  # `BAR = %i[map collect].to_set.freeze` — a membership set.
+  MAP_METHODS: [":map", ":collect"]
+```
+
+Both forms bind `%NAME` inside a pattern to the `Arg::Set` of the table's
+**members** — a map's members are its keys — so upstream's `%MAP_METHODS`
+spelling stays verbatim whichever form the constant has. A string member's
+leading `:` is optional and stripped (`[":map"]` and `[map]` are the same set);
+quote a `:`-prefixed member, because YAML's flow sequence will not take a bare
+one.
+
+Both forms also answer `in: consts.NAME` (see the `in` operator). The forms
+differ in exactly one place: `lookup:` needs values, so a list-valued table is a
+load error there.
 
 ## `matchers:` and `predicates:`
 
@@ -156,16 +179,22 @@ self reference is a load error.
 | `not` | 1 expr | bool |
 | `eq`, `ne` | 2 exprs | bool |
 | `lt`, `le`, `gt`, `ge` | 2 exprs | bool |
-| `in` | `[expr, [expr, …]]` | bool — `eq` against any member |
+| `in` | `[expr, [expr, …]]`, `[expr, consts.<Table>]`, `[expr, cfg.<Key>]` | bool — `eq` against any member |
 | `if` | 3 exprs (cond, then, else) | the taken branch's value |
 | `lit` | 1 scalar | that literal, never a reference |
-| `lookup` | `[consts.<Table>, expr]` | the table's value, or `nil` |
+| `lookup` | `[consts.<Table>, expr]` | the map-valued table's value, or `nil` |
 | `attr` | `[expr, "<attr>"]`, `[expr, "arg", <int>]`, or `[expr, "loc", "<part>"]` | see attribute table |
 | `pred` | `[expr, "<name>", <arg>…]` | bool |
 | `matches` | `[expr, "<matcher or predicate>"]` | bool |
 | `regex` | `[expr, "<source>"]` or `[expr, "<source>", "<imx flags>"]` | bool |
 | `any_of`, `all_of`, `none_of` | quantifier mapping | bool |
 | `count` | quantifier mapping | int — matching elements |
+
+`in`'s second operand is a literal sequence, a `constants:` table (its members
+— a map's keys), or a `string_array` config key. The last is how a cop tests
+against something a `.rubocop.yml` supplies; a config key of any other type is
+a load error rather than a silently one-member test. So is any other expression
+there, for the same reason.
 
 Comparison rules: two nodes compare by byte range (identity, which is what `==`
 on Parser nodes means); ints, bools and `nil` compare by value; anything else

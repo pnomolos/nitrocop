@@ -145,6 +145,25 @@ fn json_schema_matches_rust_schema() {
         "ir_schema.json drifted from IrDocument"
     );
 
+    // `constants:` accepts both table forms (schema::ConstTable): a list of
+    // scalars and a map of scalars.
+    assert_eq!(
+        json["properties"]["constants"]["additionalProperties"]["$ref"],
+        serde_json::json!("#/$defs/constTable"),
+        "ir_schema.json `constants:` should reference constTable"
+    );
+    let forms: Vec<&str> = json["$defs"]["constTable"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|branch| branch["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        forms,
+        ["array", "object"],
+        "ir_schema.json constTable drifted from schema::ConstTable"
+    );
+
     // Operator vocabulary must match schema::OPERATORS exactly. Branch 2 of
     // the `expr` union carries the plain operators, branch 3 the quantifiers
     // (whose operand is a quantifier mapping, not an expression).

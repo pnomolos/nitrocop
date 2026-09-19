@@ -52,7 +52,9 @@ use crate::node_pattern::resolve::{Params, Resolver};
 use crate::parse::source::SourceFile;
 
 use super::eval::{EvalCtx, Value, eval};
-use super::expr::{Attr, Collection, CompiledDoc, DocResolver, Expr, Intrinsic, LocPart, Target};
+use super::expr::{
+    Attr, Collection, CompiledDoc, DocResolver, Expr, Haystack, Intrinsic, LocPart, Target,
+};
 use super::load::{IrCop, IrError, IrErrorKind};
 use super::schema::{
     AutocorrectMode, ConfigType, CorrectionOp, EnabledDefault, LocationSpec, MatchSpec,
@@ -1113,7 +1115,13 @@ fn expr_ascends(expr: &Expr) -> bool {
         Expr::Matches { of, .. } | Expr::Regex { of, .. } | Expr::Not(of) => expr_ascends(of),
         Expr::All(items) | Expr::Any(items) => items.iter().any(expr_ascends),
         Expr::Cmp { lhs, rhs, .. } => expr_ascends(lhs) || expr_ascends(rhs),
-        Expr::In { needle, haystack } => expr_ascends(needle) || haystack.iter().any(expr_ascends),
+        Expr::In { needle, haystack } => {
+            expr_ascends(needle)
+                || match haystack {
+                    Haystack::Items(items) => items.iter().any(expr_ascends),
+                    Haystack::Set(set) => expr_ascends(set),
+                }
+        }
         Expr::If { cond, then, els } => {
             expr_ascends(cond) || expr_ascends(then) || expr_ascends(els)
         }
@@ -1141,8 +1149,8 @@ fn split_params(doc: &IrCop) -> (Params, Vec<(String, usize)>) {
             }
             seen.push(param);
             if let Some(table) = doc.document.constants.get(param) {
-                let members = table.keys().map(|k| Arg::Symbol(k.clone())).collect();
-                const_params = const_params.with_named(param.clone(), Arg::Set(members));
+                const_params =
+                    const_params.with_named(param.clone(), super::expr::const_table_arg(table));
             } else if let Some(slot) = doc.compiled.config_names.iter().position(|n| n == param) {
                 config_params.push((param.clone(), slot));
             }

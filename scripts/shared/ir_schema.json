@@ -89,26 +89,7 @@
     "constants": {
       "type": "object",
       "additionalProperties": {
-        "type": "object",
-        "additionalProperties": {
-          "oneOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "integer"
-            },
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
-        }
+        "$ref": "#/$defs/constTable"
       }
     },
     "matchers": {
@@ -483,6 +464,53 @@
           "$ref": "#/$defs/expr"
         }
       }
+    },
+    "constScalar": {
+      "description": "A scalar member of a list-valued constants entry.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "constTable": {
+      "description": "A frozen constant: a lookup map (upstream FOO = {...}.freeze) or a membership list (upstream FOO = %i[...].to_set.freeze). Both bind %FOO to the set of members and both answer `in: consts.FOO`; only `lookup:` needs the map form.",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/constScalar"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          }
+        }
+      ]
     }
   }
 }

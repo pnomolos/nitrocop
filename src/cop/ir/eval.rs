@@ -26,9 +26,10 @@ use crate::node_pattern::{Captures, NoResolver, Params, PredCtx, PredTarget, Res
 use crate::parse::source::SourceFile;
 
 use super::expr::{
-    Attr, CmpOp, Collection, CompiledDoc, Expr, Intrinsic, Lit, MatcherRef, QuantKind, Target,
+    Attr, CmpOp, Collection, CompiledDoc, Expr, Haystack, Intrinsic, Lit, MatcherRef, QuantKind,
+    Target,
 };
-use super::schema::ConstValue;
+use super::schema::{ConstScalar, ConstValue};
 
 /// A runtime value. Byte slices borrow from the parsed source or the compiled
 /// document wherever possible.
@@ -256,11 +257,18 @@ pub fn eval<'pr>(expr: &Expr, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
         Expr::Cmp { op, lhs, rhs } => Value::Bool(compare(*op, &eval(lhs, ctx), &eval(rhs, ctx))),
         Expr::In { needle, haystack } => {
             let value = eval(needle, ctx);
-            Value::Bool(
-                haystack
+            let held = match haystack {
+                Haystack::Items(items) => items
                     .iter()
                     .any(|item| compare(CmpOp::Eq, &value, &eval(item, ctx))),
-            )
+                // A set reference evaluates to a `List`; anything else (a
+                // config key whose value is absent, say) holds nothing.
+                Haystack::Set(set) => match eval(set, ctx) {
+                    Value::List(items) => items.iter().any(|item| compare(CmpOp::Eq, &value, item)),
+                    _ => false,
+                },
+            };
+            Value::Bool(held)
         }
         Expr::If { cond, then, els } => {
             if eval(cond, ctx).truthy() {
@@ -276,6 +284,8 @@ pub fn eval<'pr>(expr: &Expr, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 return Value::Nil;
             };
+            // Only a map has values to look up; a list-valued table is a
+            // membership set, so `lookup` on one is `nil`.
             match ctx.doc.consts.get(*table).and_then(|t| t.get(text)) {
                 Some(ConstValue::Str(s)) => Value::str(s.as_bytes()),
                 Some(ConstValue::Int(i)) => Value::Int(*i),
@@ -309,9 +319,24 @@ fn path<'pr>(target: Target, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
         },
         Target::Bind(slot) => ctx.binds.get(slot).cloned().unwrap_or(Value::Nil),
         Target::Cfg(slot) => ctx.config.get(slot).map_or(Value::Nil, from_yaml),
-        // A bare `consts.Table` is only meaningful as `lookup`'s first operand,
-        // which the compiler consumes; reaching here means it was used as a value.
-        Target::Const(_) => Value::Nil,
+        // A table as a value is the list of its members, which is what
+        // `in: consts.NAME` tests against. (`lookup`'s first operand is
+        // consumed by the compiler and never evaluated.)
+        Target::Const(slot) => ctx.doc.consts.get(slot).map_or(Value::Nil, |table| {
+            Value::List(
+                table
+                    .members()
+                    .into_iter()
+                    .map(|member| match member {
+                        ConstScalar::Str(text) => Value::Sym(Cow::Owned(
+                            text.strip_prefix(':').unwrap_or(&text).as_bytes().to_vec(),
+                        )),
+                        ConstScalar::Int(value) => Value::Int(value),
+                        ConstScalar::Bool(value) => Value::Bool(value),
+                    })
+                    .collect(),
+            )
+        }),
         Target::Var(slot) => ctx.vars.borrow()[slot]
             .as_ref()
             .map_or(Value::Nil, |node| Value::Node(dup_node(node))),
@@ -882,6 +907,29 @@ mod tests {
                 "{ in: [node.method_name, [\":now\", \":utc\"]] }",
             )
             .falsey(),
+            // `in:` over a whole set: a list-valued constant, a map-valued one
+            // (its keys), and a `string_array` config key.
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: [\":new\", \":now\"]\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: [utc, now]\n")
+                .falsey(),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: { new: \"now\" }\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, cfg.Allowed] }")
+                .extra("config:\n  Allowed: { type: string_array, default: [\"new\"] }\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, cfg.Allowed] }")
+                .extra("config:\n  Allowed: { type: string_array, default: [] }\n")
+                .falsey(),
+            // A list-valued constant is also a `%NAME` membership set, which
+            // is how upstream's `%i[…].to_set.freeze` constants read.
+            Case::new("x.is_a?(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: [\"is_a?\", \"kind_of?\"]\n"),
+            Case::new("x.foo(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: [\"is_a?\", \"kind_of?\"]\n")
+                .falsey(),
             // --- values ---------------------------------------------------
             Case::new("Time.new", TIME_NEW, "{ if: [true, true, false] }"),
             Case::new("Time.new", TIME_NEW, "{ if: [false, true, false] }").falsey(),

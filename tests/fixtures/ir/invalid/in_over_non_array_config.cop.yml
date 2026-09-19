@@ -1,0 +1,15 @@
+schema: 1
+cop: "Style/TimeNow"
+config:
+  Max: { type: int, default: 3 }
+matchers:
+  time_new:
+    pattern: |
+      (call (const {nil? cbase} :Time) :new)
+hooks:
+  - on: [send]
+    match: time_new
+    when: { in: [node.method_name, cfg.Max] }
+    offense:
+      location: node
+      message: "Prefer `Time.now`."
