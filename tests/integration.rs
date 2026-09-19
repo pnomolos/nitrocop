@@ -62,7 +62,14 @@ fn default_args() -> Args {
         tier: None,
         stdin: None,
         init: false,
-        no_cache: false,
+        // Hermetic by default: tests must never touch the developer's real
+        // `~/.cache/nitrocop`. A failing run writing there, or a stale entry
+        // being replayed on the next run, produces false pass/fail signals.
+        // Tests that intentionally exercise the result cache spawn the
+        // `nitrocop` binary and point `NITROCOP_CACHE_DIR` at a per-test temp
+        // dir via `Command::env` (see `run_nitrocop_json` below), rather than
+        // overriding this default.
+        no_cache: true,
         cache: "true".to_string(),
         cache_clear: false,
         fail_level: "convention".to_string(),
@@ -4225,87 +4232,92 @@ fn no_vendor_include_macros_in_src() {
 
 // ---------- Result cache integration tests ----------
 
+/// Spawn the `nitrocop` binary with `--format json` and parse its output.
+///
+/// `cache_dir`, when given, is passed as `NITROCOP_CACHE_DIR` on the *child
+/// process's* environment only (`Command::env`), never via
+/// `std::env::set_var` on this test process. Integration tests run in
+/// parallel threads within one process, so mutating this process's global
+/// env would race other tests; a per-child env var is isolated by
+/// construction and always points at a per-test temp dir, never the
+/// developer's real `~/.cache/nitrocop`.
+fn run_nitrocop_json(
+    dir: &Path,
+    cache_dir: Option<&Path>,
+    extra_args: &[&str],
+) -> serde_json::Value {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nitrocop"));
+    if let Some(cache_dir) = cache_dir {
+        cmd.env("NITROCOP_CACHE_DIR", cache_dir);
+    }
+    let output = cmd
+        .args(extra_args)
+        .args(["--format", "json", dir.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute nitrocop");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("Should be valid JSON: {e}\n{stdout}"))
+}
+
 #[test]
 fn cache_produces_same_results_as_uncached() {
     let dir = temp_dir("cache_same_results");
     // File with offenses
-    let file1 = write_file(&dir, "trailing.rb", b"x = 1 \ny = 2\n");
+    write_file(&dir, "trailing.rb", b"x = 1 \ny = 2\n");
     // File without offenses
-    let file2 = write_file(&dir, "clean.rb", b"x = 1\ny = 2\n");
-
-    let config = load_config(None, Some(dir.as_path()), None).unwrap();
-    let registry = CopRegistry::default_registry();
+    write_file(&dir, "clean.rb", b"x = 1\ny = 2\n");
 
     // Run without cache
-    let args_no_cache = Args {
-        only: vec!["Layout/TrailingWhitespace".to_string()],
-        cache: "false".to_string(),
-        preview: true,
-        ..default_args()
-    };
-    let result_no_cache = run_linter(
-        &discovered(&[file1.clone(), file2.clone()]),
-        &config,
-        &registry,
-        &args_no_cache,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
+    let no_cache = run_nitrocop_json(
+        &dir,
+        None,
+        &[
+            "--only",
+            "Layout/TrailingWhitespace",
+            "--cache",
+            "false",
+            "--preview",
+            "--force-default-config",
+        ],
     );
+    let offenses_no_cache = no_cache["offenses"].as_array().cloned().unwrap_or_default();
 
-    // Run with cache (cold)
+    // Run with cache (cold), isolated to a per-test temp cache dir
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    // SAFETY: test-only, set env var for cache root
-    unsafe { std::env::set_var("NITROCOP_CACHE_DIR", &cache_dir) };
-    let args_cached = Args {
-        only: vec!["Layout/TrailingWhitespace".to_string()],
-        cache: "true".to_string(),
-        preview: true,
-        ..default_args()
-    };
-    let result_cold = run_linter(
-        &discovered(&[file1.clone(), file2.clone()]),
-        &config,
-        &registry,
-        &args_cached,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
-    );
+    let cache_args = [
+        "--only",
+        "Layout/TrailingWhitespace",
+        "--cache",
+        "true",
+        "--preview",
+        "--force-default-config",
+    ];
+    let cold = run_nitrocop_json(&dir, Some(&cache_dir), &cache_args);
+    let offenses_cold = cold["offenses"].as_array().cloned().unwrap_or_default();
 
-    // Run with cache (warm)
-    let result_warm = run_linter(
-        &discovered(&[file1.clone(), file2.clone()]),
-        &config,
-        &registry,
-        &args_cached,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
-    );
-
-    unsafe { std::env::remove_var("NITROCOP_CACHE_DIR") };
+    // Run with cache (warm), same cache dir
+    let warm = run_nitrocop_json(&dir, Some(&cache_dir), &cache_args);
+    let offenses_warm = warm["offenses"].as_array().cloned().unwrap_or_default();
 
     // All three runs should produce identical diagnostics
     assert_eq!(
-        result_no_cache.diagnostics.len(),
-        result_cold.diagnostics.len(),
+        offenses_no_cache.len(),
+        offenses_cold.len(),
         "Cold cache should produce same offense count as uncached"
     );
     assert_eq!(
-        result_no_cache.diagnostics.len(),
-        result_warm.diagnostics.len(),
+        offenses_no_cache.len(),
+        offenses_warm.len(),
         "Warm cache should produce same offense count as uncached"
     );
 
     // Verify actual offenses match
-    for (d1, d2) in result_no_cache
-        .diagnostics
-        .iter()
-        .zip(result_warm.diagnostics.iter())
-    {
-        assert_eq!(d1.cop_name, d2.cop_name);
-        assert_eq!(d1.location.line, d2.location.line);
-        assert_eq!(d1.location.column, d2.location.column);
-        assert_eq!(d1.message, d2.message);
+    for (o1, o2) in offenses_no_cache.iter().zip(offenses_warm.iter()) {
+        assert_eq!(o1["cop_name"], o2["cop_name"]);
+        assert_eq!(o1["line"], o2["line"]);
+        assert_eq!(o1["column"], o2["column"]);
+        assert_eq!(o1["message"], o2["message"]);
     }
 
     let _ = fs::remove_dir_all(&dir);
@@ -4360,29 +4372,20 @@ fn cache_invalidated_by_file_change() {
 
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    unsafe { std::env::set_var("NITROCOP_CACHE_DIR", &cache_dir) };
-
-    let config = load_config(None, Some(dir.as_path()), None).unwrap();
-    let registry = CopRegistry::default_registry();
-    let args = Args {
-        only: vec!["Layout/TrailingWhitespace".to_string()],
-        cache: "true".to_string(),
-        preview: true,
-        ..default_args()
-    };
+    let args = [
+        "--only",
+        "Layout/TrailingWhitespace",
+        "--cache",
+        "true",
+        "--preview",
+        "--force-default-config",
+    ];
 
     // First run: should detect trailing whitespace
-    let result1 = run_linter(
-        &discovered(&[file.clone()]),
-        &config,
-        &registry,
-        &args,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
-    );
+    let result1 = run_nitrocop_json(&dir, Some(&cache_dir), &args);
     assert_eq!(
-        result1.diagnostics.len(),
-        1,
+        result1["offenses"].as_array().map(Vec::len),
+        Some(1),
         "Should detect trailing whitespace"
     );
 
@@ -4390,77 +4393,61 @@ fn cache_invalidated_by_file_change() {
     fs::write(&file, b"x = 1\n").unwrap();
 
     // Second run: file changed, cache should miss, no offense
-    let result2 = run_linter(
-        &discovered(&[file.clone()]),
-        &config,
-        &registry,
-        &args,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
-    );
+    let result2 = run_nitrocop_json(&dir, Some(&cache_dir), &args);
     assert_eq!(
-        result2.diagnostics.len(),
-        0,
+        result2["offenses"].as_array().map(Vec::len),
+        Some(0),
         "After fix, should find no offenses"
     );
 
-    unsafe { std::env::remove_var("NITROCOP_CACHE_DIR") };
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn cache_invalidated_by_config_change() {
     let dir = temp_dir("cache_config_change");
-    let file = write_file(&dir, "test.rb", b"x = 1 \n");
+    write_file(&dir, "test.rb", b"x = 1 \n");
 
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    unsafe { std::env::set_var("NITROCOP_CACHE_DIR", &cache_dir) };
-
-    let config = load_config(None, Some(dir.as_path()), None).unwrap();
-    let registry = CopRegistry::default_registry();
 
     // Run with --only TrailingWhitespace
-    let args1 = Args {
-        only: vec!["Layout/TrailingWhitespace".to_string()],
-        cache: "true".to_string(),
-        preview: true,
-        ..default_args()
-    };
-    let result1 = run_linter(
-        &discovered(&[file.clone()]),
-        &config,
-        &registry,
-        &args1,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
+    let result1 = run_nitrocop_json(
+        &dir,
+        Some(&cache_dir),
+        &[
+            "--only",
+            "Layout/TrailingWhitespace",
+            "--cache",
+            "true",
+            "--preview",
+            "--force-default-config",
+        ],
     );
-    assert_eq!(result1.diagnostics.len(), 1);
+    assert_eq!(result1["offenses"].as_array().map(Vec::len), Some(1));
 
     // Run with --only a different cop — different session hash, so cache miss
-    let args2 = Args {
-        only: vec!["Style/FrozenStringLiteralComment".to_string()],
-        cache: "true".to_string(),
-        preview: true,
-        ..default_args()
-    };
-    let result2 = run_linter(
-        &discovered(&[file.clone()]),
-        &config,
-        &registry,
-        &args2,
-        &TierMap::load(),
-        &AutocorrectAllowlist::load(),
+    let result2 = run_nitrocop_json(
+        &dir,
+        Some(&cache_dir),
+        &[
+            "--only",
+            "Style/FrozenStringLiteralComment",
+            "--cache",
+            "true",
+            "--preview",
+            "--force-default-config",
+        ],
     );
     // Should get different results (FrozenStringLiteralComment, not TrailingWhitespace)
-    for d in &result2.diagnostics {
+    let empty = vec![];
+    for offense in result2["offenses"].as_array().unwrap_or(&empty) {
         assert_ne!(
-            d.cop_name, "Layout/TrailingWhitespace",
+            offense["cop_name"], "Layout/TrailingWhitespace",
             "Config change should use different session, not return stale cached results"
         );
     }
 
-    unsafe { std::env::remove_var("NITROCOP_CACHE_DIR") };
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -5578,10 +5565,16 @@ fn force_default_config_ignores_config_file() {
     );
 
     // With --force-default-config: config is ignored, cop fires
+    //
+    // `--force-default-config` bypasses the lockfile requirement but NOT the
+    // result cache (they're independently gated in lib.rs/linter.rs), so
+    // `--no-cache` is still required here to avoid touching the developer's
+    // real `~/.cache/nitrocop`.
     let output_force = std::process::Command::new(env!("CARGO_BIN_EXE_nitrocop"))
         .args([
             "--preview",
             "--force-default-config",
+            "--no-cache",
             "--only",
             "Layout/TrailingWhitespace",
             dir.to_str().unwrap(),
