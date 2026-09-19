@@ -25,6 +25,24 @@ use crate::parse::source::SourceFile;
 /// or string (RuboCop's pattern is `({sym str} $_)`).
 ///
 /// This cop is visited by the corpus oracle for both style variants.
+///
+/// ## `NegatedMatcher` (rubocop-rspec 3.10, vendor bump 2026-09)
+///
+/// `NegatedMatcher` (default: none) names an additional matcher method
+/// (e.g. `not_change`) that is checked the same way as the built-in
+/// `change`, so a project's negated-matcher helper (for compound
+/// expectations like `change(Foo, :bar).and not_change(Foo, :baz)`) gets the
+/// same style enforcement. Matches RuboCop's
+/// `matcher_method_names = [:change, negated_matcher&.to_sym].compact`.
+///
+/// Implementing this required parameterizing the diagnostic message on the
+/// actual matcher name instead of the hardcoded `"change"` literal. Doing so
+/// also fixed a pre-existing, unrelated conformance bug in the
+/// `EnforcedStyle: block` message: it previously emitted a generic
+/// placeholder ("Prefer `change { }` over `change(obj, :attr)`.") instead of
+/// RuboCop's fully-rendered `"Prefer `change { obj.attr }`."`. That branch
+/// now renders the real receiver/attribute text, matching upstream for both
+/// the default `change` matcher and any configured `NegatedMatcher`.
 pub struct ExpectChange;
 
 impl Cop for ExpectChange {
@@ -66,6 +84,10 @@ impl Cop for ExpectChange {
     ) {
         // Config: EnforcedStyle — "method_call" (default) or "block"
         let enforced_style = config.get_str("EnforcedStyle", "method_call");
+        // Config: NegatedMatcher (default: none) — an additional method name
+        // (e.g. `not_change`) treated the same as `change` for style checks,
+        // matching RuboCop's `matcher_method_names = [:change, negated_matcher&.to_sym].compact`.
+        let negated_matcher = config.get_str("NegatedMatcher", "");
 
         let call = match node.as_call_node() {
             Some(c) => c,
@@ -76,7 +98,10 @@ impl Cop for ExpectChange {
             return;
         }
 
-        if call.name().as_slice() != b"change" {
+        let matcher_name = std::str::from_utf8(call.name().as_slice()).unwrap_or("");
+        if matcher_name != "change"
+            && (negated_matcher.is_empty() || matcher_name != negated_matcher)
+        {
             return;
         }
 
@@ -92,19 +117,28 @@ impl Cop for ExpectChange {
             }
             // RuboCop's pattern `({sym str} $_)` accepts symbol or string.
             // Accept BOTH symbol and string as the second argument.
-            let is_sym_or_str =
-                arg_list[1].as_symbol_node().is_some() || arg_list[1].as_string_node().is_some();
-            if !is_sym_or_str {
+            let attr_text = if let Some(sym) = arg_list[1].as_symbol_node() {
+                std::str::from_utf8(sym.unescaped())
+                    .unwrap_or("")
+                    .to_string()
+            } else if let Some(str_node) = arg_list[1].as_string_node() {
+                std::str::from_utf8(str_node.unescaped())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
                 return;
-            }
+            };
+            let obj_loc = arg_list[0].location();
+            let obj_text = source.byte_slice(obj_loc.start_offset(), obj_loc.end_offset(), "");
             let loc = call.location();
             let (line, column) = source.offset_to_line_col(loc.start_offset());
             diagnostics.push(self.diagnostic(
                 source,
                 line,
                 column,
-                "Prefer `change { }` over `change(obj, :attr)`.".to_string(),
+                format!("Prefer `{matcher_name} {{ {obj_text}.{attr_text} }}`."),
             ));
+            return;
         }
 
         // Default: "method_call" style — flag `change { User.count }`
@@ -184,7 +218,7 @@ impl Cop for ExpectChange {
             source,
             line,
             column,
-            format!("Prefer `change({recv_text}, :{method})`."),
+            format!("Prefer `{matcher_name}({recv_text}, :{method})`."),
         ));
     }
 }
@@ -193,6 +227,7 @@ impl Cop for ExpectChange {
 mod tests {
     use super::*;
     crate::cop_fixture_tests!(ExpectChange, "cops/rspec/expect_change");
+    crate::cop_variant_fixture_tests!(ExpectChange, "cops/rspec/expect_change", negated_matcher,);
 
     #[test]
     fn block_style_flags_method_call_form() {
@@ -209,7 +244,7 @@ mod tests {
         let source = b"expect { x }.to change(User, :count)\n";
         let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
         assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("change { }"));
+        assert_eq!(diags[0].message, "Prefer `change { User.count }`.");
     }
 
     #[test]
@@ -300,5 +335,120 @@ mod tests {
             1,
             "String second arg should be flagged in block style"
         );
+    }
+
+    fn config_with(options: std::collections::HashMap<String, serde_yml::Value>) -> CopConfig {
+        CopConfig {
+            options,
+            ..CopConfig::default()
+        }
+    }
+
+    #[test]
+    fn negated_matcher_flags_block_form_with_method_call_style() {
+        use std::collections::HashMap;
+
+        let config = config_with(HashMap::from([
+            (
+                "EnforcedStyle".into(),
+                serde_yml::Value::String("method_call".into()),
+            ),
+            (
+                "NegatedMatcher".into(),
+                serde_yml::Value::String("not_change".into()),
+            ),
+        ]));
+        let source = b"expect { run }.to not_change { User.count }\n";
+        let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "Prefer `not_change(User, :count)`.");
+    }
+
+    #[test]
+    fn negated_matcher_flags_both_sides_of_compound_expectation() {
+        use std::collections::HashMap;
+
+        let config = config_with(HashMap::from([
+            (
+                "EnforcedStyle".into(),
+                serde_yml::Value::String("method_call".into()),
+            ),
+            (
+                "NegatedMatcher".into(),
+                serde_yml::Value::String("not_change".into()),
+            ),
+        ]));
+        let source = b"expect { run }.to change { Foo.bar }.and not_change { Foo.baz }\n";
+        let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].message, "Prefer `change(Foo, :bar)`.");
+        assert_eq!(diags[1].message, "Prefer `not_change(Foo, :baz)`.");
+    }
+
+    #[test]
+    fn negated_matcher_ignores_matching_method_call_style() {
+        use std::collections::HashMap;
+
+        let config = config_with(HashMap::from([
+            (
+                "EnforcedStyle".into(),
+                serde_yml::Value::String("method_call".into()),
+            ),
+            (
+                "NegatedMatcher".into(),
+                serde_yml::Value::String("not_change".into()),
+            ),
+        ]));
+        let source = b"expect { run }.to change(Foo, :bar).and not_change(Foo, :baz)\n";
+        let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn negated_matcher_flags_method_call_form_with_block_style() {
+        use std::collections::HashMap;
+
+        let config = config_with(HashMap::from([
+            (
+                "EnforcedStyle".into(),
+                serde_yml::Value::String("block".into()),
+            ),
+            (
+                "NegatedMatcher".into(),
+                serde_yml::Value::String("not_change".into()),
+            ),
+        ]));
+        let source = b"expect { run }.to not_change(User, :count)\n";
+        let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "Prefer `not_change { User.count }`.");
+    }
+
+    #[test]
+    fn negated_matcher_ignores_matching_block_style() {
+        use std::collections::HashMap;
+
+        let config = config_with(HashMap::from([
+            (
+                "EnforcedStyle".into(),
+                serde_yml::Value::String("block".into()),
+            ),
+            (
+                "NegatedMatcher".into(),
+                serde_yml::Value::String("not_change".into()),
+            ),
+        ]));
+        let source = b"expect { run }.to change { Foo.bar }.and not_change { Foo.baz }\n";
+        let diags = crate::testutil::run_cop_full_with_config(&ExpectChange, source, config);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn no_negated_matcher_configured_ignores_other_matcher_names() {
+        // Without NegatedMatcher set, a call named `not_change` is just an
+        // ordinary method call — not recognized as a change-style matcher.
+        let source = b"expect { run }.to not_change { User.count }\n";
+        let diags = crate::testutil::run_cop_full(&ExpectChange, source);
+        assert!(diags.is_empty());
     }
 }
