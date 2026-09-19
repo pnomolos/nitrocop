@@ -10,6 +10,7 @@ pub mod lexer;
 pub mod mapping;
 pub mod parser;
 pub mod pattern_db;
+pub mod predicates;
 
 pub use captures::{CaptureValue, Captures, MatchEnv};
 pub use extract::{
@@ -19,3 +20,4 @@ pub use interpreter::{CompiledPattern, interpret_pattern, match_with_captures};
 pub use lexer::{Lexer, Token};
 pub use mapping::{NodeMapping, build_mapping_table};
 pub use parser::{Parser, PatternError, PatternNode, pattern_summary};
+pub use predicates::{Arg, Arity, Builtin, PredCtx, PredTarget};
