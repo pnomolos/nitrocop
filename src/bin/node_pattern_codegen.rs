@@ -218,13 +218,16 @@ impl CodeGenerator {
                 let fail = if self.has_captures { "None" } else { "false" };
                 self.writeln(&format!("if {var} != b\"{s}\" {{ return {fail}; }}"));
             }
-            PatternNode::HelperCall(name) => {
+            PatternNode::HelperCall { name, .. } | PatternNode::Predicate { name, .. } => {
                 let fail = if self.has_captures { "None" } else { "false" };
                 let fn_name = name.trim_end_matches('?');
                 self.writeln(&format!("if !{fn_name}(&{var}) {{ return {fail}; }}"));
                 if !self.helper_stubs.contains(&fn_name.to_string()) {
                     self.helper_stubs.push(fn_name.to_string());
                 }
+            }
+            PatternNode::Regexp { body, flags } => {
+                self.writeln(&format!("// TODO: regexp literal /{body}/{flags}"));
             }
             PatternNode::Capture { inner, .. } => {
                 let cap_idx = self.capture_count;
@@ -263,12 +266,13 @@ impl CodeGenerator {
                     self.writeln(&format!("// Unknown type predicate: {typ}?"));
                 }
             }
-            PatternNode::ParamRef(param) => {
+            PatternNode::ParamNumber(_)
+            | PatternNode::ParamNamed(_)
+            | PatternNode::ParamConst(_) => {
                 let fail = if self.has_captures { "None" } else { "false" };
-                self.writeln(&format!("// TODO: parameter reference %{param}"));
-                self.writeln(&format!(
-                    "// if {var} != param_{param} {{ return {fail}; }}"
-                ));
+                let param = pattern_summary(node);
+                self.writeln(&format!("// TODO: parameter reference {param}"));
+                self.writeln(&format!("// if {var} != param {{ return {fail}; }}"));
             }
             PatternNode::ParentRef(inner) => {
                 self.writeln("// TODO: parent node reference (^)");
@@ -493,7 +497,7 @@ impl CodeGenerator {
                 self.writeln(&format!("let {temp_var} = {parent_var}.{accessor};"));
                 self.generate_node_check(inner, &temp_var, false);
             }
-            PatternNode::HelperCall(name) => {
+            PatternNode::HelperCall { name, .. } => {
                 let fn_name = name.trim_end_matches('?');
                 self.writeln(&format!("let {child_var} = {parent_var}.{accessor};"));
                 self.writeln(&format!("if !{fn_name}(&{child_var}) {{ return {fail}; }}"));
@@ -620,7 +624,7 @@ impl CodeGenerator {
                         self.writeln("}");
                     }
                 }
-                PatternNode::HelperCall(name) => {
+                PatternNode::HelperCall { name, .. } => {
                     let fn_name = name.trim_end_matches('?');
                     self.writeln(&format!("if {fn_name}(&{var}) {{ matched = true; }}"));
                     if !self.helper_stubs.contains(&fn_name.to_string()) {
@@ -698,7 +702,7 @@ impl CodeGenerator {
                     self.writeln(&format!("// Negation of unmapped type: {node_type}"));
                 }
             }
-            PatternNode::HelperCall(name) => {
+            PatternNode::HelperCall { name, .. } => {
                 let fn_name = name.trim_end_matches('?');
                 self.writeln(&format!("if {fn_name}(&{var}) {{ return {fail}; }}"));
                 if !self.helper_stubs.contains(&fn_name.to_string()) {

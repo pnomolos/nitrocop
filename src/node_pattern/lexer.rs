@@ -24,12 +24,39 @@ pub enum Token {
     TruePredicate,         // true?
     FalsePredicate,        // false?
     TypePredicate(String), // int?, str?, sym?, etc.
-    Ident(String),         // node type names: send, block, def, etc.
-    ParamRef(String),      // %1, %param
-    Caret,                 // ^ (parent node ref)
-    Backtick,              // ` (descend operator)
-    LAngle,                // < (any-order group)
-    RAngle,                // > (any-order group)
+    /// A node predicate method call — `lexer.rex`'s `tPREDICATE`
+    /// (`IDENTIFIER?`), sent to the *matched node*.
+    ///
+    /// The name keeps its `?`. Type predicates (`send_type?`, `nil?`, …) are
+    /// lexed as [`Token::TypePredicate`] / [`Token::NilPredicate`] instead.
+    Predicate(String),
+    Ident(String), // node type names: send, block, def, etc.
+    /// `%1`, or a bare `%` — `lexer.rex`'s `tPARAM_NUMBER`, which maps `%` to
+    /// `%1`. The value is the 1-based positional parameter index; `%0` exists
+    /// too and stays 0.
+    ParamNumber(usize),
+    /// `%name` — `lexer.rex`'s `tPARAM_NAMED` (`%[a-z_]+`).
+    ParamNamed(String),
+    /// `%Const` or a bare `Const` — `lexer.rex`'s `tPARAM_CONST`
+    /// (`%?([A-Z:][a-zA-Z_:]+)`; the `%` is optional, so `RuboCop::AST::Node`
+    /// on its own is a constant reference too).
+    ParamConst(String),
+    /// `/body/flags` — `lexer.rex`'s `tREGEXP`.
+    Regexp {
+        /// The regexp source between the slashes, escapes intact.
+        body: String,
+        /// The `imxo` flag letters that followed the closing slash.
+        flags: String,
+    },
+    /// `(` opening a function-call/predicate argument list — `lexer.rex`'s
+    /// `tARG_LIST`, emitted only in the `:ARG` state, i.e. when the `(`
+    /// immediately follows `#call` or `pred?` with no intervening whitespace.
+    ArgList,
+    Comma,    // , between arguments
+    Caret,    // ^ (parent node ref)
+    Backtick, // ` (descend operator)
+    LAngle,   // < (any-order group)
+    RAngle,   // > (any-order group)
 }
 
 pub struct Lexer<'a> {
@@ -97,10 +124,84 @@ impl<'a> Lexer<'a> {
         ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-'
     }
 
+    /// A byte that can appear inside `CONST_NAME` (`/[A-Z:][a-zA-Z_:]+/`).
+    fn is_const_char(ch: u8) -> bool {
+        ch.is_ascii_alphabetic() || ch == b'_' || ch == b':'
+    }
+
+    /// Read `CONST_NAME` at the cursor, or `None` when what follows is too
+    /// short to be one (the macro needs at least two characters).
+    fn read_const_name(&mut self) -> Option<String> {
+        let start = self.pos;
+        let name = self.read_while(Self::is_const_char);
+        if name.len() >= 2 {
+            Some(name)
+        } else {
+            self.pos = start;
+            None
+        }
+    }
+
+    /// Lex the three `%param` forms, cursor just past the `%`.
+    ///
+    /// `lexer.rex` tries them in this order: `%?(CONST_NAME)` → `tPARAM_CONST`,
+    /// `%([a-z_]+)` → `tPARAM_NAMED`, `%(\d*)` → `tPARAM_NUMBER` with an empty
+    /// digit run meaning `1`.
+    fn read_param(&mut self) -> Token {
+        if self
+            .peek()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == b':')
+            && let Some(name) = self.read_const_name()
+        {
+            return Token::ParamConst(name);
+        }
+        if self
+            .peek()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+        {
+            let name = self.read_while(|c| c.is_ascii_lowercase() || c == b'_');
+            return Token::ParamNamed(name);
+        }
+        let digits = self.read_while(|c| c.is_ascii_digit());
+        // `lexer.rex`: `emit(:tPARAM_NUMBER) { |s| s.empty? ? 1 : s.to_i }`.
+        Token::ParamNumber(digits.parse::<usize>().unwrap_or(1))
+    }
+
+    /// Lex `/body/flags` at the cursor, or `None` when there is no closing
+    /// slash (in which case the caller falls back to skipping the byte).
+    ///
+    /// `lexer.rex`: `REGEXP = /\/(#{REGEXP_BODY})(?<!\\)\/([imxo]*)/`.
+    fn read_regexp(&mut self) -> Option<Token> {
+        let start = self.pos + 1;
+        let mut end = start;
+        loop {
+            match self.input.get(end) {
+                None => return None,
+                Some(b'\\') => end += 2,
+                Some(b'/') => break,
+                Some(_) => end += 1,
+            }
+        }
+        let body = String::from_utf8_lossy(&self.input[start..end]).into_owned();
+        self.pos = end + 1;
+        let flags = self.read_while(|c| b"imxo".contains(&c));
+        Some(Token::Regexp { body, flags })
+    }
+
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
+        // `lexer.rex`'s `:ARG` state: set right after `tFUNCTION_CALL` /
+        // `tPREDICATE`, and cleared by the very next scan. Only a `(` that
+        // follows with no whitespace is an argument list; `#fn (seq)` is a
+        // call followed by a sequence.
+        let mut arg_state = false;
 
         loop {
+            if std::mem::take(&mut arg_state) && self.peek() == Some(b'(') {
+                self.advance();
+                tokens.push(Token::ArgList);
+                continue;
+            }
             self.skip_whitespace();
             let Some(ch) = self.peek() else { break };
 
@@ -189,6 +290,7 @@ impl<'a> Lexer<'a> {
                             );
                         }
                         tokens.push(Token::HelperCall(name));
+                        arg_state = true;
                     } else if self.peek() == Some(b'{') {
                         // Ruby string interpolation left in a pattern extracted
                         // from vendor source: skip the whole `#{...}` so the
@@ -218,8 +320,19 @@ impl<'a> Lexer<'a> {
                 }
                 b'%' => {
                     self.advance();
-                    let param = self.read_while(|c| c.is_ascii_alphanumeric() || c == b'_');
-                    tokens.push(Token::ParamRef(param));
+                    let param = self.read_param();
+                    tokens.push(param);
+                }
+                b',' => {
+                    self.advance();
+                    tokens.push(Token::Comma);
+                }
+                b'/' => {
+                    if let Some(regexp) = self.read_regexp() {
+                        tokens.push(regexp);
+                    } else {
+                        self.advance();
+                    }
                 }
                 b'\'' | b'"' => {
                     let quote = self.advance().unwrap();
@@ -252,6 +365,18 @@ impl<'a> Lexer<'a> {
                         tokens.push(Token::Ident(num_str));
                     }
                 }
+                // `CONST_NAME` without a leading `%`: `lexer.rex` makes the
+                // `%` optional (`/%?(#{CONST_NAME})/`), so a bare constant
+                // path is a `tPARAM_CONST` too. `NODE_TYPE`/`IDENTIFIER` both
+                // start lowercase, so an uppercase word can only be this.
+                _ if ch.is_ascii_uppercase() => {
+                    if let Some(name) = self.read_const_name() {
+                        tokens.push(Token::ParamConst(name));
+                    } else {
+                        let word = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        tokens.push(Token::Ident(word));
+                    }
+                }
                 _ if ch.is_ascii_alphabetic() => {
                     let word = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
                     match word.as_str() {
@@ -269,6 +394,13 @@ impl<'a> Lexer<'a> {
                             // Generic _type? predicate: strip `_type?` suffix
                             let stem = &word[..word.len() - 6]; // strip "_type?"
                             tokens.push(Token::TypePredicate(stem.replace('-', "_")));
+                        }
+                        // `IDENTIFIER?` is `tPREDICATE`: a method sent to the
+                        // matched node, and the one other token that opens an
+                        // argument list.
+                        _ if word.ends_with('?') => {
+                            tokens.push(Token::Predicate(word));
+                            arg_state = true;
                         }
                         // RuboCop compiles a node type to `#{type.tr('-', '_')}_type?`
                         // (`node_pattern_subcompiler.rb:88-90`), so `block-pass`
@@ -368,10 +500,142 @@ mod tests {
     }
 
     #[test]
-    fn test_lexer_param_ref() {
-        let mut lexer = Lexer::new("%1");
+    fn test_lexer_param_number() {
+        for (input, expected) in [("%1", 1), ("%2", 2), ("%0", 0), ("%", 1), ("%12", 12)] {
+            let mut lexer = Lexer::new(input);
+            assert_eq!(
+                lexer.tokenize(),
+                vec![Token::ParamNumber(expected)],
+                "failed for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lexer_param_named() {
+        let mut lexer = Lexer::new("%method_name");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::ParamNamed("method_name".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_lexer_param_const() {
+        for input in ["%RESTRICT_ON_SEND", "RESTRICT_ON_SEND"] {
+            let mut lexer = Lexer::new(input);
+            assert_eq!(
+                lexer.tokenize(),
+                vec![Token::ParamConst("RESTRICT_ON_SEND".to_string())],
+                "failed for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lexer_param_const_keeps_the_whole_path() {
+        // `CONST_NAME` is `/[A-Z:][a-zA-Z_:]+/`, so `::` stays inside the token.
+        let mut lexer = Lexer::new("%RuboCop::AST::Node::VARIABLES");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::ParamConst(
+                "RuboCop::AST::Node::VARIABLES".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_lexer_arg_list_needs_no_whitespace() {
+        // `#fn(arg)` is a call with an argument list…
+        let mut lexer = Lexer::new("#global_const?(:Proc)");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::HelperCall("global_const?".to_string()),
+                Token::ArgList,
+                Token::SymbolLiteral("Proc".to_string()),
+                Token::RParen,
+            ]
+        );
+        // …while `#fn (seq)` is a call followed by a sequence.
+        let mut lexer = Lexer::new("#foo (send nil? :bar)");
         let tokens = lexer.tokenize();
-        assert_eq!(tokens, vec![Token::ParamRef("1".to_string())]);
+        assert_eq!(tokens[0], Token::HelperCall("foo".to_string()));
+        assert_eq!(tokens[1], Token::LParen);
+    }
+
+    #[test]
+    fn test_lexer_arg_list_commas() {
+        let mut lexer = Lexer::new("#belongs_to?(%1, :foo)");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::HelperCall("belongs_to?".to_string()),
+                Token::ArgList,
+                Token::ParamNumber(1),
+                Token::Comma,
+                Token::SymbolLiteral("foo".to_string()),
+                Token::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_node_predicate_and_its_arg_list() {
+        let mut lexer = Lexer::new("method?(:freeze)");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::Predicate("method?".to_string()),
+                Token::ArgList,
+                Token::SymbolLiteral("freeze".to_string()),
+                Token::RParen,
+            ]
+        );
+        // A bare predicate stays a predicate…
+        let mut lexer = Lexer::new("literal?");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::Predicate("literal?".to_string())]
+        );
+        // …but type predicates keep their own token.
+        let mut lexer = Lexer::new("str_type?");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![Token::TypePredicate("str".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_lexer_sequence_after_predicate_is_not_an_arg_list() {
+        let mut lexer = Lexer::new("[literal? (send nil? :foo)]");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[1], Token::Predicate("literal?".to_string()));
+        assert_eq!(tokens[2], Token::LParen);
+    }
+
+    #[test]
+    fn test_lexer_regexp_literal() {
+        let mut lexer = Lexer::new("(str /^foo$/i)");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::LParen,
+                Token::Ident("str".to_string()),
+                Token::Regexp {
+                    body: "^foo$".to_string(),
+                    flags: "i".to_string(),
+                },
+                Token::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_division_symbol_is_not_a_regexp() {
+        let mut lexer = Lexer::new("(send _ :/ _)");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[3], Token::SymbolLiteral("/".to_string()));
     }
 
     #[test]
