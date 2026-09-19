@@ -21,12 +21,17 @@ Planning branch, not for upstream. Read this first when resuming.
 | # | Stream | State |
 |---|--------|-------|
 | W0 | Corpus oracle baseline on fork (run 35413735947, branch ci/corpus-oracle-optional-app-token, PR #1) | running |
-| W1 | Vendor bump to latest (scope doc pending) | scoping |
+| W1 | Vendor bump to latest: PR #2 (bump only, config_audit red on 8 new options) + stacked PR implementing the 8 options (branch vendor/new-cop-options) | PRs open |
 | W2 | Fix remaining diverging cops from fresh oracle | blocked on W0 |
-| W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafting |
-| W4 | node_pattern completion PRs | blocked on W3 |
+| W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
+| W4 | node_pattern completion PRs (PR1 captures in progress, branch np/real-captures; then `<>`+mapping, predicate registry, `#helper`/`%param`, ancestors) | PR1 in progress |
 | W5 | IR loader/interpreter MVP | blocked on W4 |
 | W6 | Translator scripts + pilot on 23 new cops | blocked on W1, W5 |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
+- #2 vendor: bump rubocop 1.91.0 / rails 2.37.0 / rspec 3.10.2 / performance 1.27.0 / ast 1.50.0 (see 05-vendor-bump-scope.md; 280 implemented cops have upstream behavior changes; oracle re-run on main after merge measures drift)
+
+## Sequencing notes
+- After #2 merges: dispatch corpus oracle on main, then triage drift (W2). Three cops replicate RuboCop 1.84 crashes that upstream fixed: Layout/HashAlignment, Layout/IndentationWidth, Lint/LiteralAsCondition.
+- 5 of the 23 new cops need a cross-file symbol index (ProjectIndexHelp): Lint/ArgumentMismatch, DeprecatedReference, NameTypo, SuperArgumentMismatch, UnusedPrivateMethod. Needs an owner decision; not IR work.
