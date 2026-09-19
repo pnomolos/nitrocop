@@ -151,6 +151,36 @@ pub enum PatternError {
         /// The supported maximum, [`ANY_ORDER_MAX_TERMS`].
         max: usize,
     },
+    /// The pattern did not parse and no more specific error was recorded.
+    Syntax,
+    /// `#name` resolved to neither an owner-supplied matcher nor a builtin.
+    ///
+    /// Upstream this is a `NoMethodError` the first time the pattern runs;
+    /// here it is a compile error, so a cop-local helper can never be silently
+    /// treated as "always true".
+    UnknownHelper {
+        /// The name as written, without the `#`.
+        name: String,
+    },
+    /// `name?` is not a predicate `RuboCop::AST::Node` defines.
+    UnknownPredicate {
+        /// The name as written, `?` included.
+        name: String,
+    },
+    /// `%Const` (or a bare `Const`) that the resolver does not know.
+    UnknownConstant {
+        /// The constant path as written, without the `%`.
+        name: String,
+    },
+    /// A builtin was called with the wrong number of arguments.
+    PredicateArity {
+        /// The predicate name.
+        name: String,
+        /// Arguments the registry entry declares.
+        expected: usize,
+        /// Arguments the pattern passed.
+        found: usize,
+    },
 }
 
 /// Maximum number of non-rest terms a `<>` any-order group may declare.
@@ -169,6 +199,25 @@ impl std::fmt::Display for PatternError {
             PatternError::AnyOrderTooManyTerms { found, max } => write!(
                 f,
                 "<> any-order group has {found} terms, more than the supported maximum of {max}"
+            ),
+            PatternError::Syntax => write!(f, "pattern does not parse"),
+            PatternError::UnknownHelper { name } => write!(
+                f,
+                "unknown helper `#{name}`: not a builtin predicate, and the resolver supplied no matcher for it"
+            ),
+            PatternError::UnknownPredicate { name } => {
+                write!(f, "unknown node predicate `{name}`")
+            }
+            PatternError::UnknownConstant { name } => {
+                write!(f, "unknown constant `%{name}`")
+            }
+            PatternError::PredicateArity {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "`{name}` takes {expected} argument(s), but the pattern passed {found}"
             ),
         }
     }

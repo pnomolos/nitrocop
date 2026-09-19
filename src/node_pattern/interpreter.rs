@@ -32,15 +32,26 @@
 //! - A pattern list without `...` still tolerates extra trailing children,
 //!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
+//! ## Resolution
+//!
+//! `pred?` resolves against the builtin registry ([`super::predicates`]);
+//! `#helper` gives the owner's [`Resolver`] first refusal and falls back to the
+//! registry, so the matchers `node.rb` defines on `Node` itself (`#literal?`,
+//! `#global_const?`) work with no owner at all. `%1` / `%name` come from
+//! [`Params`], `%Const` from the resolver. A name nothing explains is a
+//! **compile error** ([`PatternError::UnknownHelper`] and friends), never a
+//! silent `true`.
+//!
 //! ## Deferred
 //!
-//! HelperCall (#method) and ParamRef (%1) always return true (optimistic).
-//! ParentRef (^) and DescendRef (`) always return true. Captures nested under
+//! ParentRef (^) and DescendRef (`) still return true. Captures nested under
 //! those stubs are bound optimistically too.
 
 use super::captures::{CaptureValue, Captures, MatchEnv, dup_node};
 use super::lexer::Lexer;
-use super::parser::{Parser, PatternNode};
+use super::parser::{Parser, PatternError, PatternNode};
+use super::predicates::{self, Arg, Arity, PredCtx, PredTarget};
+use super::resolve::{NoResolver, Params, Resolver};
 
 /// A child slot in the NodePattern positional matching.
 ///
@@ -70,51 +81,322 @@ pub enum MatchChild<'pr> {
     },
 }
 
-/// What a not-yet-resolved term is being evaluated against.
+/// Evaluate a term whose meaning comes from outside the pattern text.
 ///
-/// The four match dispatchers ([`matches_node`], [`matches_absent`],
-/// [`matches_name`], [`matches_synthetic`]) each hand their target to
-/// [`matches_deferred`], so the terms that still evaluate optimistically live
-/// in exactly one place.
-// The payloads are the seam the resolution PR plugs into; this PR only needs
-// the four dispatchers to agree on one shape.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum PredTarget<'a, 'pr> {
-    /// A present AST node.
-    Node(&'a ruby_prism::Node<'pr>),
-    /// An absent child (`nil?`'s target).
-    Absent,
-    /// A name or value byte slice (method name, symbol value, …).
-    Name(&'a [u8]),
-    /// A Parser-gem child Prism does not materialize.
-    Synthetic {
-        /// The Parser-gem type this stands in for.
-        parser_type: &'static str,
-        /// The value the synthesized node carries.
-        value: &'a [u8],
-    },
+/// This is the single seam the four match dispatchers ([`matches_node`],
+/// [`matches_absent`], [`matches_name`], [`matches_synthetic`]) route their
+/// unresolved terms through.
+///
+/// - `pred?` is a method on the matched node, so it resolves against the
+///   builtin registry only (`node_pattern_subcompiler.rb:80-82`).
+/// - `#helper` is a method on the pattern's owner, so the resolver gets first
+///   refusal; a name the owner does not claim falls back to the registry,
+///   which is what makes `#global_const?(:Proc)` work for the matchers
+///   `node.rb` defines on `Node` itself (`:84-86`).
+/// - `%param` / `%Const` / a regexp are atoms compared with `===` against the
+///   child slot (`:107-109`).
+/// - `^` and `` ` `` are still optimistic; the ancestors PR replaces them.
+///
+/// Every name reaching here has already been accepted by
+/// [`collect_unresolved`] at compile time, so an unknown name is an internal
+/// inconsistency and fails closed rather than matching.
+fn matches_deferred<'pr>(
+    pattern: &PatternNode,
+    target: &PredTarget<'_, 'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    // Capture discipline: a `$` nested inside an argument list still owns a
+    // slot, so a rejected attempt unwinds like any other.
+    let mark = env.mark();
+    if eval_deferred(pattern, target, env) {
+        return true;
+    }
+    env.rollback(mark);
+    false
 }
 
-/// Evaluate a term whose resolution is not implemented yet.
+/// [`matches_deferred`] without the capture bookkeeping.
+fn eval_deferred<'pr>(
+    pattern: &PatternNode,
+    target: &PredTarget<'_, 'pr>,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    match pattern {
+        PatternNode::Predicate { name, args } => {
+            let Some(builtin) = predicates::lookup(name) else {
+                return false;
+            };
+            let args = eval_args(args, env);
+            (builtin.eval)(&PredCtx::empty(), target, &args)
+        }
+        PatternNode::HelperCall { name, args } => {
+            let resolver = env.resolver();
+            let args = eval_args(args, env);
+            if let Some(matcher) = resolver.matcher(name) {
+                // A named matcher is itself a pattern: its `%1` is this call's
+                // first argument, and its captures are its own. It is applied
+                // to the child slot, which may be a name rather than a node —
+                // rubocop-rspec's `#Examples.all` takes the method symbol.
+                return matcher.matches_target(target, &Params::positional(args), resolver);
+            }
+            let Some(builtin) = predicates::lookup(name) else {
+                return false;
+            };
+            (builtin.eval)(&PredCtx::empty(), target, &args)
+        }
+        PatternNode::ParamNumber(number) => {
+            let arg = env.positional_param(*number);
+            arg_matches_target(&arg, target)
+        }
+        PatternNode::ParamNamed(name) => {
+            let arg = env.named_param(name);
+            arg_matches_target(&arg, target)
+        }
+        PatternNode::ParamConst(name) => {
+            let arg = env
+                .resolver()
+                .constant(name)
+                .cloned()
+                .unwrap_or(Arg::Unresolved);
+            arg_matches_target(&arg, target)
+        }
+        PatternNode::Regexp { body, flags } => arg_matches_target(
+            &Arg::Regexp {
+                body: body.clone(),
+                flags: flags.clone(),
+            },
+            target,
+        ),
+        PatternNode::ParentRef(_) | PatternNode::DescendRef(_) => true,
+        _ => false,
+    }
+}
+
+/// Reduce a `#call` / `pred?` argument to an atom.
 ///
-/// `#call`, `pred?`, `%param`, a regexp atom, `^` and `` ` `` all still answer
-/// `true` optimistically, as they did before they were consolidated here. Any
-/// other pattern reaching this function is a term the caller's own arms should
-/// have handled, so it answers `false`.
-fn matches_deferred(pattern: &PatternNode, target: &PredTarget<'_, '_>) -> bool {
-    let _ = target;
-    matches!(
-        pattern,
-        PatternNode::HelperCall { .. }
-            | PatternNode::Predicate { .. }
-            | PatternNode::ParamNumber(_)
-            | PatternNode::ParamNamed(_)
-            | PatternNode::ParamConst(_)
-            | PatternNode::Regexp { .. }
-            | PatternNode::ParentRef(_)
-            | PatternNode::DescendRef(_)
-    )
+/// Upstream compiles arguments with the `AtomSubcompiler`
+/// (`compiler/atom_subcompiler.rb`): literals stay literals, a `{}` of
+/// literals becomes a `Set`, and a `%param` becomes whatever the caller
+/// passed. Anything that is not an atom (a nested sequence, say) upstream
+/// turns into a lambda; here it is [`Arg::Unresolved`], which never matches.
+fn eval_arg(pattern: &PatternNode, env: &MatchEnv<'_, '_>) -> Arg {
+    match pattern {
+        PatternNode::SymbolLiteral(name) => Arg::Symbol(name.clone()),
+        PatternNode::StringLiteral(text) => Arg::Str(text.clone()),
+        PatternNode::IntLiteral(value) => Arg::Int(*value),
+        PatternNode::FloatLiteral(text) => text.parse::<f64>().map_or(Arg::Unresolved, Arg::Float),
+        PatternNode::Regexp { body, flags } => Arg::Regexp {
+            body: body.clone(),
+            flags: flags.clone(),
+        },
+        // A node type used as an atom is a bare name, e.g. `#foo(bar)`.
+        PatternNode::Ident(name) => Arg::Symbol(name.clone()),
+        PatternNode::Alternatives(alts) => {
+            Arg::Set(alts.iter().map(|alt| eval_arg(alt, env)).collect())
+        }
+        PatternNode::ParamNumber(number) => env.positional_param(*number),
+        PatternNode::ParamNamed(name) => env.named_param(name),
+        PatternNode::ParamConst(name) => env
+            .resolver()
+            .constant(name)
+            .cloned()
+            .unwrap_or(Arg::Unresolved),
+        _ => Arg::Unresolved,
+    }
+}
+
+/// Reduce a whole argument list.
+fn eval_args(args: &[PatternNode], env: &MatchEnv<'_, '_>) -> Vec<Arg> {
+    args.iter().map(|arg| eval_arg(arg, env)).collect()
+}
+
+/// `arg === access_element` — how upstream matches a parameter, a constant or
+/// a regexp against the child slot (`node_pattern_subcompiler.rb:107-109`).
+fn arg_matches_target(arg: &Arg, target: &PredTarget<'_, '_>) -> bool {
+    if let Arg::Unresolved = arg {
+        return false;
+    }
+    if let Some(bytes) = target.value_bytes() {
+        return arg.accepts_value(bytes);
+    }
+    let Some(node) = target.node() else {
+        return false;
+    };
+    match arg {
+        // A `Set`/literal compared against a node only matches when the node
+        // is the corresponding literal, which is what `===` does in Ruby.
+        Arg::Set(items) => items.iter().any(|item| arg_matches_target(item, target)),
+        Arg::Int(value) => {
+            literal_text(node).and_then(|text| text.parse::<i64>().ok()) == Some(*value)
+        }
+        Arg::Float(value) => {
+            literal_text(node).and_then(|text| text.parse::<f64>().ok()) == Some(*value)
+        }
+        Arg::Symbol(_) | Arg::Str(_) | Arg::Regexp { .. } => {
+            literal_bytes(node).is_some_and(|bytes| arg.accepts_value(bytes))
+        }
+        Arg::Unresolved => false,
+    }
+}
+
+/// The decoded value of a literal node, for comparison against an atom.
+fn literal_bytes<'pr>(node: &ruby_prism::Node<'pr>) -> Option<&'pr [u8]> {
+    if let Some(string) = node.as_string_node() {
+        return Some(string.content_loc().as_slice());
+    }
+    if let Some(symbol) = node.as_symbol_node() {
+        return symbol
+            .value_loc()
+            .map(|loc| loc.as_slice())
+            .or_else(|| Some(symbol.location().as_slice()));
+    }
+    if let Some(constant) = node.as_constant_read_node() {
+        return Some(constant.name().as_slice());
+    }
+    None
+}
+
+/// Source text of a numeric literal node, underscores stripped by the caller.
+fn literal_text(node: &ruby_prism::Node<'_>) -> Option<String> {
+    if node.as_integer_node().is_none() && node.as_float_node().is_none() {
+        return None;
+    }
+    std::str::from_utf8(node.location().as_slice())
+        .ok()
+        .map(|text| text.replace('_', ""))
+}
+
+/// A name a pattern refers to but neither the registry nor the resolver knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    /// `#name` — a cop-local matcher the resolver did not supply.
+    Helper(String),
+    /// `name?` — a node predicate with no registry entry.
+    Predicate(String),
+    /// `%Const` / bare `Const` — a constant the resolver did not supply.
+    Constant(String),
+}
+
+impl Unresolved {
+    /// The bare name, without its sigil.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Unresolved::Helper(name) | Unresolved::Predicate(name) | Unresolved::Constant(name) => {
+                name
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unresolved::Helper(name) => write!(f, "#{name}"),
+            Unresolved::Predicate(name) => write!(f, "{name}"),
+            Unresolved::Constant(name) => write!(f, "%{name}"),
+        }
+    }
+}
+
+/// Walk `pattern` and collect every name `resolver` and the builtin registry
+/// both fail to explain, in source order.
+///
+/// This is the compile-time check that turns an unknown helper into an error
+/// instead of a silent `true`.
+pub fn collect_unresolved(
+    pattern: &PatternNode,
+    resolver: &dyn Resolver,
+    out: &mut Vec<Unresolved>,
+) {
+    match pattern {
+        PatternNode::Predicate { name, args } => {
+            if predicates::lookup(name).is_none() {
+                out.push(Unresolved::Predicate(name.clone()));
+            }
+            for arg in args {
+                collect_unresolved(arg, resolver, out);
+            }
+        }
+        PatternNode::HelperCall { name, args } => {
+            if resolver.matcher(name).is_none() && predicates::lookup(name).is_none() {
+                out.push(Unresolved::Helper(name.clone()));
+            }
+            for arg in args {
+                collect_unresolved(arg, resolver, out);
+            }
+        }
+        PatternNode::ParamConst(name) => {
+            if resolver.constant(name).is_none() {
+                out.push(Unresolved::Constant(name.clone()));
+            }
+        }
+        PatternNode::NodeMatch { children, .. } => {
+            for child in children {
+                collect_unresolved(child, resolver, out);
+            }
+        }
+        PatternNode::Alternatives(items)
+        | PatternNode::Conjunction(items)
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => {
+            for item in items {
+                collect_unresolved(item, resolver, out);
+            }
+        }
+        PatternNode::Negation(inner)
+        | PatternNode::ParentRef(inner)
+        | PatternNode::DescendRef(inner) => collect_unresolved(inner, resolver, out),
+        PatternNode::Capture { inner, .. } => collect_unresolved(inner, resolver, out),
+        _ => {}
+    }
+}
+
+/// Check the arity of every resolved predicate against its registry entry.
+fn check_arities(pattern: &PatternNode) -> Result<(), PatternError> {
+    let check = |name: &String, args: &Vec<PatternNode>| -> Result<(), PatternError> {
+        if let Some(builtin) = predicates::lookup(name) {
+            let expected = match builtin.arity {
+                Arity::Nullary => 0,
+                Arity::Unary => 1,
+            };
+            if args.len() != expected {
+                return Err(PatternError::PredicateArity {
+                    name: name.clone(),
+                    expected,
+                    found: args.len(),
+                });
+            }
+        }
+        Ok(())
+    };
+    match pattern {
+        PatternNode::Predicate { name, args } | PatternNode::HelperCall { name, args } => {
+            check(name, args)?;
+            for arg in args {
+                check_arities(arg)?;
+            }
+        }
+        PatternNode::NodeMatch { children, .. } => {
+            for child in children {
+                check_arities(child)?;
+            }
+        }
+        PatternNode::Alternatives(items)
+        | PatternNode::Conjunction(items)
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => {
+            for item in items {
+                check_arities(item)?;
+            }
+        }
+        PatternNode::Negation(inner)
+        | PatternNode::ParentRef(inner)
+        | PatternNode::DescendRef(inner) => check_arities(inner)?,
+        PatternNode::Capture { inner, .. } => check_arities(inner)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A parsed NodePattern plus the number of capture slots it allocates.
@@ -125,14 +407,45 @@ pub struct CompiledPattern {
 }
 
 impl CompiledPattern {
-    /// Lex and parse `pattern_str`, returning `None` on a parse error or an
-    /// invalid pattern (e.g. `{}` branches with different capture counts).
+    /// Lex, parse and resolve `pattern_str` against the builtin registry alone.
+    ///
+    /// Returns `None` on a parse error, an invalid pattern (`{}` branches with
+    /// different capture counts), or a `#helper` / `pred?` / `%Const` no
+    /// builtin explains. Use [`CompiledPattern::compile_with`] to supply the
+    /// owner's matchers and constants, and to see *why* a pattern was
+    /// rejected.
     #[must_use]
     pub fn compile(pattern_str: &str) -> Option<Self> {
+        Self::compile_with(pattern_str, &NoResolver).ok()
+    }
+
+    /// Lex, parse and resolve `pattern_str`, with `resolver` supplying the
+    /// owner-specific names.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Syntax`] when the pattern does not parse,
+    /// [`PatternError::UnknownHelper`] / [`PatternError::UnknownPredicate`] /
+    /// [`PatternError::UnknownConstant`] naming the first name nothing
+    /// explains, or [`PatternError::PredicateArity`] when a builtin is called
+    /// with the wrong number of arguments.
+    pub fn compile_with(pattern_str: &str, resolver: &dyn Resolver) -> Result<Self, PatternError> {
         let mut lexer = Lexer::new(pattern_str);
         let mut parser = Parser::new(lexer.tokenize());
-        let ast = parser.parse()?;
-        Some(Self {
+        let Some(ast) = parser.parse() else {
+            return Err(parser.error().cloned().unwrap_or(PatternError::Syntax));
+        };
+        let mut unresolved = Vec::new();
+        collect_unresolved(&ast, resolver, &mut unresolved);
+        if let Some(first) = unresolved.into_iter().next() {
+            return Err(match first {
+                Unresolved::Helper(name) => PatternError::UnknownHelper { name },
+                Unresolved::Predicate(name) => PatternError::UnknownPredicate { name },
+                Unresolved::Constant(name) => PatternError::UnknownConstant { name },
+            });
+        }
+        check_arities(&ast)?;
+        Ok(Self {
             ast,
             capture_count: parser.capture_count(),
         })
@@ -155,6 +468,66 @@ impl CompiledPattern {
     pub fn matches(&self, node: &ruby_prism::Node<'_>) -> bool {
         let mut env = MatchEnv::new(self.capture_count);
         matches_node(&self.ast, node, &mut env)
+    }
+
+    /// Whether the pattern matches `node`, with `params` bound to its
+    /// `%param` references and `resolver` answering its `#helper` calls.
+    #[must_use]
+    pub fn matches_in(
+        &self,
+        node: &ruby_prism::Node<'_>,
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> bool {
+        let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+        matches_node(&self.ast, node, &mut env)
+    }
+
+    /// Whether the pattern matches whatever sits in a child slot.
+    ///
+    /// `#helper` is applied to `access_element`, which is a node only some of
+    /// the time — rubocop-rspec's `#Examples.all` is handed the method symbol,
+    /// and `#rspec?` in receiver position can be handed an absent child. The
+    /// callee's captures are its own and are discarded, as upstream's are: a
+    /// function call compiles to a boolean, not to a binding.
+    pub(crate) fn matches_target(
+        &self,
+        target: &PredTarget<'_, '_>,
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> bool {
+        match target {
+            PredTarget::Node(node) => self.matches_in(node, params, resolver),
+            PredTarget::Absent => {
+                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+                matches_absent(&self.ast, &mut env)
+            }
+            PredTarget::Name(bytes) => {
+                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+                matches_name(&self.ast, bytes, bytes, &mut env)
+            }
+            PredTarget::Synthetic { parser_type, value } => {
+                let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+                matches_synthetic(&self.ast, parser_type, value, &mut env)
+            }
+        }
+    }
+
+    /// [`CompiledPattern::match_captures`] with `%param` bindings and a
+    /// resolver.
+    #[must_use]
+    pub fn match_captures_in<'pr>(
+        &self,
+        node: &ruby_prism::Node<'pr>,
+        params: &Params,
+        resolver: &dyn Resolver,
+    ) -> Option<Captures<'pr>> {
+        let mut env = MatchEnv::with_inputs(self.capture_count, params, resolver);
+        if matches_node(&self.ast, node, &mut env) {
+            Some(env.into_captures())
+        } else {
+            None
+        }
     }
 
     /// Match `node`, returning the bound captures on success.
@@ -1158,7 +1531,7 @@ fn get_children<'pr>(
 fn matches_child<'pr>(
     pattern: &PatternNode,
     child: &MatchChild<'pr>,
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     match child {
         MatchChild::Node(node) => matches_node(pattern, node, env),
@@ -1180,7 +1553,7 @@ fn matches_synthetic<'pr>(
     pattern: &PatternNode,
     parser_type: &'static str,
     value: &'pr [u8],
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     match pattern {
         PatternNode::Wildcard | PatternNode::Rest => true,
@@ -1246,7 +1619,7 @@ fn matches_synthetic<'pr>(
             env.rollback(mark);
             false
         }
-        _ => matches_deferred(pattern, &PredTarget::Synthetic { parser_type, value }),
+        _ => matches_deferred(pattern, &PredTarget::Synthetic { parser_type, value }, env),
     }
 }
 
@@ -1265,7 +1638,7 @@ fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
 fn matches_node<'pr>(
     pattern: &PatternNode,
     node: &ruby_prism::Node<'pr>,
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
@@ -1438,12 +1811,12 @@ fn matches_node<'pr>(
         | PatternNode::ParamConst(_)
         | PatternNode::Regexp { .. }
         | PatternNode::ParentRef(_)
-        | PatternNode::DescendRef(_) => matches_deferred(pattern, &PredTarget::Node(node)),
+        | PatternNode::DescendRef(_) => matches_deferred(pattern, &PredTarget::Node(node), env),
     }
 }
 
 /// Match a pattern against an absent child (`nil?` predicate target).
-fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr>) -> bool {
+fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr, '_>) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
         PatternNode::NilPredicate => true,
@@ -1481,7 +1854,7 @@ fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr>) -> bool {
             false
         }
         PatternNode::Rest => true,
-        _ => matches_deferred(pattern, &PredTarget::Absent),
+        _ => matches_deferred(pattern, &PredTarget::Absent, env),
     }
 }
 
@@ -1495,7 +1868,7 @@ fn matches_name<'pr>(
     pattern: &PatternNode,
     bytes: &[u8],
     captured: &'pr [u8],
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
@@ -1538,7 +1911,7 @@ fn matches_name<'pr>(
             false
         }
         PatternNode::Rest => true,
-        _ => matches_deferred(pattern, &PredTarget::Name(bytes)),
+        _ => matches_deferred(pattern, &PredTarget::Name(bytes), env),
     }
 }
 
@@ -1618,7 +1991,7 @@ fn assign_any_order<'pr>(
     used: &mut [bool],
     leftovers: &mut Vec<usize>,
     has_rest: bool,
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     if index == actuals.len() {
         return used.iter().all(|matched| *matched);
@@ -1661,7 +2034,7 @@ fn match_any_order<'pr>(
     items: &[PatternNode],
     rest_terms: &[&PatternNode],
     actuals: &[MatchChild<'pr>],
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
     exact: bool,
 ) -> bool {
     let (terms, rest) = split_any_order(items);
@@ -1720,7 +2093,7 @@ fn match_any_order<'pr>(
 fn matches_children_list<'pr>(
     patterns: &[PatternNode],
     actuals: &[MatchChild<'pr>],
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     let terms: Vec<&PatternNode> = patterns.iter().collect();
     let exact = patterns.iter().any(contains_rest);
@@ -1738,7 +2111,7 @@ fn splice<'p>(head: &'p PatternNode, tail: &[&'p PatternNode]) -> Vec<&'p Patter
 fn match_sequence<'pr>(
     terms: &[&PatternNode],
     actuals: &[MatchChild<'pr>],
-    env: &mut MatchEnv<'pr>,
+    env: &mut MatchEnv<'pr, '_>,
     exact: bool,
 ) -> bool {
     let Some((term, rest_terms)) = terms.split_first() else {
@@ -1804,6 +2177,90 @@ mod tests {
         let program = root.as_program_node().unwrap();
         let stmts = program.statements();
         stmts.body().iter().next().unwrap()
+    }
+
+    /// A stand-in for the object a pattern was defined on: named matchers and
+    /// constants, exactly what the future IR cop supplies.
+    struct Owner {
+        matchers: std::collections::HashMap<String, CompiledPattern>,
+        constants: std::collections::HashMap<String, Arg>,
+    }
+
+    impl Owner {
+        fn new(matchers: &[(&str, &str)], constants: &[(&str, Arg)]) -> Self {
+            Self {
+                matchers: matchers
+                    .iter()
+                    .map(|(name, pattern)| {
+                        (
+                            (*name).to_string(),
+                            CompiledPattern::compile(pattern)
+                                .unwrap_or_else(|| panic!("matcher {name} should compile")),
+                        )
+                    })
+                    .collect(),
+                constants: constants
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), value.clone()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Resolver for Owner {
+        fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
+            self.matchers.get(name)
+        }
+
+        fn constant(&self, name: &str) -> Option<&Arg> {
+            self.constants.get(name)
+        }
+    }
+
+    /// An owner that claims every name, for tests that only care that a
+    /// vendored pattern *compiles* and not what its cop-local helpers mean.
+    struct AnyOwner {
+        wildcard: CompiledPattern,
+        unresolved: Arg,
+    }
+
+    impl AnyOwner {
+        fn new() -> Self {
+            Self {
+                wildcard: CompiledPattern::compile("_").expect("`_` compiles"),
+                unresolved: Arg::Unresolved,
+            }
+        }
+    }
+
+    impl Resolver for AnyOwner {
+        fn matcher(&self, _name: &str) -> Option<&CompiledPattern> {
+            Some(&self.wildcard)
+        }
+
+        fn constant(&self, _name: &str) -> Option<&Arg> {
+            Some(&self.unresolved)
+        }
+    }
+
+    /// Compile `pattern` against builtins only and match it on `ruby`.
+    fn matches_ruby(pattern: &str, ruby: &[u8]) -> bool {
+        let compiled =
+            CompiledPattern::compile(pattern).unwrap_or_else(|| panic!("{pattern} should compile"));
+        let result = ruby_prism::parse(ruby);
+        compiled.matches(&first_stmt(&result))
+    }
+
+    /// Match an already-compiled pattern on `ruby` with `owner` resolving.
+    fn matches_with(pattern: &CompiledPattern, ruby: &[u8], owner: &dyn Resolver) -> bool {
+        let result = ruby_prism::parse(ruby);
+        pattern.matches_in(&first_stmt(&result), &Params::new(), owner)
+    }
+
+    /// Match an already-compiled pattern on `ruby` with `params` bound.
+    fn matches_params(pattern: &CompiledPattern, ruby: &[u8], params: &Params) -> bool {
+        let result = ruby_prism::parse(ruby);
+        pattern.matches_in(&first_stmt(&result), params, &NoResolver)
     }
 
     #[test]
@@ -1996,7 +2453,10 @@ mod tests {
     #[test]
     fn test_captures_inside_union_branches_share_slots() {
         let pattern = "{(send $(send _ :rstrip) :lstrip) (send $(send _ :lstrip) :rstrip)}";
-        let compiled = CompiledPattern::compile(pattern).unwrap();
+        // `#rspec?` and the two `Const.method` helpers are rubocop-rspec
+        // `Language` matchers, i.e. owner-supplied.
+        let owner = AnyOwner::new();
+        let compiled = CompiledPattern::compile_with(pattern, &owner).unwrap();
         assert_eq!(compiled.capture_count(), 1);
 
         let first = ruby_prism::parse(b"s.rstrip.lstrip");
@@ -2144,9 +2604,14 @@ mod tests {
                 continue;
             }
             checked += 1;
-            let compiled = CompiledPattern::compile(entry.pattern).unwrap_or_else(|| {
-                panic!("{} failed to compile: {}", entry.cop_name, entry.pattern)
-            });
+            let owner = AnyOwner::new();
+            let compiled =
+                CompiledPattern::compile_with(entry.pattern, &owner).unwrap_or_else(|err| {
+                    panic!(
+                        "{} failed to compile: {} ({err})",
+                        entry.cop_name, entry.pattern
+                    )
+                });
             assert!(
                 compiled.capture_count() > 0,
                 "{} has `$` but no capture slots",
@@ -2322,13 +2787,194 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_call_always_true() {
+    fn test_unknown_helper_is_a_compile_error() {
+        // Upstream this is a `NoMethodError` the first time the pattern runs.
+        assert_eq!(
+            CompiledPattern::compile_with("(send #any_helper? :foo)", &NoResolver).err(),
+            Some(PatternError::UnknownHelper {
+                name: "any_helper?".to_string()
+            })
+        );
+        assert_eq!(
+            CompiledPattern::compile_with("(send _ bogus_thing?)", &NoResolver).err(),
+            Some(PatternError::UnknownPredicate {
+                name: "bogus_thing?".to_string()
+            })
+        );
+        assert_eq!(
+            CompiledPattern::compile_with("(send _ :foo %CANDIDATE_METHODS)", &NoResolver).err(),
+            Some(PatternError::UnknownConstant {
+                name: "CANDIDATE_METHODS".to_string()
+            })
+        );
+        // And the boolean entry point simply does not match.
         let source = b"obj.foo";
         let result = ruby_prism::parse(source);
         let node = first_stmt(&result);
+        assert!(!interpret_pattern("(send #any_helper? :foo)", &node));
+    }
 
-        // HelperCall patterns are always-true in Phase 1
-        assert!(interpret_pattern("(send #any_helper? :foo)", &node));
+    #[test]
+    fn test_predicate_arity_is_checked() {
+        assert_eq!(
+            CompiledPattern::compile_with("(send _ method?)", &NoResolver).err(),
+            Some(PatternError::PredicateArity {
+                name: "method?".to_string(),
+                expected: 1,
+                found: 0,
+            })
+        );
+        assert!(CompiledPattern::compile_with("(send _ method?(:foo))", &NoResolver).is_ok());
+    }
+
+    #[test]
+    fn test_builtin_predicate_is_evaluated() {
+        // `Naming/ConstantName#literal_receiver?`, first branch.
+        assert!(matches_ruby("(send literal? ...)", b"1.foo"));
+        assert!(!matches_ruby("(send literal? ...)", b"x.foo"));
+        // A predicate on a name slot.
+        assert!(matches_ruby("(send _ operator_method? _)", b"a + b"));
+        assert!(!matches_ruby("(send _ operator_method? _)", b"a.foo(b)"));
+        // `Mixin/SafeAssignment#setter_method?`, verbatim.
+        assert!(matches_ruby("[(call ...) setter_method?]", b"a.b = 1"));
+        assert!(!matches_ruby("[(call ...) setter_method?]", b"a.b"));
+    }
+
+    #[test]
+    fn test_builtin_predicate_with_an_argument() {
+        assert!(matches_ruby("(send _ method?(:freeze))", b"a.freeze"));
+        assert!(!matches_ruby("(send _ method?(:freeze))", b"a.dup"));
+        // A `{}` argument is a Set upstream; membership, not equality.
+        assert!(matches_ruby("(send _ method?({:dup :freeze}))", b"a.dup"));
+        assert!(!matches_ruby("(send _ method?({:dup :freeze}))", b"a.to_s"));
+    }
+
+    #[test]
+    fn test_helper_call_falls_back_to_the_registry() {
+        // `#global_const?` is defined on `Node` itself (`node.rb:605-606`), so
+        // it resolves with no owner at all.
+        assert!(matches_ruby(
+            "(send #global_const?(:Proc) :new)",
+            b"Proc.new"
+        ));
+        assert!(matches_ruby(
+            "(send #global_const?(:Proc) :new)",
+            b"::Proc.new"
+        ));
+        assert!(!matches_ruby(
+            "(send #global_const?(:Proc) :new)",
+            b"Data.new"
+        ));
+    }
+
+    #[test]
+    fn test_helper_call_resolves_to_an_owner_matcher() {
+        let owner = Owner::new(&[("array_receiver?", "{array (send _ :to_a)}")], &[]);
+        let pattern =
+            CompiledPattern::compile_with("(send #array_receiver? :first)", &owner).unwrap();
+        assert!(matches_with(&pattern, b"[1, 2].first", &owner));
+        assert!(matches_with(&pattern, b"x.to_a.first", &owner));
+        assert!(!matches_with(&pattern, b"x.first", &owner));
+    }
+
+    #[test]
+    fn test_const_qualified_helper_resolves_through_the_owner() {
+        // rubocop-rspec's `Language` modules: `#Examples.all`.
+        // `Language::Examples.all` is handed the method symbol and answers
+        // set membership, so the matcher sits in a name slot.
+        let owner = Owner::new(&[("Examples.all", "{:it :specify}")], &[]);
+        let pattern =
+            CompiledPattern::compile_with("(send nil? #Examples.all ...)", &owner).unwrap();
+        assert!(matches_with(&pattern, b"it('x') { }", &owner));
+        assert!(!matches_with(&pattern, b"describe('x') { }", &owner));
+        // Without the owner it does not compile at all.
+        assert!(matches!(
+            CompiledPattern::compile_with("(send nil? #Examples.all ...)", &NoResolver),
+            Err(PatternError::UnknownHelper { .. })
+        ));
+    }
+
+    #[test]
+    fn test_helper_call_arguments_become_the_matchers_params() {
+        // `#foo(:bar)` calls the matcher with `:bar` bound to its `%1`.
+        let owner = Owner::new(&[("named?", "(send nil? %1)")], &[]);
+        let pattern = CompiledPattern::compile_with("#named?(:foo)", &owner).unwrap();
+        assert!(matches_with(&pattern, b"foo", &owner));
+        assert!(!matches_with(&pattern, b"bar", &owner));
+    }
+
+    #[test]
+    fn test_positional_params_bind() {
+        let pattern = CompiledPattern::compile("(send nil? %1)").unwrap();
+        let params = Params::positional(vec![Arg::Symbol("foo".to_string())]);
+        assert!(matches_params(&pattern, b"foo", &params));
+        assert!(!matches_params(&pattern, b"bar", &params));
+        // A bare `%` is `%1` (`lexer.rex`).
+        let bare = CompiledPattern::compile("(send nil? %)").unwrap();
+        assert!(matches_params(&bare, b"foo", &params));
+    }
+
+    #[test]
+    fn test_named_params_bind() {
+        let pattern = CompiledPattern::compile("(send nil? %method_name)").unwrap();
+        let params = Params::new().with_named("method_name", Arg::Symbol("foo".to_string()));
+        assert!(matches_params(&pattern, b"foo", &params));
+        assert!(!matches_params(&pattern, b"bar", &params));
+    }
+
+    #[test]
+    fn test_a_param_set_matches_by_membership() {
+        let pattern = CompiledPattern::compile("(send nil? %1)").unwrap();
+        let params = Params::positional(vec![Arg::Set(vec![
+            Arg::Symbol("foo".to_string()),
+            Arg::Symbol("bar".to_string()),
+        ])]);
+        assert!(matches_params(&pattern, b"foo", &params));
+        assert!(matches_params(&pattern, b"bar", &params));
+        assert!(!matches_params(&pattern, b"baz", &params));
+    }
+
+    #[test]
+    fn test_an_unbound_param_fails_closed() {
+        let pattern = CompiledPattern::compile("(send nil? %1)").unwrap();
+        assert!(!matches_params(&pattern, b"foo", &Params::new()));
+    }
+
+    #[test]
+    fn test_constants_resolve_through_the_owner() {
+        let owner = Owner::new(
+            &[],
+            &[(
+                "CANDIDATE_METHODS",
+                Arg::Set(vec![
+                    Arg::Symbol("first".to_string()),
+                    Arg::Symbol("last".to_string()),
+                ]),
+            )],
+        );
+        let pattern = CompiledPattern::compile_with("(send _ %CANDIDATE_METHODS)", &owner).unwrap();
+        assert!(matches_with(&pattern, b"x.first", &owner));
+        assert!(!matches_with(&pattern, b"x.map", &owner));
+    }
+
+    #[test]
+    fn test_regexp_atom_matches_a_name() {
+        let pattern = CompiledPattern::compile("(send nil? /^style_detected$/)").unwrap();
+        let result = ruby_prism::parse(b"style_detected");
+        assert!(pattern.matches(&first_stmt(&result)));
+        let result = ruby_prism::parse(b"other");
+        assert!(!pattern.matches(&first_stmt(&result)));
+    }
+
+    #[test]
+    fn test_a_capture_under_a_failing_predicate_is_unwound() {
+        // The union's first branch captures then fails its predicate; the
+        // second branch must see a clean slot.
+        let pattern = CompiledPattern::compile("{(send $_ operator_method?) (send $_ _)}").unwrap();
+        let result = ruby_prism::parse(b"recv.foo");
+        let captures = pattern.match_captures(&first_stmt(&result)).unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captured_src(&captures, 0), "recv");
     }
 
     #[test]
@@ -2505,7 +3151,10 @@ mod tests {
         let result = ruby_prism::parse(b"foo('b', :a)");
         let node = first_stmt(&result);
 
-        let compiled = CompiledPattern::compile(pattern).unwrap();
+        // `#rspec?` and the two `Const.method` helpers are rubocop-rspec
+        // `Language` matchers, i.e. owner-supplied.
+        let owner = AnyOwner::new();
+        let compiled = CompiledPattern::compile_with(pattern, &owner).unwrap();
         assert_eq!(compiled.capture_count(), 1);
         let captures = compiled.match_captures(&node).unwrap();
         let run = captures[0].as_list().expect("group binds a list");
@@ -2529,7 +3178,10 @@ mod tests {
     fn test_any_order_inside_union_branch() {
         // Both branches declare one capture, as RuboCop requires.
         let pattern = "(send nil? :foo {<(sym $_) ...> (hash <(pair (sym $_) true) ...>)})";
-        let compiled = CompiledPattern::compile(pattern).unwrap();
+        // `#rspec?` and the two `Const.method` helpers are rubocop-rspec
+        // `Language` matchers, i.e. owner-supplied.
+        let owner = AnyOwner::new();
+        let compiled = CompiledPattern::compile_with(pattern, &owner).unwrap();
         assert_eq!(compiled.capture_count(), 1);
 
         let result = ruby_prism::parse(b"foo(1, :skip)");
@@ -2562,14 +3214,22 @@ mod tests {
               (hash <(pair (sym ${:pending :skip}) true) ...>)\n \
             }\n \
           )";
-        let compiled = CompiledPattern::compile(pattern).unwrap();
+        // `#rspec?` and the two `Const.method` helpers are rubocop-rspec
+        // `Language` matchers, i.e. owner-supplied.
+        let owner = AnyOwner::new();
+        let compiled = CompiledPattern::compile_with(pattern, &owner).unwrap();
         assert_eq!(compiled.capture_count(), 1);
 
         let result = ruby_prism::parse(b"RSpec.describe 'thing', :pending do\nend");
         let node = first_stmt(&result);
         let call = node.as_call_node().unwrap().as_node();
         assert_eq!(
-            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            captured_name(
+                &compiled
+                    .match_captures_in(&call, &Params::new(), &owner)
+                    .unwrap(),
+                0
+            ),
             "pending"
         );
 
@@ -2577,7 +3237,12 @@ mod tests {
         let node = first_stmt(&result);
         let call = node.as_call_node().unwrap().as_node();
         assert_eq!(
-            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            captured_name(
+                &compiled
+                    .match_captures_in(&call, &Params::new(), &owner)
+                    .unwrap(),
+                0
+            ),
             "skip"
         );
 
@@ -2585,7 +3250,11 @@ mod tests {
         let result = ruby_prism::parse(b"RSpec.describe 'thing', :focus do\nend");
         let node = first_stmt(&result);
         let call = node.as_call_node().unwrap().as_node();
-        assert!(compiled.match_captures(&call).is_none());
+        assert!(
+            compiled
+                .match_captures_in(&call, &Params::new(), &owner)
+                .is_none()
+        );
     }
 
     #[test]
