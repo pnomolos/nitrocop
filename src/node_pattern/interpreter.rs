@@ -70,6 +70,53 @@ pub enum MatchChild<'pr> {
     },
 }
 
+/// What a not-yet-resolved term is being evaluated against.
+///
+/// The four match dispatchers ([`matches_node`], [`matches_absent`],
+/// [`matches_name`], [`matches_synthetic`]) each hand their target to
+/// [`matches_deferred`], so the terms that still evaluate optimistically live
+/// in exactly one place.
+// The payloads are the seam the resolution PR plugs into; this PR only needs
+// the four dispatchers to agree on one shape.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum PredTarget<'a, 'pr> {
+    /// A present AST node.
+    Node(&'a ruby_prism::Node<'pr>),
+    /// An absent child (`nil?`'s target).
+    Absent,
+    /// A name or value byte slice (method name, symbol value, …).
+    Name(&'a [u8]),
+    /// A Parser-gem child Prism does not materialize.
+    Synthetic {
+        /// The Parser-gem type this stands in for.
+        parser_type: &'static str,
+        /// The value the synthesized node carries.
+        value: &'a [u8],
+    },
+}
+
+/// Evaluate a term whose resolution is not implemented yet.
+///
+/// `#call`, `pred?`, `%param`, a regexp atom, `^` and `` ` `` all still answer
+/// `true` optimistically, as they did before they were consolidated here. Any
+/// other pattern reaching this function is a term the caller's own arms should
+/// have handled, so it answers `false`.
+fn matches_deferred(pattern: &PatternNode, target: &PredTarget<'_, '_>) -> bool {
+    let _ = target;
+    matches!(
+        pattern,
+        PatternNode::HelperCall { .. }
+            | PatternNode::Predicate { .. }
+            | PatternNode::ParamNumber(_)
+            | PatternNode::ParamNamed(_)
+            | PatternNode::ParamConst(_)
+            | PatternNode::Regexp { .. }
+            | PatternNode::ParentRef(_)
+            | PatternNode::DescendRef(_)
+    )
+}
+
 /// A parsed NodePattern plus the number of capture slots it allocates.
 #[derive(Debug, Clone)]
 pub struct CompiledPattern {
@@ -1199,11 +1246,7 @@ fn matches_synthetic<'pr>(
             env.rollback(mark);
             false
         }
-        PatternNode::HelperCall(_)
-        | PatternNode::ParamRef(_)
-        | PatternNode::ParentRef(_)
-        | PatternNode::DescendRef(_) => true,
-        _ => false,
+        _ => matches_deferred(pattern, &PredTarget::Synthetic { parser_type, value }),
     }
 }
 
@@ -1367,11 +1410,6 @@ fn matches_node<'pr>(
             false
         }
 
-        PatternNode::HelperCall(_) => true,
-        PatternNode::ParamRef(_) => true,
-        PatternNode::ParentRef(_) => true,
-        PatternNode::DescendRef(_) => true,
-
         PatternNode::FloatLiteral(s) => {
             if let Some(float_node) = node.as_float_node() {
                 let loc = float_node.location();
@@ -1392,6 +1430,15 @@ fn matches_node<'pr>(
         PatternNode::AnyOrder(_) => false,
 
         PatternNode::Rest => true,
+
+        PatternNode::HelperCall { .. }
+        | PatternNode::Predicate { .. }
+        | PatternNode::ParamNumber(_)
+        | PatternNode::ParamNamed(_)
+        | PatternNode::ParamConst(_)
+        | PatternNode::Regexp { .. }
+        | PatternNode::ParentRef(_)
+        | PatternNode::DescendRef(_) => matches_deferred(pattern, &PredTarget::Node(node)),
     }
 }
 
@@ -1433,12 +1480,8 @@ fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr>) -> bool {
             env.rollback(mark);
             false
         }
-        PatternNode::HelperCall(_) => true,
-        PatternNode::ParamRef(_) => true,
-        PatternNode::ParentRef(_) => true,
-        PatternNode::DescendRef(_) => true,
         PatternNode::Rest => true,
-        _ => false,
+        _ => matches_deferred(pattern, &PredTarget::Absent),
     }
 }
 
@@ -1494,12 +1537,8 @@ fn matches_name<'pr>(
             env.rollback(mark);
             false
         }
-        PatternNode::HelperCall(_) => true,
-        PatternNode::ParamRef(_) => true,
-        PatternNode::ParentRef(_) => true,
-        PatternNode::DescendRef(_) => true,
         PatternNode::Rest => true,
-        _ => false,
+        _ => matches_deferred(pattern, &PredTarget::Name(bytes)),
     }
 }
 

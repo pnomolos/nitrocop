@@ -46,8 +46,32 @@ pub enum PatternNode {
     Rest,
     /// !pattern
     Negation(Box<PatternNode>),
-    /// #helper_method
-    HelperCall(String),
+    /// `#helper` / `#helper(arg, …)` — `parser.y`'s `tFUNCTION_CALL args`.
+    ///
+    /// In RuboCop the call goes to the object the pattern was defined on (the
+    /// cop, or `Node` itself for the matchers in `node.rb`), with the matched
+    /// node prepended to the argument list
+    /// (`node_pattern_subcompiler.rb:84-86`).
+    HelperCall {
+        /// Method name as written, `?` included; `Const.method` for the
+        /// const-qualified form (`#Examples.all`).
+        name: String,
+        /// Argument patterns. RuboCop compiles these as *atoms*
+        /// (`atom_subcompiler.rb`) — literals, `%param` refs, or a `{}` union
+        /// of literals, which upstream turns into a `Set`.
+        args: Vec<PatternNode>,
+    },
+    /// `pred?` / `pred?(arg, …)` — `parser.y`'s `tPREDICATE args`.
+    ///
+    /// The call goes to the matched node itself
+    /// (`node_pattern_subcompiler.rb:80-82`), so these resolve against the
+    /// rubocop-ast `Node` predicate registry rather than against the cop.
+    Predicate {
+        /// Method name as written, `?` included.
+        name: String,
+        /// Argument patterns, as for [`PatternNode::HelperCall`].
+        args: Vec<PatternNode>,
+    },
     /// :symbol
     SymbolLiteral(String),
     /// Integer literal
@@ -64,8 +88,25 @@ pub enum PatternNode {
     FalseLiteral,
     /// nil literal node
     NilLiteral,
-    /// %param
-    ParamRef(String),
+    /// `%1`, or a bare `%` (which upstream maps to `%1`) — a positional
+    /// pattern parameter (`tPARAM_NUMBER`).
+    ParamNumber(usize),
+    /// `%name` — a named pattern parameter (`tPARAM_NAMED`).
+    ParamNamed(String),
+    /// `%Const` or a bare `Const` — a constant reference (`tPARAM_CONST`).
+    ///
+    /// Upstream emits the constant verbatim into the compiled code and matches
+    /// it with `===`, so `%RuboCop::AST::Node` is an `is_a?` test and
+    /// `%SOME_SET` a membership test. Resolution is therefore owner-specific
+    /// and goes through the same hook as cop-local helpers.
+    ParamConst(String),
+    /// `/body/flags` — a regexp literal, matched with `Regexp#===`.
+    Regexp {
+        /// Regexp source between the slashes, escapes intact.
+        body: String,
+        /// The `imxo` flag letters that followed the closing slash.
+        flags: String,
+    },
     /// Type predicate: int?, str?, sym?, etc.
     TypePredicate(String),
     /// ^pattern — parent node
@@ -260,7 +301,14 @@ impl Parser {
             Token::HelperCall(ref name) => {
                 let name = name.clone();
                 self.advance();
-                Some(PatternNode::HelperCall(name))
+                let args = self.parse_arg_list();
+                Some(PatternNode::HelperCall { name, args })
+            }
+            Token::Predicate(ref name) => {
+                let name = name.clone();
+                self.advance();
+                let args = self.parse_arg_list();
+                Some(PatternNode::Predicate { name, args })
             }
             Token::SymbolLiteral(ref name) => {
                 let name = name.clone();
@@ -291,13 +339,53 @@ impl Parser {
                     _ => Some(PatternNode::Ident(name)),
                 }
             }
-            Token::ParamRef(ref s) => {
+            Token::ParamNumber(n) => {
+                self.advance();
+                Some(PatternNode::ParamNumber(n))
+            }
+            Token::ParamNamed(ref s) => {
                 let s = s.clone();
                 self.advance();
-                Some(PatternNode::ParamRef(s))
+                Some(PatternNode::ParamNamed(s))
+            }
+            Token::ParamConst(ref s) => {
+                let s = s.clone();
+                self.advance();
+                Some(PatternNode::ParamConst(s))
+            }
+            Token::Regexp {
+                ref body,
+                ref flags,
+            } => {
+                let (body, flags) = (body.clone(), flags.clone());
+                self.advance();
+                Some(PatternNode::Regexp { body, flags })
             }
             _ => None,
         }
+    }
+
+    /// Parse the optional argument list of a `#call` / `pred?`.
+    ///
+    /// `parser.y`: `args: | tARG_LIST arg_list ')'` and
+    /// `arg_list: node_pattern | arg_list ',' node_pattern`. The lexer only
+    /// emits [`Token::ArgList`] when the `(` touched the call name, so an
+    /// absent `tARG_LIST` here means the call simply has no arguments.
+    fn parse_arg_list(&mut self) -> Vec<PatternNode> {
+        if !self.expect(&Token::ArgList) {
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        while self.peek().is_some() && self.peek() != Some(&Token::RParen) {
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+                continue;
+            }
+            let Some(arg) = self.parse_node() else { break };
+            args.push(arg);
+        }
+        self.expect(&Token::RParen);
+        args
     }
 
     fn parse_sequence(&mut self) -> Option<PatternNode> {
@@ -524,6 +612,11 @@ fn shift_capture_slots(node: &mut PatternNode, delta: usize) {
         PatternNode::Negation(inner)
         | PatternNode::ParentRef(inner)
         | PatternNode::DescendRef(inner) => shift_capture_slots(inner, delta),
+        PatternNode::HelperCall { args, .. } | PatternNode::Predicate { args, .. } => {
+            for arg in args {
+                shift_capture_slots(arg, delta);
+            }
+        }
         _ => {}
     }
 }
@@ -566,13 +659,26 @@ pub fn pattern_summary(node: &PatternNode) -> String {
             inner.join(" ")
         }
         PatternNode::Negation(inner) => format!("!{}", pattern_summary(inner)),
-        PatternNode::HelperCall(name) => format!("#{name}"),
+        PatternNode::HelperCall { name, args } => format!("#{name}{}", arg_summary(args)),
+        PatternNode::Predicate { name, args } => format!("{name}{}", arg_summary(args)),
         PatternNode::TypePredicate(t) => format!("{t}?"),
-        PatternNode::ParamRef(p) => format!("%{p}"),
+        PatternNode::ParamNumber(n) => format!("%{n}"),
+        PatternNode::ParamNamed(p) => format!("%{p}"),
+        PatternNode::ParamConst(p) => format!("%{p}"),
+        PatternNode::Regexp { body, flags } => format!("/{body}/{flags}"),
         PatternNode::ParentRef(inner) => format!("^{}", pattern_summary(inner)),
         PatternNode::DescendRef(inner) => format!("`{}", pattern_summary(inner)),
         PatternNode::Ident(name) => name.clone(),
     }
+}
+
+/// Render a `#call` / `pred?` argument list, empty when there is none.
+fn arg_summary(args: &[PatternNode]) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let inner: Vec<String> = args.iter().map(pattern_summary).collect();
+    format!("({})", inner.join(", "))
 }
 
 #[cfg(test)]
@@ -706,7 +812,9 @@ mod tests {
                 children,
             } => {
                 assert_eq!(node_type, "send");
-                assert!(matches!(&children[0], PatternNode::HelperCall(n) if n == "expect?"));
+                assert!(
+                    matches!(&children[0], PatternNode::HelperCall { name, args } if name == "expect?" && args.is_empty())
+                );
                 assert!(matches!(&children[1], PatternNode::Wildcard));
                 assert!(matches!(&children[2], PatternNode::Rest));
             }
@@ -961,5 +1069,110 @@ mod tests {
                 found: 1
             })
         );
+    }
+
+    fn parse_ok(pattern: &str) -> PatternNode {
+        let mut lexer = Lexer::new(pattern);
+        let mut parser = Parser::new(lexer.tokenize());
+        parser.parse().expect("pattern should parse")
+    }
+
+    #[test]
+    fn test_parser_helper_call_with_symbol_arg() {
+        match parse_ok("#global_const?(:Proc)") {
+            PatternNode::HelperCall { name, args } => {
+                assert_eq!(name, "global_const?");
+                assert!(matches!(&args[0], PatternNode::SymbolLiteral(s) if s == "Proc"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected HelperCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parser_helper_call_with_union_arg() {
+        // Upstream compiles a `{}` of atoms into a `Set` (`atom_subcompiler.rb`).
+        match parse_ok("#global_const?({:Class :Module :Struct})") {
+            PatternNode::HelperCall { name, args } => {
+                assert_eq!(name, "global_const?");
+                match &args[0] {
+                    PatternNode::Alternatives(alts) => assert_eq!(alts.len(), 3),
+                    other => panic!("expected Alternatives, got {other:?}"),
+                }
+            }
+            other => panic!("expected HelperCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parser_helper_call_with_several_args() {
+        match parse_ok("#belongs_to?(%1, %2)") {
+            PatternNode::HelperCall { name, args } => {
+                assert_eq!(name, "belongs_to?");
+                assert!(matches!(args[0], PatternNode::ParamNumber(1)));
+                assert!(matches!(args[1], PatternNode::ParamNumber(2)));
+            }
+            other => panic!("expected HelperCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parser_helper_call_without_args_is_followed_by_a_sequence() {
+        // `#fn (seq)` — the whitespace makes the parenthesis a sequence, so the
+        // call keeps an empty argument list and the sequence is a sibling.
+        match parse_ok("{#foo (send nil? :bar)}") {
+            PatternNode::Alternatives(alts) => {
+                assert_eq!(alts.len(), 2);
+                assert!(
+                    matches!(&alts[0], PatternNode::HelperCall { name, args } if name == "foo" && args.is_empty())
+                );
+                assert!(matches!(&alts[1], PatternNode::NodeMatch { .. }));
+            }
+            other => panic!("expected Alternatives, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parser_node_predicate_with_arg() {
+        match parse_ok("method?(:freeze)") {
+            PatternNode::Predicate { name, args } => {
+                assert_eq!(name, "method?");
+                assert!(matches!(&args[0], PatternNode::SymbolLiteral(s) if s == "freeze"));
+            }
+            other => panic!("expected Predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parser_param_forms() {
+        assert!(matches!(parse_ok("%"), PatternNode::ParamNumber(1)));
+        assert!(matches!(parse_ok("%2"), PatternNode::ParamNumber(2)));
+        assert!(matches!(parse_ok("%name"), PatternNode::ParamNamed(n) if n == "name"));
+        assert!(
+            matches!(parse_ok("%RuboCop::AST::Node::VARIABLES"), PatternNode::ParamConst(n) if n == "RuboCop::AST::Node::VARIABLES")
+        );
+        assert!(
+            matches!(parse_ok("CANDIDATE_METHODS"), PatternNode::ParamConst(n) if n == "CANDIDATE_METHODS")
+        );
+    }
+
+    #[test]
+    fn test_parser_captures_inside_an_arg_list_are_numbered() {
+        // `$` is legal inside an argument list (`arg_list: node_pattern`).
+        let mut lexer = Lexer::new("(send $_ #foo($_) $_)");
+        let mut parser = Parser::new(lexer.tokenize());
+        parser.parse().expect("pattern should parse");
+        assert_eq!(parser.capture_count(), 3);
+    }
+
+    #[test]
+    fn test_pattern_summary_round_trips_calls_and_params() {
+        assert_eq!(
+            pattern_summary(&parse_ok("#global_const?(:Proc)")),
+            "#global_const?(:Proc)"
+        );
+        assert_eq!(pattern_summary(&parse_ok("method?(:a)")), "method?(:a)");
+        assert_eq!(pattern_summary(&parse_ok("%1")), "%1");
+        assert_eq!(pattern_summary(&parse_ok("/ab/i")), "/ab/i");
     }
 }
