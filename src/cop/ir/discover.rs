@@ -402,6 +402,23 @@ hooks:
     }
 
     #[test]
+    fn the_documented_example_cop_loads() {
+        // `docs/CUSTOM_COPS.md` tells people to copy this file; a change to the
+        // schema that invalidates it must fail here, not in their project.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/examples/no_base_transaction.cop.yml");
+        let source = std::fs::read_to_string(&path).expect("example cop should exist");
+        let doc = load_str_with(
+            &source,
+            "docs/examples/no_base_transaction.cop.yml",
+            LoadMode::User,
+        )
+        .expect("example cop should load");
+        assert_eq!(doc.name(), "Custom/NoBaseTransaction");
+        IrCopRunner::new(doc).expect("example cop should compile");
+    }
+
+    #[test]
     fn the_digest_tracks_document_contents() {
         let dir = tmp("digest");
         write(&dir, ".nitrocop/cops/a.cop.yml", DOC);

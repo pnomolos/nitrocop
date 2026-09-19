@@ -1,0 +1,31 @@
+# An example custom cop. Copy it to `.nitrocop/cops/` in your project and run
+# `nitrocop --validate-ir`. See docs/CUSTOM_COPS.md for the walkthrough and
+# docs/COP_IR.md for the full schema.
+schema: 1
+cop: "Custom/NoBaseTransaction"
+severity: warning
+docs: |
+  `Base.transaction` always opens on the primary connection. Use
+  `ApplicationRecord.transaction`, which is routed by the current role.
+
+# Upstream's RESTRICT_ON_SEND: one byte compare skips every call whose selector
+# is not `transaction`, before the pattern walk ever runs.
+restrict_on_send: [transaction]
+
+config:
+  # Configurable from .rubocop.yml as `Custom/NoBaseTransaction: { Receiver: ... }`.
+  Receiver: { type: string, default: "Base" }
+
+matchers:
+  transaction_call:
+    pattern: "(send (const _ $_) :transaction ...)"
+    captures: [receiver]
+
+hooks:
+  - on: [send]
+    match: transaction_call
+    when: { eq: ["$receiver", cfg.Receiver] }
+    offense:
+      # Underline the selector, not the whole call.
+      location: node.selector
+      message: "Use `ApplicationRecord.transaction` instead of `%{receiver}.transaction`."
