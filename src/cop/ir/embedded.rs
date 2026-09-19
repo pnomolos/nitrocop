@@ -32,6 +32,10 @@ pub static FILES: &[(&str, &str)] = &[
         include_str!("../../resources/ir/style/file_open.cop.yml"),
     ),
     (
+        "src/resources/ir/style/predicate_with_kind.cop.yml",
+        include_str!("../../resources/ir/style/predicate_with_kind.cop.yml"),
+    ),
+    (
         "src/resources/ir/style/redundant_min_max_by.cop.yml",
         include_str!("../../resources/ir/style/redundant_min_max_by.cop.yml"),
     ),
@@ -47,6 +51,11 @@ crate::ir_cop_fixture_tests!(
     "cops/lint/data_define_override"
 );
 crate::ir_cop_fixture_tests!(style_file_open, "Style/FileOpen", "cops/style/file_open");
+crate::ir_cop_fixture_tests!(
+    style_predicate_with_kind,
+    "Style/PredicateWithKind",
+    "cops/style/predicate_with_kind"
+);
 crate::ir_cop_fixture_tests!(
     style_redundant_min_max_by,
     "Style/RedundantMinMaxBy",

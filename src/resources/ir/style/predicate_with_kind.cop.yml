@@ -1,0 +1,83 @@
+schema: 1
+cop: "Style/PredicateWithKind"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: unsafe
+docs: |
+  Looks for `any?`, `all?`, `none?` or `one?` with a block containing only an
+  `is_a?`, `kind_of?` or `instance_of?` check, and suggests passing the class
+  to the predicate directly.
+
+constants:
+  # `KIND_METHODS`, verbatim. Declared as a constant table so the matcher can
+  # keep upstream's `%KIND_METHODS` spelling; only the keys are read (they
+  # become the `Arg::Set` the pattern matches the selector against).
+  KIND_METHODS: { "is_a?": true, "kind_of?": true, "instance_of?": true }
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/style/predicate_with_kind.rb.
+  kind_check:
+    pattern: |
+      {
+        (block call (args (arg $_)) $(send (lvar _) %KIND_METHODS _))
+        (numblock call $1 $(send (lvar _) %KIND_METHODS _))
+        (itblock call $_ $(send (lvar _) %KIND_METHODS _))
+      }
+    captures: [block_arg, kind_check]
+    params: [KIND_METHODS]
+
+hooks:
+  # Upstream hooks `on_send` on the *predicate call* and reaches the block with
+  # `node.block_node`. Prism has one `CallNode` for the call and the Parser
+  # `block` node around it, so the hook is on the block instead and `node` is
+  # both: `node.method_name` is the predicate, `node.selector` its `loc`, and
+  # the matcher sees the Parser `block` shape. `RESTRICT_ON_SEND` therefore has
+  # no send hook to apply to and is spelled as the `in:` guard.
+  #
+  # `return if block_node.body&.begin_type?` needs no transcription: a
+  # multi-statement body is a Parser `begin`, which the matcher's
+  # `(send (lvar _) …)` body term already rejects.
+  #
+  # The second half of `extract_send_node` is
+  #   kind_call?(kind_check_node, block_arg_name)   # (send (lvar %1) %KIND_METHODS _)
+  # re-run with the block parameter's name, and the matcher has already
+  # established everything about that node *except* that its receiver is the
+  # block's own parameter. That residue is the `eq:` below. Upstream renames the
+  # captured value per block kind (`:"_#{n}"` for a numblock, `:it` for an
+  # itblock), which here is simply the literal each hook compares against.
+  - on: [block]
+    match: kind_check
+    when: &pwk_when
+      all:
+        - { in: [node.method_name, [":any?", ":all?", ":none?", ":one?"]] }
+        - { eq: [$kind_check.receiver.name, $block_arg] }
+    bind: &pwk_bind
+      method: node.method_name
+      klass: $kind_check.first_argument.source
+    offense: &pwk_offense
+      location: node
+      message: "Prefer `%{method}(%{klass})` to `%{method} { ... }` with a kind check."
+      correct:
+        - op: replace
+          range: { start: node.selector.start, stop: node.block.end.stop }
+          text: "%{method}(%{klass})"
+
+  - on: [numblock]
+    match: kind_check
+    when:
+      all:
+        - { in: [node.method_name, [":any?", ":all?", ":none?", ":one?"]] }
+        - { eq: [$kind_check.receiver.name, ":_1"] }
+    bind: *pwk_bind
+    offense: *pwk_offense
+
+  - on: [itblock]
+    match: kind_check
+    when:
+      all:
+        - { in: [node.method_name, [":any?", ":all?", ":none?", ":one?"]] }
+        - { eq: [$kind_check.receiver.name, ":it"] }
+    bind: *pwk_bind
+    offense: *pwk_offense
