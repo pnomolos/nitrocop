@@ -1,0 +1,73 @@
+Style/HashExcept: 31 example(s) converted, 68 skipped
+  wrote: tests/python/testdata/spec_to_fixture/style_hash_except/style/hash_except/offense.rb
+  wrote: tests/python/testdata/spec_to_fixture/style_hash_except/style/hash_except/no_offense.rb
+  wrote: tests/python/testdata/spec_to_fixture/style_hash_except/style/hash_except/corrected.rb
+Skipped:
+  spec line 7: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 13: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 24: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 35: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 46: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 57: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 64: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 70: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 81: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 87: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 93: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 99: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 105: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 111: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 117: inside shared_examples/it_behaves_like or a parameterized block
+  spec line 324: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 335: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 346: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 357: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 368: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 379: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 390: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 404: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 415: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 426: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 437: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 448: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 459: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 470: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 483: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 494: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 500: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 506: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 512: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 518: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 524: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 530: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 536: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 542: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 550: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 561: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 572: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 583: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 589: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 600: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 611: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 622: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 635: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 646: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 652: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 658: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 664: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 670: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 676: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 682: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 689: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 695: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 701: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 707: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 713: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 719: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 725: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 731: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 737: let(:config) sets ['AllCops'], not this cop's own options — not representable via # nitrocop-config: (cop-scoped only)
+  spec line 788: tagged unsupported_on: :prism (parser-gem-only behavior)
+  spec line 794: tagged unsupported_on: :prism (parser-gem-only behavior)
+  spec line 800: tagged unsupported_on: :prism (parser-gem-only behavior)
+  spec line 806: tagged unsupported_on: :prism (parser-gem-only behavior)

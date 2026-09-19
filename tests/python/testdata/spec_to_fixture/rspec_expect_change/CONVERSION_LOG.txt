@@ -1,0 +1,7 @@
+RSpec/ExpectChange: 20 example(s) converted, 0 skipped
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/offense.method_call.rb
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/offense.block.rb
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/no_offense.method_call.rb
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/no_offense.block.rb
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/corrected.method_call.rb
+  wrote: tests/python/testdata/spec_to_fixture/rspec_expect_change/rspec/expect_change/corrected.block.rb
