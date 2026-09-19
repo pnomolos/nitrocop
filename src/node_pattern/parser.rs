@@ -4,6 +4,15 @@
 
 use super::lexer::Token;
 
+/// The sentinel node type a sequence gets when its head is not a bare type
+/// name.
+///
+/// `(^send …)` and `({^any_block […]} …)` are legal upstream: the head term is
+/// compiled with `seq_head: true` rather than as a type test
+/// (`compiler/sequence_subcompiler.rb:60-74`). There is no Parser type by this
+/// name, so it cannot collide with a real one.
+pub const COMPLEX_SEQ_HEAD: &str = "_complex";
+
 #[derive(Debug, Clone)]
 pub enum PatternNode {
     /// (node_type child1 child2 ...)
@@ -468,11 +477,14 @@ impl Parser {
                 children,
             })
         } else {
-            // Non-identifier first element (e.g. alternatives) — wrap in _complex
+            // A head term that is not a bare type name — `(^send …)`,
+            // `({^any_block […]} …)` — is parked under a sentinel type with the
+            // real head term as the first child; the interpreter compiles it
+            // with upstream's `seq_head: true` semantics.
             let mut all = vec![first];
             all.extend(children);
             Some(PatternNode::NodeMatch {
-                node_type: "_complex".to_string(),
+                node_type: COMPLEX_SEQ_HEAD.to_string(),
                 children: all,
             })
         }

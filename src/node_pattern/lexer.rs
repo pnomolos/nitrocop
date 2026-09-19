@@ -307,13 +307,22 @@ impl<'a> Lexer<'a> {
                         self.advance();
                         tokens.push(Token::Ident("cbase".to_string()));
                     } else {
-                        // Ruby symbols can be operator method names: :==, :===, :!=,
-                        // :<=>, :<=, :>=, :<<, :>>, :+, :-, :*, :/, :%, :!, :[],
-                        // :[]=, :!~, :=~, :&, :|, :^, :~, :**
-                        let name = if self.peek().is_some_and(|c| b"=<>!~+*&|^/%-.".contains(&c)) {
-                            self.read_while(|c| b"=<>!~+*&|^/%-.[]".contains(&c))
+                        // `lexer.rex`: `SYMBOL_NAME = /[\w+@*\/?!<>=~|%^&-]+|\[\]=?/`.
+                        // The character class covers operator methods (`:<=>`,
+                        // `:**`) and the setter/predicate/bang suffixes
+                        // (`:metadata=`, `:empty?`, `:map!`) in one rule; only
+                        // `:[]` and `:[]=` need the second alternative,
+                        // because `[` is not in the class.
+                        let name = if self.input[self.pos..].starts_with(b"[]=") {
+                            self.pos += 3;
+                            "[]=".to_string()
+                        } else if self.input[self.pos..].starts_with(b"[]") {
+                            self.pos += 2;
+                            "[]".to_string()
                         } else {
-                            self.read_while(|c| Self::is_ident_char(c) || c == b'?')
+                            self.read_while(|c| {
+                                c.is_ascii_alphanumeric() || b"_+@*/?!<>=~|%^&-".contains(&c)
+                            })
                         };
                         tokens.push(Token::SymbolLiteral(name));
                     }

@@ -7518,7 +7518,7 @@ fn verifier_vendor_pattern_builtin_resolution_coverage() {
     // up, and a vendor bump should not have to touch this test to move it a
     // little either way.
     assert!(
-        resolved * 100 >= total * 70,
-        "builtin-only resolution fell below 70% ({resolved}/{total})"
+        resolved * 100 >= total * 75,
+        "builtin-only resolution fell below 75% ({resolved}/{total})"
     );
 }
