@@ -577,6 +577,8 @@ jobs:
     env:
       # Effective run_id to download artifacts from (defaults to current run).
       ARTIFACTS_RUN_ID: ${{ inputs.source_run_id || github.run_id }}
+      # secrets are not readable from step-level `if`; surface presence via env.
+      HAS_GH_APP: ${{ secrets.GH_APP_ID != '' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -894,14 +896,19 @@ jobs:
             docs/cop_coverage.md
           retention-days: 30
 
+      # Both steps are skipped on forks that lack the GitHub App secrets, so
+      # the run still succeeds and the corpus-report artifact stays usable by
+      # check_cop.py (which only considers successful runs).
       - name: Generate app token
         id: app-token
+        if: ${{ env.HAS_GH_APP == 'true' }}
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
 
       - name: Open PR if tiers, README, or corpus report changed
+        if: ${{ env.HAS_GH_APP == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
