@@ -40,6 +40,10 @@ pub static FILES: &[(&str, &str)] = &[
         include_str!("../../resources/ir/style/redundant_min_max_by.cop.yml"),
     ),
     (
+        "src/resources/ir/style/redundant_struct_keyword_init.cop.yml",
+        include_str!("../../resources/ir/style/redundant_struct_keyword_init.cop.yml"),
+    ),
+    (
         "src/resources/ir/style/select_by_kind.cop.yml",
         include_str!("../../resources/ir/style/select_by_kind.cop.yml"),
     ),
@@ -68,6 +72,13 @@ crate::ir_cop_fixture_tests!(
     style_redundant_min_max_by,
     "Style/RedundantMinMaxBy",
     "cops/style/redundant_min_max_by"
+);
+crate::ir_cop_fixture_tests!(
+    style_redundant_struct_keyword_init,
+    "Style/RedundantStructKeywordInit",
+    "cops/style/redundant_struct_keyword_init",
+    // `min_target_ruby: 3.2`; the fixtures are all Ruby >= 3.2 code.
+    "TargetRubyVersion: 3.2"
 );
 crate::ir_cop_fixture_tests!(
     style_select_by_kind,

@@ -1,0 +1,140 @@
+schema: 1
+cop: "Style/RedundantStructKeywordInit"
+version_added: "1.85"
+enabled_default: false
+tier: preview
+autocorrect: unsafe
+# `minimum_target_ruby_version 3.2`.
+min_target_ruby: 3.2
+docs: |
+  Checks for a redundant `keyword_init` option on `Struct.new`.
+
+  Since Ruby 3.2 `keyword_init` defaults to the `nil` behavior, so
+  `keyword_init: nil` and `keyword_init: true` can be dropped. Disabled by
+  default because `keyword_init: true` is not purely redundant: it changes
+  `Struct#keyword_init?` and how a `Hash` argument is treated.
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/style/redundant_struct_keyword_init.rb, except for the
+  # leading `^^` — see the hook comment.
+  struct_new:
+    pattern: |
+      ^^(call (const {nil? cbase} :Struct) :new ...)
+  redundant_keyword_init?:
+    pattern: |
+      (pair (sym :keyword_init) {(true) (nil)})
+  keyword_init_false?:
+    pattern: |
+      (pair (sym :keyword_init) (false))
+
+hooks:
+  # Upstream hooks `on_send` on the `Struct.new` call, selects the
+  # `keyword_init` pairs out of its last argument and calls `register_offense`
+  # once per redundant one. As in `Lint/DataDefineOverride`, a hook reports
+  # once, so the dispatch is inverted: the hook fires on the **pair** and the
+  # matcher ascends two Parser-visible levels (pair -> hash -> call).
+  #
+  # `keyword_init?`, upstream's `{#redundant_keyword_init? #keyword_init_false?}`
+  # union, is not declared as a matcher: `matchers:` compile in name order and
+  # `keyword_init?` sorts *before* both of its operands, so it could not see
+  # them. It is the two-armed `any:` of `all_kw` below instead; the two leaf
+  # patterns stay verbatim, which is what matters.
+  #
+  # Three upstream guards, in order:
+  #
+  # * `node.arguments.none?` cannot hold — a pair is inside the argument list;
+  # * `!node.last_argument.hash_type?` is `last_arg`, which `^^` alone cannot
+  #   express: it pins the pair's grandparent but not that the hash is the
+  #   *last* argument, so `Struct.new({a: 1}, :foo)` would slip through;
+  # * `keyword_init_nodes.any? { keyword_init_false? }` is `no_false`.
+  #
+  # `all_kw` is `range`'s own test — `pair.parent.pairs.all? { keyword_init? }`,
+  # i.e. "the hash holds nothing else, so it is emptied". `register_offense`'s
+  # `range` is an if/elsif/else that a `correct:` list cannot express, so each
+  # of its four outcomes is its own hook, discriminated by the condition
+  # upstream tests for it.
+  - &rski_base
+    on: [pair]
+    match: { all_of: [struct_new, "redundant_keyword_init?"] }
+    bind: &rski_bind
+      # `format(MSG, value: keyword_init.value.source)`; a `pair`'s value is
+      # its last child.
+      value: node.last_child.source
+    when:
+      all:
+        - &last_arg { any_of: { over: ancestors, var: a, body: { eq: [a.last_argument, parent] } } }
+        - &no_false
+          none_of:
+            of: parent
+            over: children
+            var: p
+            body: { matches: [p, "keyword_init_false?"] }
+        - &all_kw
+          all_of:
+            of: parent
+            over: children
+            var: p
+            body:
+              any:
+                - { matches: [p, "redundant_keyword_init?"] }
+                - { matches: [p, "keyword_init_false?"] }
+        # `range_emptying_hash`: `(preceding = pair.parent.left_sibling).is_a?(AST::Node)`.
+        - { ne: [parent.left_sibling, null] }
+    offense: &rski_offense
+      location: node
+      message: "Remove the redundant `keyword_init: %{value}`."
+      correct:
+        - op: remove
+          range:
+            start: parent.left_sibling.expression.stop
+            stop: node.expression.stop
+
+  # `range_emptying_hash`, else branch: nothing precedes the hash, so only the
+  # pair itself goes.
+  - <<: *rski_base
+    when:
+      all:
+        - *last_arg
+        - *no_false
+        - *all_kw
+        - { eq: [parent.left_sibling, null] }
+    offense:
+      <<: *rski_offense
+      correct:
+        - { op: remove, range: node }
+
+  # `range_within_hash`: other pairs remain, so drop this pair and one adjacent
+  # comma. A hash with a single pair always takes `range_emptying_hash` above,
+  # so a pair reaching here always has a sibling — upstream's final `else`,
+  # `pair.source_range`, is unreachable.
+  - <<: *rski_base
+    when:
+      all:
+        - *last_arg
+        - *no_false
+        - { not: *all_kw }
+        - { ne: [node.left_sibling, null] }
+    offense:
+      <<: *rski_offense
+      correct:
+        - op: remove
+          range:
+            start: node.left_sibling.expression.stop
+            stop: node.expression.stop
+
+  - <<: *rski_base
+    when:
+      all:
+        - *last_arg
+        - *no_false
+        - { not: *all_kw }
+        - { eq: [node.left_sibling, null] }
+        - { ne: [node.right_sibling, null] }
+    offense:
+      <<: *rski_offense
+      correct:
+        - op: remove
+          range:
+            start: node.expression.start
+            stop: node.right_sibling.expression.start
