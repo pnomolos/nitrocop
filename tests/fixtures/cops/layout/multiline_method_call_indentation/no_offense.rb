@@ -267,3 +267,15 @@ end
 foo(bar: { a: 1 }.merge(b: 2)
                  .transform_values(&:to_s)
                  .to_a)
+
+# A `->() {}` literal is a `block` node in the parser gem, so its body stops
+# `part_of_assignment_rhs` and the chain falls back to plain indentation.
+def events_by_id
+  recursive_query = ->(non_recursive_term, recursive_term) {
+    Event
+      .unscoped
+      .with_recursive(event_graph: [non_recursive_term, recursive_term])
+      .strict_loading
+  }
+  recursive_query
+end

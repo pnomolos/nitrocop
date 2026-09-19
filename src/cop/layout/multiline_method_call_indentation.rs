@@ -1212,7 +1212,13 @@ fn find_assignment_rhs_base<'a>(
     ancestors: &[ruby_prism::Node<'a>],
 ) -> Option<ruby_prism::Node<'a>> {
     for ancestor in ancestors.iter().rev().skip(1) {
-        if ancestor.as_block_node().is_some() || ancestor.as_begin_node().is_some() {
+        // `part_of_block_body?` and the `kwbegin` member of UNALIGNED_RHS_TYPES.
+        // A `->() {}` literal is a `block` node in the parser gem, so a
+        // `LambdaNode` body stops the walk exactly like a `do ... end` body.
+        if ancestor.as_block_node().is_some()
+            || ancestor.as_lambda_node().is_some()
+            || ancestor.as_begin_node().is_some()
+        {
             break;
         }
         // Mirrors RuboCop's `disqualified_rhs?` / `UNALIGNED_RHS_TYPES`: an
@@ -1595,6 +1601,13 @@ fn left_hand_side_start_offset(
             }
 
             lhs_start = call.location().start_offset();
+            // A call carrying a real block is wrapped in a `block` node by the
+            // parser gem, so `lhs.parent` there is not a call and RuboCop's
+            // `left_hand_side` loop stops. Prism keeps the block on the
+            // `CallNode`, so the stop has to be spelled out.
+            if has_real_block(&call) {
+                break;
+            }
             continue;
         }
 
