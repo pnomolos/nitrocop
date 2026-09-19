@@ -78,6 +78,21 @@ pub enum MatchChild<'pr> {
         /// The value the synthesized node carries.
         value: &'pr [u8],
     },
+    /// A Parser-gem child node that Prism does not materialize *and* that has
+    /// children of its own, so [`MatchChild::Synthetic`]'s single value cannot
+    /// stand in for it.
+    ///
+    /// The assignment target of an `op_asgn` is the case: Parser builds
+    /// `(op_asgn (send (lvar :h) :[] (lvar :k)) :+ (int 1))` for `h[k] += 1`,
+    /// while Prism has one `IndexOperatorWriteNode` holding the receiver and
+    /// the index as fields. Every child of a virtual node is real, so the
+    /// subtree below it matches normally.
+    Virtual {
+        /// The Parser-gem type this stands in for (`send`, `lvasgn`, …).
+        parser_type: &'static str,
+        /// Its Parser-gem children, in order.
+        children: Vec<MatchChild<'pr>>,
+    },
 }
 
 /// Evaluate a term whose meaning comes from outside the pattern text.
@@ -1049,6 +1064,94 @@ fn regexp_options(ignore_case: bool, extended: bool, multi_line: bool) -> &'stat
     OPTIONS[usize::from(ignore_case) | usize::from(multi_line) << 1 | usize::from(extended) << 2]
 }
 
+/// Parser's first child of an `op_asgn` / `or_asgn` / `and_asgn`: the
+/// assignment *target*, as a node.
+///
+/// Prism folds the target into the write node's own fields — an
+/// `IndexOperatorWriteNode` carries the receiver and the index, not a
+/// `(send … :[] …)` child — so the child is rebuilt as a
+/// [`MatchChild::Virtual`]. Upstream patterns address it directly:
+/// `Style/TallyMethod`'s `(op_asgn (send (lvar _hash) :[] (lvar _elem)) :+
+/// (int 1))` is the whole `each_with_object` check.
+///
+/// A target Prism keeps as a real node of its own (a constant path) is left
+/// absent, as it was before.
+fn operator_write_target<'pr>(node: &ruby_prism::Node<'pr>) -> MatchChild<'pr> {
+    /// `h[k] op= v` -> `(send <recv> :[] <index…>)`.
+    macro_rules! index {
+        ($($accessor:ident),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                let mut children = vec![match target.receiver() {
+                    Some(receiver) => MatchChild::Node(receiver),
+                    None => MatchChild::Absent,
+                }];
+                children.push(MatchChild::Name(b"[]"));
+                if let Some(arguments) = target.arguments() {
+                    for argument in arguments.arguments().iter() {
+                        children.push(MatchChild::Node(argument));
+                    }
+                }
+                return MatchChild::Virtual { parser_type: "send", children };
+            }
+        )*};
+    }
+    /// `a.b op= v` -> `(send <recv> :b)`.
+    macro_rules! call {
+        ($($accessor:ident),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                let receiver = match target.receiver() {
+                    Some(receiver) => MatchChild::Node(receiver),
+                    None => MatchChild::Absent,
+                };
+                return MatchChild::Virtual {
+                    parser_type: "send",
+                    children: vec![receiver, MatchChild::Name(target.read_name().as_slice())],
+                };
+            }
+        )*};
+    }
+    /// `x op= v` -> `(lvasgn :x)` and friends.
+    macro_rules! named {
+        ($($accessor:ident => $parser_type:literal),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                return MatchChild::Virtual {
+                    parser_type: $parser_type,
+                    children: vec![MatchChild::Name(target.name().as_slice())],
+                };
+            }
+        )*};
+    }
+
+    index!(
+        as_index_operator_write_node,
+        as_index_or_write_node,
+        as_index_and_write_node,
+    );
+    call!(
+        as_call_operator_write_node,
+        as_call_or_write_node,
+        as_call_and_write_node,
+    );
+    named!(
+        as_local_variable_operator_write_node => "lvasgn",
+        as_local_variable_or_write_node => "lvasgn",
+        as_local_variable_and_write_node => "lvasgn",
+        as_instance_variable_operator_write_node => "ivasgn",
+        as_instance_variable_or_write_node => "ivasgn",
+        as_instance_variable_and_write_node => "ivasgn",
+        as_class_variable_operator_write_node => "cvasgn",
+        as_class_variable_or_write_node => "cvasgn",
+        as_class_variable_and_write_node => "cvasgn",
+        as_global_variable_operator_write_node => "gvasgn",
+        as_global_variable_or_write_node => "gvasgn",
+        as_global_variable_and_write_node => "gvasgn",
+        as_constant_operator_write_node => "casgn",
+        as_constant_or_write_node => "casgn",
+        as_constant_and_write_node => "casgn",
+    );
+    MatchChild::Absent
+}
+
 /// The operator and value of an `op_asgn` / `or_asgn` / `and_asgn` node.
 ///
 /// The operator is `None` for `||=` and `&&=`, which Parser spells as the node
@@ -1537,7 +1640,7 @@ pub(crate) fn get_children<'pr>(
         // is absent; the operator and value are exact.
         "op_asgn" | "or_asgn" | "and_asgn" => {
             let (operator, value) = operator_write_parts(node)?;
-            children.push(MatchChild::Absent);
+            children.push(operator_write_target(node));
             if let Some(operator) = operator {
                 children.push(MatchChild::Name(operator));
             }
@@ -1814,6 +1917,81 @@ fn matches_child<'pr>(
         MatchChild::Synthetic { parser_type, value } => {
             matches_synthetic(pattern, parser_type, value, env)
         }
+        MatchChild::Virtual {
+            parser_type,
+            children,
+        } => matches_virtual(pattern, parser_type, children, env),
+    }
+}
+
+/// Match a pattern against a synthesized Parser-gem child that has children
+/// ([`MatchChild::Virtual`]).
+///
+/// A virtual node has no Prism node behind it, so the three terms that need one
+/// fail closed: `pred?` and `#helper` have nothing to call themselves on, `$`
+/// has nothing to bind (it binds `Absent`), and `_name` has no byte form to
+/// unify by. Everything structural — the type, the children, and `{}` / `[]` /
+/// `!` over them — works exactly as it does for a real node.
+fn matches_virtual<'pr>(
+    pattern: &PatternNode,
+    parser_type: &'static str,
+    children: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    match pattern {
+        PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Ident(name) | PatternNode::TypePredicate(name) => {
+            type_answers(parser_type, name)
+        }
+        PatternNode::NodeMatch {
+            node_type,
+            children: pattern_children,
+        } => {
+            if !type_answers(parser_type, node_type) {
+                return false;
+            }
+            let mark = env.mark();
+            if matches_children_list(pattern_children, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Alternatives(alts) => alts.iter().any(|alt| {
+            let mark = env.mark();
+            if matches_virtual(alt, parser_type, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }),
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items
+                .iter()
+                .all(|item| matches_virtual(item, parser_type, children, env))
+            {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_virtual(inner, parser_type, children, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Absent);
+            if matches_virtual(inner, parser_type, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        _ => false,
     }
 }
 
@@ -1913,6 +2091,8 @@ fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
         MatchChild::Name(bytes) | MatchChild::Synthetic { value: bytes, .. } => {
             CaptureValue::Name(bytes)
         }
+        // Nothing real to bind; see `matches_virtual`.
+        MatchChild::Virtual { .. } => CaptureValue::Absent,
     }
 }
 
@@ -4485,10 +4665,30 @@ mod tests {
             "(block _ (args (mlhs (arg :a) (arg :b))) _)",
             "(block _ (args (arg :a)) _)",
         ),
-        // Operator assignment.
-        ("x += 1", "(op_asgn _ :+ (int 1))", "(op_asgn _ :- _)"),
-        ("x ||= 1", "(or_asgn _ (int 1))", "(and_asgn _ _)"),
-        ("x &&= 1", "(and_asgn _ (int 1))", "(op_asgn ...)"),
+        // Operator assignment. Parser's first child is the assignment target;
+        // Prism folds it into the write node's own fields, so it is rebuilt.
+        (
+            "x += 1",
+            "(op_asgn (lvasgn :x) :+ (int 1))",
+            "(op_asgn _ :- _)",
+        ),
+        ("x ||= 1", "(or_asgn (lvasgn :x) (int 1))", "(and_asgn _ _)"),
+        ("x &&= 1", "(and_asgn (lvasgn :x) (int 1))", "(op_asgn ...)"),
+        (
+            "@x += 1",
+            "(op_asgn (ivasgn :@x) :+ (int 1))",
+            "(op_asgn (lvasgn _) ...)",
+        ),
+        (
+            "h[k] += 1",
+            "(op_asgn (send (send nil? :h) :[] (send nil? :k)) :+ (int 1))",
+            "(op_asgn (send _ :[] (send nil? :other)) ...)",
+        ),
+        (
+            "foo.bar ||= 1",
+            "(or_asgn (send (send nil? :foo) :bar) (int 1))",
+            "(or_asgn (send _ :baz) _)",
+        ),
         // Singleton class and definitions.
         ("class << self; end", "(sclass (self) nil?)", "(class ...)"),
         (
