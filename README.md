@@ -59,7 +59,7 @@ Compared with RuboCop on [**5,587 open-source repos**](docs/corpus.md) (590k Rub
 
 **Default** = default RuboCop config. **All variants** = every supported `EnforcedStyle` (e.g. `EnforcedStyle: comma`).
 
-**[rubocop](https://github.com/rubocop/rubocop)** `1.84.2` (588 cops)
+**[rubocop](https://github.com/rubocop/rubocop)** `1.91.0` (588 cops)
 
 | Department | Cops | Exact match (default) | Exact match (all variants) |
 |------------|-----:|----------------------:|---------------------------:|
@@ -74,19 +74,19 @@ Compared with RuboCop on [**5,587 open-source repos**](docs/corpus.md) (590k Rub
 | Migration | 1 | **1 ✓** | **1 ✓** |
 | **Total** | **588** | **582 (98.9%)** | **580 (98.6%)** |
 
-**[rubocop-rails](https://github.com/rubocop/rubocop-rails)** `2.34.3` (138 cops)
+**[rubocop-rails](https://github.com/rubocop/rubocop-rails)** `2.37.0` (138 cops)
 
 | Department | Cops | Exact match (default) | Exact match (all variants) |
 |------------|-----:|----------------------:|---------------------------:|
 | Rails | 138 | **138 ✓** | **138 ✓** |
 
-**[rubocop-performance](https://github.com/rubocop/rubocop-performance)** `1.26.1` (52 cops)
+**[rubocop-performance](https://github.com/rubocop/rubocop-performance)** `1.27.0` (52 cops)
 
 | Department | Cops | Exact match (default) | Exact match (all variants) |
 |------------|-----:|----------------------:|---------------------------:|
 | Performance | 52 | **52 ✓** | **52 ✓** |
 
-**[rubocop-rspec](https://github.com/rubocop/rubocop-rspec)** `3.9.0` (113 cops)
+**[rubocop-rspec](https://github.com/rubocop/rubocop-rspec)** `3.10.2` (113 cops)
 
 | Department | Cops | Exact match (default) | Exact match (all variants) |
 |------------|-----:|----------------------:|---------------------------:|
