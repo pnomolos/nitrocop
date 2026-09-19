@@ -690,10 +690,10 @@ impl ChainVisitor<'_> {
         let chain_indent = line_indentation(chain_line_bytes);
         let expected = self.width + keyword_extra_indent(call_node, &self.ancestors);
         let what = operation_description(call_node, &self.ancestors);
-        format!(
-            "Use {expected} (not {}) spaces for indenting {what} spanning multiple lines.",
-            rhs_col.saturating_sub(chain_indent)
-        )
+        // `rhs.column - indentation(lhs)` is a plain subtraction in RuboCop and
+        // goes negative when the continuation is outdented past its lhs line.
+        let used = rhs_col as isize - chain_indent as isize;
+        format!("Use {expected} (not {used}) spaces for indenting {what} spanning multiple lines.")
     }
 
     /// Message for `indented_relative_to_receiver` style.

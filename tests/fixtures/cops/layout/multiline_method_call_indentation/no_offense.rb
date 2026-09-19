@@ -347,3 +347,13 @@ def merge_columns
     .concat ['nom'].map { |c| f(c) }
     .concat ['man'].map { |c| f(c) }
 end
+
+# `if` IS in UNALIGNED_RHS_TYPES, so a chain inside a branch of an assigned
+# `if` keeps its branch-local alignment instead of the assignment RHS column.
+def branchy(key, value)
+  result = if key
+    Member
+      .joins(:current_or_future_membership)
+      .distinct
+  end
+end

@@ -286,16 +286,6 @@ def members(key, value)
   end
 end
 
-# `if` IS in UNALIGNED_RHS_TYPES, so a chain inside a branch of an assigned
-# `if` keeps its branch-local alignment instead of the assignment RHS column.
-def branchy(key, value)
-  result = if key
-    Member
-      .joins(:current_or_future_membership)
-      .distinct
-  end
-end
-
 # Hash pair value whose chain base receiver is NOT a hash: every continuation
 # line is measured against the left-hand side, with no block-chain escape.
 def rows(bid)
@@ -303,11 +293,11 @@ def rows(bid)
     {
       prev: @prev_rows
         .select { |r| r.budget_id == bid }
-        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `@prev_rows` on line 250.
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `@prev_rows` on line 240.
         .collect { |r| r.amount }
-        ^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.collect` with `@prev_rows` on line 250.
+        ^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.collect` with `@prev_rows` on line 240.
         .inject(0) { |sum, x| sum + x }
-        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.inject` with `@prev_rows` on line 250.
+        ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.inject` with `@prev_rows` on line 240.
     }
   ]
 end
@@ -320,11 +310,11 @@ def actions
     File.open(file_path, "wb") { |file| file.write("line1") }
   end
   .then("watch") do
-  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 262.
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 252.
     reading.watch_this(watch_dir)
   end
   .then("wait") do
-  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 262.
+  ^^^^^ Layout/MultilineMethodCallIndentation: Align `.then` with `.run` on line 252.
     wait(2)
   end
 end
@@ -336,15 +326,15 @@ end
 def list
   subquery = joins(:dates, :translations)
     .select("events.*", "event_dates.start_at")
-    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 278.
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 268.
     .select(Event::Translation.column_names
-    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 278.
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 268.
                               .reject { |col|
               ["id", "event_id"].include?(col)
             }
                               .map { |col| "event_translations.#{col}" })
     .preload_all_dates
-    ^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.preload_all_dates` with `joins(:dates, :translations)` on line 278.
+    ^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.preload_all_dates` with `joins(:dates, :translations)` on line 268.
   subquery
 end
 
@@ -354,5 +344,5 @@ def links(item)
   item.edition_organisations
       .first
     &.organisation
-    ^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `&.organisation` with `.edition_organisations` on line 292.
+    ^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `&.organisation` with `.edition_organisations` on line 282.
 end
