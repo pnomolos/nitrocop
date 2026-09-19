@@ -51,6 +51,15 @@ use crate::parse::source::SourceFile;
 /// FN=1: `# rubocop:disable Layout/LineLength,` (trailing comma after cop name).
 /// `is_malformed_cop_list` split by comma, got `["Layout/LineLength", ""]`, and skipped
 /// the empty trailing element. Fix: detect trailing comma in `cop_part` before splitting.
+///
+/// ## Vendor bump (rubocop 1.84.2 -> 1.91.0)
+///
+/// `Enabled` flipped from `pending` to `true` in vendor `config/default.yml`
+/// (https://github.com/rubocop/rubocop/pull/15616), so `default_enabled()` no longer
+/// needs to force this off for real-world (non-`.rubocop.yml`) runs — removed the
+/// override, falling back to the `Cop` trait's default of `true`. This cop also now
+/// supersedes `Style/DoubleCopDisableDirective`, which the same PR removed from
+/// vendor config (see `src/cop/style/double_cop_disable_directive.rs`).
 pub struct CopDirectiveSyntax;
 
 impl Cop for CopDirectiveSyntax {
@@ -60,10 +69,6 @@ impl Cop for CopDirectiveSyntax {
 
     fn default_severity(&self) -> Severity {
         Severity::Warning
-    }
-
-    fn default_enabled(&self) -> bool {
-        false
     }
 
     fn check_source(
