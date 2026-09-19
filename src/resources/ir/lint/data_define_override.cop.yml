@@ -1,0 +1,67 @@
+schema: 1
+cop: "Lint/DataDefineOverride"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+autocorrect: none
+severity: warning
+docs: |
+  Checks for `Data.define` members that shadow a method `Data` (or `Object`)
+  already provides, which silently overrides it on the generated class.
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0
+  # lib/rubocop/cop/lint/data_define_override.rb, with one leading `^`.
+  #
+  # Upstream hooks `on_send` on the `Data.define` call and loops over
+  # `node.arguments`, reporting one offense per offending member. A hook's
+  # `offense:` reports once, so the dispatch is inverted: the hook fires on the
+  # *member* and the matcher ascends to assert the enclosing call. That gives
+  # one offense per member with no engine "for each" construct, and `^`
+  # resolves against Parser-visible ancestry, so Prism's `ArgumentsNode` is
+  # traversed and a splatted or hash-nested symbol correctly fails to match —
+  # exactly what `node.arguments` gives upstream.
+  data_define_member:
+    pattern: |
+      ^(send
+        (const {nil? cbase} :Data) :define ...)
+
+hooks:
+  # `DATA_METHOD_NAMES`, verbatim: `Data.define.instance_methods.sort` in Ruby
+  # 4.0.0. A frozen `%i[]` list has no `constants:` spelling (that key is a map
+  # of maps), so it is an `in:` operand list.
+  - on: [sym]
+    match: data_define_member
+    when: &member_overrides_data
+      in:
+        - node.value
+        - &data_method_names [
+            "!", "!=", "!~", "<=>", "==", "===", "__id__", "__send__", "class", "clone",
+            "deconstruct", "deconstruct_keys", "define_singleton_method", "display", "dup",
+            "enum_for", "eql?", "equal?", "extend", "freeze", "frozen?", "hash", "inspect",
+            "instance_eval", "instance_exec", "instance_of?", "instance_variable_defined?",
+            "instance_variable_get", "instance_variable_set", "instance_variables", "is_a?",
+            "itself", "kind_of?", "members", "method", "methods", "nil?", "object_id",
+            "private_methods", "protected_methods", "public_method", "public_methods",
+            "public_send", "remove_instance_variable", "respond_to?", "send",
+            "singleton_class", "singleton_method", "singleton_methods", "tap", "then",
+            "to_enum", "to_h", "to_s", "with", "yield_self",
+          ]
+    bind: &member_name
+      name: node.value
+    offense:
+      location: node
+      # Upstream formats `MSG` with `member_name: member_name.inspect` and
+      # `method_name: member_name.to_s`. `inspect` of a Symbol is `:` plus the
+      # name, and of a String is the name in double quotes, so the two spellings
+      # are inlined into the two hooks' templates rather than needing an
+      # `inspect` attribute.
+      message: "`:%{name}` member overrides `Data#%{name}` and it may be unexpected."
+
+  - on: [str]
+    match: data_define_member
+    when: *member_overrides_data
+    bind: *member_name
+    offense:
+      location: node
+      message: "`\"%{name}\"` member overrides `Data#%{name}` and it may be unexpected."

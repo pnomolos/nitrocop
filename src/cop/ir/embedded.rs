@@ -24,6 +24,10 @@ use super::load::{LoadMode, load_str_with};
 /// `(path relative to the repo root, contents)` for every embedded IR cop.
 pub static FILES: &[(&str, &str)] = &[
     (
+        "src/resources/ir/lint/data_define_override.cop.yml",
+        include_str!("../../resources/ir/lint/data_define_override.cop.yml"),
+    ),
+    (
         "src/resources/ir/style/file_open.cop.yml",
         include_str!("../../resources/ir/style/file_open.cop.yml"),
     ),
@@ -33,6 +37,11 @@ pub static FILES: &[(&str, &str)] = &[
     ),
 ];
 
+crate::ir_cop_fixture_tests!(
+    lint_data_define_override,
+    "Lint/DataDefineOverride",
+    "cops/lint/data_define_override"
+);
 crate::ir_cop_fixture_tests!(style_file_open, "Style/FileOpen", "cops/style/file_open");
 crate::ir_cop_fixture_tests!(style_time_now, "Style/TimeNow", "cops/style/time_now");
 
