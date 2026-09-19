@@ -176,6 +176,11 @@ impl CodeGenerator {
             PatternNode::Wildcard => {
                 // No check needed — any value is OK
             }
+            PatternNode::Unify(name) => {
+                // `_name` unification has no generated form; the interpreter
+                // carries it (`MatchEnv::unify`).
+                self.writeln(&format!("// TODO: unify `_{name}` is interpreter-only"));
+            }
             PatternNode::Rest => {
                 // No check on remaining children
             }

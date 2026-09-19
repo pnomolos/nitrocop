@@ -18,17 +18,44 @@
 //! | `BlockNode` | part of `(block send args body)` | dropped; the enclosing `CallNode` *is* the Parser `block` node |
 //! | `StatementsNode` | `begin`, but only when it holds ≠ 1 statement | dropped when it holds exactly one statement, or when its own parent is a `ParenthesesNode` / `BeginNode` / `EmbeddedStatementsNode` — those already spell the `begin`/`kwbegin` |
 //!
-//! Two divergences are accepted and not worked around:
+//! ## Two levels Prism cannot supply
 //!
-//! - A `CallNode` carrying a literal block is **one** chain entry answering
-//!   both `send` and `block`, where Parser has two nested nodes. `^^` from
-//!   inside such a block therefore lands one level higher than upstream.
-//! - Prism's `BeginNode` + `RescueNode` pair has no `rescue` level, so
-//!   `^^resbody` (`Style/RedundantParentheses`) sees `kwbegin` where upstream
-//!   sees `rescue`.
+//! Both divergences below are properties of the mapping, not of any one
+//! pattern, which is why they are recorded here rather than in a cop. Both
+//! affect `^` *only*: the corresponding **child** slots are exact, because
+//! `interpreter::get_children` can synthesize a level that the chain cannot
+//! (see [`super::interpreter::begin_clause_child`]).
 //!
-//! Both are recorded here rather than in a cop because they are properties of
-//! the mapping, not of any one pattern.
+//! **1. The `send` inside a `block`.** A `CallNode` carrying a literal block is
+//! **one** chain entry answering both `send` and `block`, where Parser has two
+//! nested nodes. For a node in the block's *body* this is already right — `^`
+//! is the block and `^^` is the block's parent, as upstream. For a node in the
+//! *send* half (an argument of `foo(x) { }`) `^` is right and `^^` lands one
+//! level high, because upstream `^^` there is the `block` that this same entry
+//! is already standing for.
+//!
+//! **2. The `rescue` above a `resbody`.** Parser nests
+//! `kwbegin → rescue → resbody`; Prism has `BeginNode → RescueNode`, with the
+//! `rescue` level existing only as a field. `^^resbody`
+//! (`Style/RedundantParentheses#rescue?`) therefore sees `kwbegin` where
+//! upstream sees `rescue`. A keyword-less `BeginNode` *is* the `rescue` node
+//! here ([`super::interpreter::begin_parser_type`]), so the implicit form —
+//! `def m; a; rescue; b; end` — already gives the upstream answer; only the
+//! explicit `begin … end` form is short a level.
+//!
+//! ### What a fix would need
+//!
+//! Neither is a missing accessor: in both cases the Parser level has no Prism
+//! node to point at, and [`visible_index`] / [`nth_ancestor`] return an index
+//! into the real chain and a `&Node`. Closing them means an
+//! `Ancestor::{Node(&Node), Virtual(&'static str)}` return type and teaching
+//! every consumer about the type-only case: `^` in
+//! [`super::interpreter::matches_ascend`] (which today hands the ancestor to
+//! `matches_node`, so `^(rescue $_ ...)` could not read children off a virtual
+//! level at all), plus `PredCtx::nth_ancestor` and the five predicates built on
+//! it (`root?`, `argument?`, `macro?`, `chained?`, `value_used?`). That is a
+//! ~250-line change to semantics PR #11 has just settled, for two vendored
+//! patterns, so it is deliberately deferred.
 
 use ruby_prism::Node;
 

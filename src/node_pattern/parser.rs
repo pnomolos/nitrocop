@@ -91,6 +91,13 @@ pub enum PatternNode {
     },
     /// _
     Wildcard,
+    /// `_name` — a unification variable (`lexer.rex`'s `tUNIFY`).
+    ///
+    /// The first occurrence in a pattern matches anything and binds; every
+    /// later occurrence must equal what it bound. Upstream's own patterns use
+    /// it to tie a block parameter to its use, as in
+    /// `(block _ (args (arg _x)) (lvar _x))`.
+    Unify(String),
     /// ...
     Rest,
     /// !pattern
@@ -479,6 +486,10 @@ impl Parser {
                     "nil" => Some(PatternNode::NilLiteral),
                     "true" => Some(PatternNode::TrueLiteral),
                     "false" => Some(PatternNode::FalseLiteral),
+                    // The lexer already ruled out a bare `_` (that is
+                    // `Token::Wildcard`), so a leading underscore here is
+                    // `tUNIFY` and never a node type name.
+                    _ if name.starts_with('_') => Some(PatternNode::Unify(name)),
                     _ => Some(PatternNode::Ident(name)),
                 }
             }
@@ -829,7 +840,7 @@ pub fn pattern_summary(node: &PatternNode) -> String {
         }
         PatternNode::ParentRef(inner) => format!("^{}", pattern_summary(inner)),
         PatternNode::DescendRef(inner) => format!("`{}", pattern_summary(inner)),
-        PatternNode::Ident(name) => name.clone(),
+        PatternNode::Ident(name) | PatternNode::Unify(name) => name.clone(),
     }
 }
 

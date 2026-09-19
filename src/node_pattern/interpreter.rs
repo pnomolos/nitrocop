@@ -29,8 +29,6 @@
 //! Known divergences from RuboCop's compiler, in addition to the stubs below:
 //!
 //! - `(int $_)` / `(float $_)` bind the literal node, not the numeric value.
-//! - A pattern list without `...` still tolerates extra trailing children,
-//!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
 //! ## Resolution
 //!
@@ -79,6 +77,21 @@ pub enum MatchChild<'pr> {
         parser_type: &'static str,
         /// The value the synthesized node carries.
         value: &'pr [u8],
+    },
+    /// A Parser-gem child node that Prism does not materialize *and* that has
+    /// children of its own, so [`MatchChild::Synthetic`]'s single value cannot
+    /// stand in for it.
+    ///
+    /// The assignment target of an `op_asgn` is the case: Parser builds
+    /// `(op_asgn (send (lvar :h) :[] (lvar :k)) :+ (int 1))` for `h[k] += 1`,
+    /// while Prism has one `IndexOperatorWriteNode` holding the receiver and
+    /// the index as fields. Every child of a virtual node is real, so the
+    /// subtree below it matches normally.
+    Virtual {
+        /// The Parser-gem type this stands in for (`send`, `lvasgn`, …).
+        parser_type: &'static str,
+        /// Its Parser-gem children, in order.
+        children: Vec<MatchChild<'pr>>,
     },
 }
 
@@ -272,7 +285,23 @@ fn descend_children<'pr>(
         return false;
     }
     env.enter(node);
-    let matched = children.iter().any(|child| {
+    let matched = descend_slots(inner, &children, depth, env);
+    env.leave();
+    matched
+}
+
+/// The per-slot half of [`descend_children`], split out so a
+/// [`MatchChild::Virtual`] can hand its own children back to it.
+///
+/// A virtual node has no Prism node to re-enter through, so `` ` `` would stop
+/// at it and never see the `resbody` of a `(kwbegin (rescue …))`.
+fn descend_slots<'pr>(
+    inner: &PatternNode,
+    slots: &[MatchChild<'pr>],
+    depth: usize,
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    slots.iter().any(|child| {
         let mark = env.mark();
         if matches_child(inner, child, env) {
             return true;
@@ -280,11 +309,211 @@ fn descend_children<'pr>(
         env.rollback(mark);
         match child {
             MatchChild::Node(child_node) => descend_children(inner, child_node, depth + 1, env),
+            MatchChild::Virtual { children, .. } => descend_slots(inner, children, depth + 1, env),
             _ => false,
         }
-    });
-    env.leave();
-    matched
+    })
+}
+
+/// The Parser type a Prism `BeginNode` answers to.
+///
+/// Prism folds four Parser shapes into one node. `begin … end` is Parser's
+/// `kwbegin`, and its clauses hang *inside* it, so
+/// `begin; a; rescue; b; ensure; c; end` is
+/// `(kwbegin (ensure (rescue (send nil :a) (resbody nil nil (send nil :b)) nil)
+/// (send nil :c)))`. Without the `begin` keyword there is no `kwbegin` at all —
+/// a `def` / block / `class` body that rescues *is* the `rescue` node, which is
+/// what `(def _ (args) (rescue ...))` is written against — so the node answers
+/// to the outermost clause it carries.
+fn begin_parser_type(begin: &ruby_prism::BeginNode<'_>) -> &'static str {
+    if begin.begin_keyword_loc().is_some() {
+        "kwbegin"
+    } else if begin.ensure_clause().is_some() {
+        "ensure"
+    } else if begin.rescue_clause().is_some() {
+        "rescue"
+    } else {
+        "begin"
+    }
+}
+
+/// Parser's `(rescue <body> <resbody>… <else>)` children for a `BeginNode`.
+///
+/// Prism chains the `rescue` clauses through `RescueNode#subsequent` rather
+/// than listing them; Parser has them flat between the body and the `else`.
+fn rescue_children<'pr>(begin: &ruby_prism::BeginNode<'pr>) -> Vec<MatchChild<'pr>> {
+    let mut children = vec![body_child(begin.statements().map(|s| s.as_node()))];
+    let mut clause = begin.rescue_clause();
+    while let Some(rescue) = clause {
+        children.push(MatchChild::Node(rescue.as_node()));
+        clause = rescue.subsequent();
+    }
+    children.push(body_child(begin.else_clause().map(|e| e.as_node())));
+    children
+}
+
+/// Parser's `(ensure <body> <ensure-body>)` children for a `BeginNode`, where
+/// `<body>` is the `rescue` node when the same `begin` also rescues.
+fn ensure_children<'pr>(begin: &ruby_prism::BeginNode<'pr>) -> Vec<MatchChild<'pr>> {
+    let guarded = if begin.rescue_clause().is_some() {
+        MatchChild::Virtual {
+            parser_type: "rescue",
+            children: rescue_children(begin),
+        }
+    } else {
+        body_child(begin.statements().map(|s| s.as_node()))
+    };
+    let ensured = begin
+        .ensure_clause()
+        .and_then(|clause| clause.statements())
+        .map(|s| s.as_node());
+    vec![guarded, body_child(ensured)]
+}
+
+/// The single Parser child of a `kwbegin` that rescues or ensures.
+///
+/// `begin … end` with no clause is a flat statement list, but one with a clause
+/// wraps the whole list in a `rescue` / `ensure` node Prism does not
+/// materialize — hence [`MatchChild::Virtual`], which
+/// `Lint/SuppressedExceptionInNumberConversion`'s `(kwbegin (rescue $#… (resbody
+/// $_? nil? {(nil) nil?}) nil))` is written against.
+fn begin_clause_child<'pr>(begin: &ruby_prism::BeginNode<'pr>) -> MatchChild<'pr> {
+    if begin.ensure_clause().is_some() {
+        MatchChild::Virtual {
+            parser_type: "ensure",
+            children: ensure_children(begin),
+        }
+    } else {
+        MatchChild::Virtual {
+            parser_type: "rescue",
+            children: rescue_children(begin),
+        }
+    }
+}
+
+/// The match child for a `body` slot, with Prism's `StatementsNode` wrapper
+/// peeled off a one-statement body.
+///
+/// Parser builds a `begin` only for a statement *list*: `def m; x; end` is
+/// `(def :m (args) (send nil :x))`, not `(def :m (args) (begin (send nil :x)))`
+/// — the same rule [`super::ancestors`] applies to the enclosing-node chain.
+/// Prism always wraps a body in a `StatementsNode`, so without this every
+/// upstream pattern that spells a single-statement body — `(block $(call _
+/// {:max_by :min_by}) (args (arg $_x)) (lvar _x))`, say — silently fails to
+/// match. A list of two or more statements *is* a Parser `begin` and is left
+/// alone.
+///
+/// The full rule, from `parser`'s `Builders::Default#compstmt` and restated on
+/// `DefNode#body` (`vendor/rubocop-ast/lib/rubocop/ast/node/def_node.rb:43-51`):
+///
+/// | statements | Parser child |
+/// |---|---|
+/// | 0 | `nil` |
+/// | 1 | the statement itself |
+/// | 2+ | `(begin stmt…)` |
+///
+/// An `ElseNode` is peeled the same way, because Parser has no `else` node —
+/// only the body it guards — which is what the `else` slot of `(if … … …)`,
+/// `(case …)` and `(case_match …)` holds. A `BeginNode` is *not* peeled: it
+/// carries the `rescue`/`ensure` clause Prism keeps in sibling fields, which
+/// is the separate mapping gap recorded on [`super::ancestors`].
+fn body_child<'pr>(body: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
+    let Some(node) = body else {
+        return MatchChild::Absent;
+    };
+    if let Some(else_node) = node.as_else_node() {
+        return body_child(else_node.statements().map(|s| s.as_node()));
+    }
+    if let Some(statements) = node.as_statements_node() {
+        let mut only: Option<ruby_prism::Node<'pr>> = None;
+        for (index, statement) in statements.body().iter().enumerate() {
+            if index > 0 {
+                return MatchChild::Node(node);
+            }
+            only = Some(statement);
+        }
+        // Zero statements is Parser's `nil` body: `if x then end` is
+        // `(if (send nil :x) nil nil)`.
+        return only.map_or(MatchChild::Absent, MatchChild::Node);
+    }
+    MatchChild::Node(node)
+}
+
+/// The match child for a parameter-list slot.
+///
+/// Parser always builds an `(args …)` node for a `def`, `defs` or block, empty
+/// when it takes no parameters; Prism has no node there at all. `(block
+/// #expect? (args) _body)` (`RSpec/VoidExpect`), `(block (send _ :describe
+/// $(const ...) ...) (args) $_)` (`RSpec/DescribedClass`) and `(def :blank?
+/// (args) ...)` (`Rails/Blank`) are all written against that always-present
+/// node.
+///
+/// The synthetic carries no value, so [`matches_synthetic`] gives it an empty
+/// child list: `(args)` matches a parameterless definition and `(args _)` does
+/// not. A `$` on the slot binds the empty byte slice — there is no node.
+fn args_child<'pr>(params: Option<ruby_prism::Node<'pr>>) -> MatchChild<'pr> {
+    match params {
+        Some(node) => MatchChild::Node(node),
+        None => MatchChild::Synthetic {
+            parser_type: "args",
+            value: b"",
+        },
+    }
+}
+
+/// The Parser-gem sibling of `node` among `parent`'s children, `offset` places
+/// away (`-1` for `left_sibling`, `1` for `right_sibling`).
+///
+/// `RuboCop::AST::Node#left_sibling` indexes into `parent.children`, which for
+/// a `send` includes the method *name* — a Symbol, not a node — which is why
+/// `Style/RedundantStructKeywordInit` guards its result with
+/// `.is_a?(AST::Node)`. The same distinction survives here: a slot that is not
+/// a [`MatchChild::Node`] answers `None`, so `Struct.new(keyword_init: nil)`
+/// correctly finds no node before the hash while
+/// `Struct.new(:foo, keyword_init: nil)` finds `:foo`.
+// Consumed by the IR cop runtime on the `ir/*` branches (`Cop IR:
+// Style/RedundantStructKeywordInit`), which is not on this branch yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn parser_sibling<'pr>(
+    node: &ruby_prism::Node<'pr>,
+    parent: &ruby_prism::Node<'pr>,
+    offset: isize,
+) -> Option<ruby_prism::Node<'pr>> {
+    let parser_type = parser_type_for_node(parent).or_else(|| block_type_of(parent))?;
+    let children = get_children(parser_type, parent)?;
+    // `NodeId` rather than the byte range alone: a wrapper can share its only
+    // child's range (a one-pair `KeywordHashNode` and its `AssocNode` do), and
+    // a range-only test would then call a node its own child.
+    let wanted = NodeId::of(node);
+    let index = children.iter().position(|child| match child {
+        MatchChild::Node(child) => NodeId::of(child) == wanted,
+        _ => false,
+    })?;
+    let target = index.checked_add_signed(offset)?;
+    match children.get(target)? {
+        MatchChild::Node(sibling) => Some(dup_node(sibling)),
+        _ => None,
+    }
+}
+
+/// Whether `parent` has `node` as a direct Parser-gem child.
+// Consumed by the IR cop runtime on the `ir/*` branches (`Cop IR:
+// Style/RedundantStructKeywordInit`), which is not on this branch yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn is_parser_child(node: &ruby_prism::Node<'_>, parent: &ruby_prism::Node<'_>) -> bool {
+    let Some(parser_type) = parser_type_for_node(parent).or_else(|| block_type_of(parent)) else {
+        return false;
+    };
+    let Some(children) = get_children(parser_type, parent) else {
+        return false;
+    };
+    let wanted = NodeId::of(node);
+    children.iter().any(|child| match child {
+        MatchChild::Node(child) => NodeId::of(child) == wanted,
+        _ => false,
+    })
 }
 
 /// Everything `descend` should walk into below `node`.
@@ -859,6 +1088,8 @@ pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'stat
 
     // Use matches! for everything else
     match node {
+        // Parser spells the implicit `it` of a `{ it }` block `(lvar :it)`.
+        ruby_prism::Node::ItLocalVariableReadNode { .. } => Some("lvar"),
         ruby_prism::Node::BlockNode { .. } => node.as_block_node().as_ref().map(block_node_type),
         ruby_prism::Node::DefNode { .. } => {
             // def vs defs: defs has a receiver
@@ -874,18 +1105,7 @@ pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'stat
         }
         ruby_prism::Node::ConstantReadNode { .. } => Some("const"),
         ruby_prism::Node::ConstantPathNode { .. } => Some("const"),
-        // Parser splits Prism's `BeginNode`: `begin … end` is `kwbegin`, while
-        // an implicit body wrapper is just the statement list.
-        ruby_prism::Node::BeginNode { .. } => Some(
-            if node
-                .as_begin_node()
-                .is_some_and(|begin| begin.begin_keyword_loc().is_some())
-            {
-                "kwbegin"
-            } else {
-                "begin"
-            },
-        ),
+        ruby_prism::Node::BeginNode { .. } => node.as_begin_node().as_ref().map(begin_parser_type),
         // Parser's `begin` is a statement list; Prism spells that three ways.
         ruby_prism::Node::StatementsNode { .. }
         | ruby_prism::Node::ParenthesesNode { .. }
@@ -921,9 +1141,16 @@ pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'stat
         ruby_prism::Node::RegularExpressionNode { .. } => Some("regexp"),
         ruby_prism::Node::ClassNode { .. } => Some("class"),
         ruby_prism::Node::ModuleNode { .. } => Some("module"),
-        ruby_prism::Node::LocalVariableWriteNode { .. } => Some("lvasgn"),
-        ruby_prism::Node::InstanceVariableWriteNode { .. } => Some("ivasgn"),
-        ruby_prism::Node::ConstantWriteNode { .. } => Some("casgn"),
+        // Parser spells an assignment the same way with or without a value:
+        // `x = 1` is `(lvasgn :x (int 1))` and the `x` of `x, y = 1, 2`,
+        // `for x in …` or `rescue => x` is `(lvasgn :x)`. Prism has a separate
+        // `*TargetNode` for the value-less form.
+        ruby_prism::Node::LocalVariableWriteNode { .. }
+        | ruby_prism::Node::LocalVariableTargetNode { .. } => Some("lvasgn"),
+        ruby_prism::Node::InstanceVariableWriteNode { .. }
+        | ruby_prism::Node::InstanceVariableTargetNode { .. } => Some("ivasgn"),
+        ruby_prism::Node::ConstantWriteNode { .. }
+        | ruby_prism::Node::ConstantTargetNode { .. } => Some("casgn"),
         ruby_prism::Node::SplatNode { .. } => Some("splat"),
         ruby_prism::Node::SuperNode { .. } => Some("super"),
         ruby_prism::Node::ForwardingSuperNode { .. } => Some("zsuper"),
@@ -952,8 +1179,10 @@ pub(crate) fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'stat
         ruby_prism::Node::InNode { .. } => Some("in_pattern"),
         ruby_prism::Node::SingletonClassNode { .. } => Some("sclass"),
         ruby_prism::Node::MultiWriteNode { .. } => Some("masgn"),
-        ruby_prism::Node::ClassVariableWriteNode { .. } => Some("cvasgn"),
-        ruby_prism::Node::GlobalVariableWriteNode { .. } => Some("gvasgn"),
+        ruby_prism::Node::ClassVariableWriteNode { .. }
+        | ruby_prism::Node::ClassVariableTargetNode { .. } => Some("cvasgn"),
+        ruby_prism::Node::GlobalVariableWriteNode { .. }
+        | ruby_prism::Node::GlobalVariableTargetNode { .. } => Some("gvasgn"),
         ruby_prism::Node::NextNode { .. } => Some("next"),
         ruby_prism::Node::BreakNode { .. } => Some("break"),
         ruby_prism::Node::DefinedNode { .. } => Some("defined?"),
@@ -1017,6 +1246,94 @@ fn numbered_parameter_count(params: Option<&ruby_prism::Node<'_>>) -> &'static [
 fn regexp_options(ignore_case: bool, extended: bool, multi_line: bool) -> &'static [u8] {
     const OPTIONS: [&[u8]; 8] = [b"", b"i", b"m", b"im", b"x", b"ix", b"mx", b"imx"];
     OPTIONS[usize::from(ignore_case) | usize::from(multi_line) << 1 | usize::from(extended) << 2]
+}
+
+/// Parser's first child of an `op_asgn` / `or_asgn` / `and_asgn`: the
+/// assignment *target*, as a node.
+///
+/// Prism folds the target into the write node's own fields — an
+/// `IndexOperatorWriteNode` carries the receiver and the index, not a
+/// `(send … :[] …)` child — so the child is rebuilt as a
+/// [`MatchChild::Virtual`]. Upstream patterns address it directly:
+/// `Style/TallyMethod`'s `(op_asgn (send (lvar _hash) :[] (lvar _elem)) :+
+/// (int 1))` is the whole `each_with_object` check.
+///
+/// A target Prism keeps as a real node of its own (a constant path) is left
+/// absent, as it was before.
+fn operator_write_target<'pr>(node: &ruby_prism::Node<'pr>) -> MatchChild<'pr> {
+    /// `h[k] op= v` -> `(send <recv> :[] <index…>)`.
+    macro_rules! index {
+        ($($accessor:ident),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                let mut children = vec![match target.receiver() {
+                    Some(receiver) => MatchChild::Node(receiver),
+                    None => MatchChild::Absent,
+                }];
+                children.push(MatchChild::Name(b"[]"));
+                if let Some(arguments) = target.arguments() {
+                    for argument in arguments.arguments().iter() {
+                        children.push(MatchChild::Node(argument));
+                    }
+                }
+                return MatchChild::Virtual { parser_type: "send", children };
+            }
+        )*};
+    }
+    /// `a.b op= v` -> `(send <recv> :b)`.
+    macro_rules! call {
+        ($($accessor:ident),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                let receiver = match target.receiver() {
+                    Some(receiver) => MatchChild::Node(receiver),
+                    None => MatchChild::Absent,
+                };
+                return MatchChild::Virtual {
+                    parser_type: "send",
+                    children: vec![receiver, MatchChild::Name(target.read_name().as_slice())],
+                };
+            }
+        )*};
+    }
+    /// `x op= v` -> `(lvasgn :x)` and friends.
+    macro_rules! named {
+        ($($accessor:ident => $parser_type:literal),* $(,)?) => {$(
+            if let Some(target) = node.$accessor() {
+                return MatchChild::Virtual {
+                    parser_type: $parser_type,
+                    children: vec![MatchChild::Name(target.name().as_slice())],
+                };
+            }
+        )*};
+    }
+
+    index!(
+        as_index_operator_write_node,
+        as_index_or_write_node,
+        as_index_and_write_node,
+    );
+    call!(
+        as_call_operator_write_node,
+        as_call_or_write_node,
+        as_call_and_write_node,
+    );
+    named!(
+        as_local_variable_operator_write_node => "lvasgn",
+        as_local_variable_or_write_node => "lvasgn",
+        as_local_variable_and_write_node => "lvasgn",
+        as_instance_variable_operator_write_node => "ivasgn",
+        as_instance_variable_or_write_node => "ivasgn",
+        as_instance_variable_and_write_node => "ivasgn",
+        as_class_variable_operator_write_node => "cvasgn",
+        as_class_variable_or_write_node => "cvasgn",
+        as_class_variable_and_write_node => "cvasgn",
+        as_global_variable_operator_write_node => "gvasgn",
+        as_global_variable_or_write_node => "gvasgn",
+        as_global_variable_and_write_node => "gvasgn",
+        as_constant_operator_write_node => "casgn",
+        as_constant_or_write_node => "casgn",
+        as_constant_and_write_node => "casgn",
+    );
+    MatchChild::Absent
 }
 
 /// The operator and value of an `op_asgn` / `or_asgn` / `and_asgn` node.
@@ -1140,27 +1457,15 @@ pub(crate) fn get_children<'pr>(
                     parser_type: "sym",
                     value: b"it",
                 }),
-                _ => match params {
-                    Some(p) => children.push(MatchChild::Node(p)),
-                    None => children.push(MatchChild::Absent),
-                },
+                _ => children.push(args_child(params)),
             }
-            match body {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(body));
         }
         "def" => {
             let def = node.as_def_node()?;
             children.push(MatchChild::Name(def.name().as_slice()));
-            match def.parameters() {
-                Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
-            match def.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(args_child(def.parameters().map(|p| p.as_node())));
+            children.push(body_child(def.body()));
         }
         "defs" => {
             let def = node.as_def_node()?;
@@ -1169,14 +1474,8 @@ pub(crate) fn get_children<'pr>(
                 None => children.push(MatchChild::Absent),
             }
             children.push(MatchChild::Name(def.name().as_slice()));
-            match def.parameters() {
-                Some(p) => children.push(MatchChild::Node(p.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
-            match def.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(args_child(def.parameters().map(|p| p.as_node())));
+            children.push(body_child(def.body()));
         }
         "const" => {
             // Parser gem: (const parent :Name) — parent is nil for bare constants.
@@ -1217,15 +1516,23 @@ pub(crate) fn get_children<'pr>(
             }
         }
         "kwbegin" => {
-            // Parser: `(kwbegin stmt …)`. A `rescue`/`ensure` clause is a child
-            // of the Parser node too; Prism keeps them in sibling fields, so
-            // only the statements are exposed here.
-            if let Some(stmts) = node.as_begin_node()?.statements() {
+            // Parser: `(kwbegin stmt …)`, except that a `rescue` / `ensure`
+            // clause wraps the whole list in one node, so the `kwbegin` then
+            // has exactly one child.
+            let begin = node.as_begin_node()?;
+            if begin.rescue_clause().is_some() || begin.ensure_clause().is_some() {
+                children.push(begin_clause_child(&begin));
+            } else if let Some(stmts) = begin.statements() {
                 for stmt in stmts.body().iter() {
                     children.push(MatchChild::Node(stmt));
                 }
             }
         }
+        // Parser: `(rescue <body> <resbody>… <else>)` and
+        // `(ensure <body> <ensure-body>)`, which a keyword-less Prism
+        // `BeginNode` stands for.
+        "rescue" => children.extend(rescue_children(&node.as_begin_node()?)),
+        "ensure" => children.extend(ensure_children(&node.as_begin_node()?)),
         "pair" => {
             let assoc = node.as_assoc_node()?;
             children.push(MatchChild::Node(assoc.key()));
@@ -1245,8 +1552,16 @@ pub(crate) fn get_children<'pr>(
             }
         }
         "lvar" => {
-            let lv = node.as_local_variable_read_node()?;
-            children.push(MatchChild::Name(lv.name().as_slice()));
+            // Parser has no node for the implicit `it` of a `{ it }` block: it
+            // is `(lvar :it)`, which is what `(itblock … (lvar :it))` and
+            // `Style/RedundantMinMaxBy`'s `itblock` matcher expect. Prism gives
+            // it its own type with no name accessor, so the name is literal.
+            if node.as_it_local_variable_read_node().is_some() {
+                children.push(MatchChild::Name(b"it"));
+            } else {
+                let lv = node.as_local_variable_read_node()?;
+                children.push(MatchChild::Name(lv.name().as_slice()));
+            }
         }
         "ivar" => {
             let iv = node.as_instance_variable_read_node()?;
@@ -1281,14 +1596,8 @@ pub(crate) fn get_children<'pr>(
         "if" => {
             let if_node = node.as_if_node()?;
             children.push(MatchChild::Node(if_node.predicate()));
-            match if_node.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
-            match if_node.subsequent() {
-                Some(s) => children.push(MatchChild::Node(s)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(if_node.statements().map(|s| s.as_node())));
+            children.push(body_child(if_node.subsequent()));
         }
         "case" => {
             let case = node.as_case_node()?;
@@ -1299,45 +1608,30 @@ pub(crate) fn get_children<'pr>(
             for cond in case.conditions().iter() {
                 children.push(MatchChild::Node(cond));
             }
-            match case.else_clause() {
-                Some(e) => children.push(MatchChild::Node(e.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(case.else_clause().map(|e| e.as_node())));
         }
         "when" => {
             let when = node.as_when_node()?;
             for cond in when.conditions().iter() {
                 children.push(MatchChild::Node(cond));
             }
-            match when.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(when.statements().map(|s| s.as_node())));
         }
         "while" => {
             let w = node.as_while_node()?;
             children.push(MatchChild::Node(w.predicate()));
-            match w.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(w.statements().map(|s| s.as_node())));
         }
         "until" => {
             let u = node.as_until_node()?;
             children.push(MatchChild::Node(u.predicate()));
-            match u.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(u.statements().map(|s| s.as_node())));
         }
         "for" => {
             let f = node.as_for_node()?;
             children.push(MatchChild::Node(f.index()));
             children.push(MatchChild::Node(f.collection()));
-            match f.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(f.statements().map(|s| s.as_node())));
         }
         "return" => {
             let r = node.as_return_node()?;
@@ -1446,10 +1740,7 @@ pub(crate) fn get_children<'pr>(
             for condition in case.conditions().iter() {
                 children.push(MatchChild::Node(condition));
             }
-            match case.else_clause() {
-                Some(e) => children.push(MatchChild::Node(e.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(case.else_clause().map(|e| e.as_node())));
         }
         "in_pattern" => {
             // Parser: `(in_pattern pattern guard body)`. Prism folds the guard
@@ -1459,19 +1750,13 @@ pub(crate) fn get_children<'pr>(
             let in_node = node.as_in_node()?;
             children.push(MatchChild::Node(in_node.pattern()));
             children.push(MatchChild::Absent);
-            match in_node.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(in_node.statements().map(|s| s.as_node())));
         }
         "sclass" => {
             // Parser: `(sclass expr body)`.
             let sclass = node.as_singleton_class_node()?;
             children.push(MatchChild::Node(sclass.expression()));
-            match sclass.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(sclass.body()));
         }
         "masgn" => {
             // Parser: `(masgn (mlhs target…) value)`. Prism's `MultiWriteNode`
@@ -1499,7 +1784,7 @@ pub(crate) fn get_children<'pr>(
         // is absent; the operator and value are exact.
         "op_asgn" | "or_asgn" | "and_asgn" => {
             let (operator, value) = operator_write_parts(node)?;
-            children.push(MatchChild::Absent);
+            children.push(operator_write_target(node));
             if let Some(operator) = operator {
                 children.push(MatchChild::Name(operator));
             }
@@ -1507,13 +1792,18 @@ pub(crate) fn get_children<'pr>(
         }
         "cvasgn" | "gvasgn" => {
             let (name, value) = if let Some(cv) = node.as_class_variable_write_node() {
-                (cv.name(), cv.value())
+                (cv.name(), Some(cv.value()))
+            } else if let Some(gv) = node.as_global_variable_write_node() {
+                (gv.name(), Some(gv.value()))
+            } else if let Some(ct) = node.as_class_variable_target_node() {
+                (ct.name(), None)
             } else {
-                let gv = node.as_global_variable_write_node()?;
-                (gv.name(), gv.value())
+                (node.as_global_variable_target_node()?.name(), None)
             };
             children.push(MatchChild::Name(name.as_slice()));
-            children.push(MatchChild::Node(value));
+            if let Some(value) = value {
+                children.push(MatchChild::Node(value));
+            }
         }
         "next" | "break" => {
             let arguments = if let Some(n) = node.as_next_node() {
@@ -1531,19 +1821,25 @@ pub(crate) fn get_children<'pr>(
             children.push(MatchChild::Node(node.as_defined_node()?.value()));
         }
         "resbody" => {
-            // Parser: `(resbody (array exception…) var body)`. Prism keeps the
-            // exception list flat, with no `array` node to stand in for, so the
-            // first child is absent.
+            // Parser: `(resbody (array exception…) var body)`, with `nil` in
+            // place of the array when the clause names no exception. Prism
+            // keeps the list flat on the node, so the `array` is virtual.
             let resbody = node.as_rescue_node()?;
-            children.push(MatchChild::Absent);
+            let exceptions: Vec<MatchChild<'pr>> =
+                resbody.exceptions().iter().map(MatchChild::Node).collect();
+            children.push(if exceptions.is_empty() {
+                MatchChild::Absent
+            } else {
+                MatchChild::Virtual {
+                    parser_type: "array",
+                    children: exceptions,
+                }
+            });
             match resbody.reference() {
                 Some(r) => children.push(MatchChild::Node(r)),
                 None => children.push(MatchChild::Absent),
             }
-            match resbody.statements() {
-                Some(s) => children.push(MatchChild::Node(s.as_node())),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(resbody.statements().map(|s| s.as_node())));
         }
         "rational" | "complex" => {
             // Value-only nodes — matched via the literal special-cases.
@@ -1555,33 +1851,33 @@ pub(crate) fn get_children<'pr>(
                 Some(s) => children.push(MatchChild::Node(s)),
                 None => children.push(MatchChild::Absent),
             }
-            match c.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
-            }
+            children.push(body_child(c.body()));
         }
         "module" => {
             let m = node.as_module_node()?;
             children.push(MatchChild::Node(m.constant_path()));
-            match m.body() {
-                Some(b) => children.push(MatchChild::Node(b)),
-                None => children.push(MatchChild::Absent),
+            children.push(body_child(m.body()));
+        }
+        // Parser: `(lvasgn :x value)`, or `(lvasgn :x)` in a target position
+        // (`x, y = …`, `for x in …`, `rescue => x`) where there is no value.
+        "lvasgn" | "ivasgn" | "casgn" => {
+            let (name, value) = if let Some(lv) = node.as_local_variable_write_node() {
+                (lv.name(), Some(lv.value()))
+            } else if let Some(iv) = node.as_instance_variable_write_node() {
+                (iv.name(), Some(iv.value()))
+            } else if let Some(cw) = node.as_constant_write_node() {
+                (cw.name(), Some(cw.value()))
+            } else if let Some(lt) = node.as_local_variable_target_node() {
+                (lt.name(), None)
+            } else if let Some(it) = node.as_instance_variable_target_node() {
+                (it.name(), None)
+            } else {
+                (node.as_constant_target_node()?.name(), None)
+            };
+            children.push(MatchChild::Name(name.as_slice()));
+            if let Some(value) = value {
+                children.push(MatchChild::Node(value));
             }
-        }
-        "lvasgn" => {
-            let lv = node.as_local_variable_write_node()?;
-            children.push(MatchChild::Name(lv.name().as_slice()));
-            children.push(MatchChild::Node(lv.value()));
-        }
-        "ivasgn" => {
-            let iv = node.as_instance_variable_write_node()?;
-            children.push(MatchChild::Name(iv.name().as_slice()));
-            children.push(MatchChild::Node(iv.value()));
-        }
-        "casgn" => {
-            let cw = node.as_constant_write_node()?;
-            children.push(MatchChild::Name(cw.name().as_slice()));
-            children.push(MatchChild::Node(cw.value()));
         }
         "splat" => {
             let s = node.as_splat_node()?;
@@ -1782,15 +2078,92 @@ fn matches_child<'pr>(
         MatchChild::Synthetic { parser_type, value } => {
             matches_synthetic(pattern, parser_type, value, env)
         }
+        MatchChild::Virtual {
+            parser_type,
+            children,
+        } => matches_virtual(pattern, parser_type, children, env),
+    }
+}
+
+/// Match a pattern against a synthesized Parser-gem child that has children
+/// ([`MatchChild::Virtual`]).
+///
+/// A virtual node has no Prism node behind it, so the three terms that need one
+/// fail closed: `pred?` and `#helper` have nothing to call themselves on, `$`
+/// has nothing to bind (it binds `Absent`), and `_name` has no byte form to
+/// unify by. Everything structural — the type, the children, and `{}` / `[]` /
+/// `!` over them — works exactly as it does for a real node.
+fn matches_virtual<'pr>(
+    pattern: &PatternNode,
+    parser_type: &'static str,
+    children: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    match pattern {
+        PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Ident(name) | PatternNode::TypePredicate(name) => {
+            type_answers(parser_type, name)
+        }
+        PatternNode::NodeMatch {
+            node_type,
+            children: pattern_children,
+        } => {
+            if !type_answers(parser_type, node_type) {
+                return false;
+            }
+            let mark = env.mark();
+            if matches_children_list(pattern_children, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Alternatives(alts) => alts.iter().any(|alt| {
+            let mark = env.mark();
+            if matches_virtual(alt, parser_type, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }),
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items
+                .iter()
+                .all(|item| matches_virtual(item, parser_type, children, env))
+            {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_virtual(inner, parser_type, children, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Absent);
+            if matches_virtual(inner, parser_type, children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        _ => false,
     }
 }
 
 /// Match a pattern against a synthesized Parser-gem child
 /// ([`MatchChild::Synthetic`]).
 ///
-/// The synthesized node has exactly one child — its value — so `(str $_)`,
-/// `(regopt)` and the bare literal forms (`:it`, `1`) all work; anything that
-/// addresses a deeper structure does not.
+/// The synthesized node has one child — its value — so `(str $_)`, `(regopt :i)`
+/// and the bare literal forms (`:it`, `1`) all work; anything that addresses a
+/// deeper structure does not. An **empty** value stands for no children at all,
+/// which is what Parser's `(lambda)` and an option-less `(regopt)` are, and
+/// what the exact-arity rule in [`matches_children_list`] needs them to be.
 fn matches_synthetic<'pr>(
     pattern: &PatternNode,
     parser_type: &'static str,
@@ -1799,6 +2172,7 @@ fn matches_synthetic<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Unify(name) => env.unify(name, value),
         PatternNode::Ident(name) | PatternNode::TypePredicate(name) => {
             type_answers(parser_type, name)
         }
@@ -1819,7 +2193,12 @@ fn matches_synthetic<'pr>(
                 return false;
             }
             let mark = env.mark();
-            if matches_children_list(children, &[MatchChild::Name(value)], env) {
+            let actuals: &[MatchChild<'pr>] = if value.is_empty() {
+                &[]
+            } else {
+                &[MatchChild::Name(value)]
+            };
+            if matches_children_list(children, actuals, env) {
                 return true;
             }
             env.rollback(mark);
@@ -1873,6 +2252,8 @@ fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
         MatchChild::Name(bytes) | MatchChild::Synthetic { value: bytes, .. } => {
             CaptureValue::Name(bytes)
         }
+        // Nothing real to bind; see `matches_virtual`.
+        MatchChild::Virtual { .. } => CaptureValue::Absent,
     }
 }
 
@@ -1930,8 +2311,18 @@ fn matches_seq_head<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard | PatternNode::Rest => true,
+        PatternNode::Unify(name) => env.unify(name, node.location().as_slice()),
         // A type name, which is what a head term usually is.
         PatternNode::Ident(name) | PatternNode::TypePredicate(name) => node_has_type(node, name),
+        // `nil`, `true` and `false` are node *type* names in head position —
+        // `(nil)`, `(true)`, `(false)` are how upstream spells those literals
+        // as sequences (`Style/RedundantStructKeywordInit`'s
+        // `(pair (sym :keyword_init) {(true) (nil)})`). The parser reads a bare
+        // one as the literal term it is everywhere else, so the head is parked
+        // under the complex-head sentinel and lands here.
+        PatternNode::NilLiteral => node_has_type(node, "nil"),
+        PatternNode::TrueLiteral => node_has_type(node, "true"),
+        PatternNode::FalseLiteral => node_has_type(node, "false"),
         // `access_node` ignores `seq_head`, so these see the node.
         PatternNode::ParentRef(_) | PatternNode::DescendRef(_) => {
             matches_deferred(pattern, &PredTarget::Node(node), env)
@@ -2051,6 +2442,10 @@ fn matches_node<'pr>(
         PatternNode::TypePredicate(typ) => node_has_type(node, typ),
 
         PatternNode::Ident(name) => node_has_type(node, name),
+
+        // A node in a `_name` position unifies on its verbatim source; see
+        // `MatchEnv::unify`.
+        PatternNode::Unify(name) => env.unify(name, node.location().as_slice()),
 
         PatternNode::NodeMatch {
             node_type,
@@ -2173,6 +2568,9 @@ fn matches_node<'pr>(
 fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr, '_>) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
+        // No byte string a real node or name can produce, so `_x` bound to an
+        // absent child only ever unifies with another absent child.
+        PatternNode::Unify(name) => env.unify(name, b"\0<absent>"),
         PatternNode::NilPredicate => true,
         PatternNode::Alternatives(alts) => {
             for alt in alts {
@@ -2226,6 +2624,9 @@ fn matches_name<'pr>(
 ) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
+        // The position upstream's own patterns actually unify in: a block
+        // parameter's name against the `lvar` that uses it.
+        PatternNode::Unify(name) => env.unify(name, bytes),
         PatternNode::SymbolLiteral(name) => bytes == name.as_bytes(),
         PatternNode::StringLiteral(s) => bytes == s.as_bytes(),
         PatternNode::Alternatives(alts) => {
@@ -2290,25 +2691,6 @@ fn is_variadic_term(pattern: &PatternNode) -> bool {
         }
         PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => true,
         PatternNode::Alternatives(alts) => alts.iter().any(is_variadic_term),
-        _ => as_rest_term(pattern).is_some(),
-    }
-}
-
-/// Whether a term can consume an unbounded number of children.
-fn contains_rest(pattern: &PatternNode) -> bool {
-    match pattern {
-        // `x*` / `x+` have no upper bound, so the enclosing list's arity is
-        // `n..∞` and every child has to be accounted for, exactly as with
-        // `...`. `x?` is bounded and leaves the list's permissive tail rule
-        // alone.
-        PatternNode::Repetition { kind, .. } => kind.is_unbounded(),
-        PatternNode::Alternatives(items)
-        | PatternNode::Subsequence(items)
-        | PatternNode::AnyOrder(items) => items.iter().any(contains_rest),
-        // `$<a ...>` is unbounded exactly when the group it wraps is.
-        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => {
-            contains_rest(inner)
-        }
         _ => as_rest_term(pattern).is_some(),
     }
 }
@@ -2555,17 +2937,25 @@ fn match_repetition<'pr>(
 ///
 /// A rest term (`...`, `$...`) matches a variable-length run, so the walk
 /// backtracks over every split point and rewinds the captures written by a
-/// rejected split. With a rest term present the arity is exact — the rest
-/// absorbs the slack, as in RuboCop's sequence compiler. Without one, extra
-/// trailing children are still tolerated (pre-existing permissive behaviour).
+/// rejected split.
+///
+/// **Arity is always exact**: every child has to be accounted for, whether or
+/// not the list has a rest term. That is `compile_child_nb_guard`
+/// (`compiler/sequence_subcompiler.rb:243-255`), which emits `==` for a fixed
+/// list and `>=`/a range for a variadic one — in both cases a guard that no
+/// unconsumed child survives.
+///
+/// This used to tolerate unconsumed trailing children when the list had no rest
+/// term. The first cop to notice was `Style/TimeNow`, whose
+/// `(call (const {nil? cbase} :Time) :new)` is upstream's spelling of
+/// "`Time.new` with *no* arguments" and matched `Time.new(2026, 8, 19)` here.
 fn matches_children_list<'pr>(
     patterns: &[PatternNode],
     actuals: &[MatchChild<'pr>],
     env: &mut MatchEnv<'pr, '_>,
 ) -> bool {
     let terms: Vec<&PatternNode> = patterns.iter().collect();
-    let exact = patterns.iter().any(contains_rest);
-    match_sequence(&terms, actuals, env, exact)
+    match_sequence(&terms, actuals, env, true)
 }
 
 /// Splice `head` (a union branch or subsequence body) in front of `tail`.
@@ -3685,6 +4075,157 @@ mod tests {
         assert!(!interpret_pattern("(sym :bar)", &node));
     }
 
+    /// Prism wraps every body in a `StatementsNode`; Parser only builds a
+    /// `begin` for a list of two or more, so a one-statement body is peeled.
+    #[test]
+    fn single_statement_body_is_not_a_begin() {
+        let one = ruby_prism::parse(b"items.each { |x| x }");
+        let node = first_stmt(&one);
+        assert!(interpret_pattern("(block _ _ (lvar :x))", &node));
+        assert!(!interpret_pattern("(block _ _ (begin (lvar :x)))", &node));
+
+        let two = ruby_prism::parse(b"items.each { |x| x; x }");
+        let node = first_stmt(&two);
+        assert!(interpret_pattern(
+            "(block _ _ (begin (lvar :x) (lvar :x)))",
+            &node
+        ));
+        assert!(!interpret_pattern("(block _ _ (lvar :x))", &node));
+
+        let def_one = ruby_prism::parse(b"def m; a; end");
+        let node = first_stmt(&def_one);
+        assert!(interpret_pattern("(def :m (args) (send nil? :a))", &node));
+        assert!(!interpret_pattern(
+            "(def :m (args) (begin (send nil? :a)))",
+            &node
+        ));
+
+        let klass = ruby_prism::parse(b"class C; a; end");
+        let node = first_stmt(&klass);
+        assert!(interpret_pattern(
+            "(class (const nil? :C) nil? (send nil? :a))",
+            &node
+        ));
+    }
+
+    /// `lexer.rex`'s `tUNIFY`: the first `_name` binds, later ones compare.
+    #[test]
+    fn unify_variables_bind_then_compare() {
+        let same = ruby_prism::parse(b"array.max_by { |x| x }");
+        let node = first_stmt(&same);
+        assert!(interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _x))",
+            &node
+        ));
+        assert!(interpret_pattern(
+            "(block $(call _ {:max_by :min_by :minmax_by}) (args (arg $_x)) (lvar _x))",
+            &node,
+        ));
+        // A different name is a *first* occurrence, so it binds and matches.
+        assert!(interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _y))",
+            &node
+        ));
+
+        let other = ruby_prism::parse(b"array.max_by { |x| y }");
+        let node = first_stmt(&other);
+        assert!(!interpret_pattern(
+            "(block _ (args (arg _x)) (lvar _x))",
+            &node
+        ));
+
+        // A binding made by a `...` placement that then fails must not leak
+        // into the next placement the interpreter tries.
+        let rest = ruby_prism::parse(b"z = 1; b = 2; a = 3; f(z, b, a, a)");
+        let node = {
+            let program = rest.node();
+            let statements = program.as_program_node().unwrap().statements();
+            statements.body().iter().last().unwrap()
+        };
+        assert!(interpret_pattern(
+            "(send nil? :f ... (lvar _x) (lvar _x))",
+            &node
+        ));
+        assert!(!interpret_pattern(
+            "(send nil? :f ... (lvar _x) (lvar _x) (lvar _x))",
+            &node
+        ));
+    }
+
+    /// Parser spells the implicit `it` of a `{ it }` block `(lvar :it)`.
+    #[test]
+    fn implicit_it_is_an_lvar() {
+        let source = ruby_prism::parse(b"array.max_by { it }");
+        let node = first_stmt(&source);
+        assert!(interpret_pattern("(itblock _ _ (lvar :it))", &node));
+        assert!(!interpret_pattern("(itblock _ _ (lvar :other))", &node));
+    }
+
+    /// `(nil)`, `(true)` and `(false)` are sequences whose head is a node
+    /// *type*, which is how upstream spells those literals inside a pattern.
+    #[test]
+    fn literal_sequences_are_type_heads() {
+        for (source, matching, other) in [
+            ("a = nil", "(nil)", "(true)"),
+            ("a = true", "(true)", "(false)"),
+            ("a = false", "(false)", "(nil)"),
+        ] {
+            let parsed = ruby_prism::parse(source.as_bytes());
+            let node = first_stmt(&parsed);
+            let pattern = format!("(lvasgn :a {matching})");
+            assert!(interpret_pattern(&pattern, &node), "{pattern} vs {source}");
+            let pattern = format!("(lvasgn :a {other})");
+            assert!(!interpret_pattern(&pattern, &node), "{pattern} vs {source}");
+        }
+        let parsed = ruby_prism::parse(b"Struct.new(keyword_init: nil)");
+        let node = first_stmt(&parsed);
+        assert!(interpret_pattern(
+            "(send _ :new (hash (pair (sym :keyword_init) {(true) (nil)})))",
+            &node,
+        ));
+    }
+
+    /// `Node#left_sibling` / `#right_sibling` over the Parser-gem child list,
+    /// where a `send`'s method name is a name rather than a node.
+    #[test]
+    fn parser_siblings_skip_non_node_slots() {
+        test_support::with_node_and_chain(
+            "Struct.new(:foo, a: 1, keyword_init: nil)\n",
+            "keyword_init: nil",
+            |pair, chain| {
+                let hash = chain.last().expect("the pair is inside the hash");
+                assert!(is_parser_child(pair, hash));
+                let left = parser_sibling(pair, hash, -1).expect("`a: 1`");
+                assert_eq!(left.location().as_slice(), b"a: 1");
+                assert!(parser_sibling(pair, hash, 1).is_none());
+
+                let call = chain
+                    .iter()
+                    .rev()
+                    .find(|node| is_parser_child(hash, node))
+                    .expect("the hash is an argument of the call");
+                // `:foo` precedes the hash in the argument list.
+                let left = parser_sibling(hash, call, -1).expect("`:foo`");
+                assert_eq!(left.location().as_slice(), b":foo");
+                assert!(parser_sibling(hash, call, 1).is_none());
+            },
+        );
+        // With no preceding argument the slot before the hash is the method
+        // *name*, which is not a node — upstream's `.is_a?(AST::Node)` guard.
+        test_support::with_node_and_chain(
+            "Struct.new(keyword_init: nil)\n",
+            "Struct.new(keyword_init: nil)",
+            |call, _| {
+                let hash = call
+                    .as_call_node()
+                    .and_then(|c| c.arguments())
+                    .and_then(|a| a.arguments().iter().next())
+                    .expect("the hash argument");
+                assert!(parser_sibling(&hash, call, -1).is_none());
+            },
+        );
+    }
+
     #[test]
     fn test_block_pattern() {
         let source = b"items.each { |x| x }";
@@ -4359,15 +4900,36 @@ mod tests {
             "(block _ (args (mlhs (arg :a) (arg :b))) _)",
             "(block _ (args (arg :a)) _)",
         ),
-        // Operator assignment.
-        ("x += 1", "(op_asgn _ :+ (int 1))", "(op_asgn _ :- _)"),
-        ("x ||= 1", "(or_asgn _ (int 1))", "(and_asgn _ _)"),
-        ("x &&= 1", "(and_asgn _ (int 1))", "(op_asgn ...)"),
+        // Operator assignment. Parser's first child is the assignment target;
+        // Prism folds it into the write node's own fields, so it is rebuilt.
+        (
+            "x += 1",
+            "(op_asgn (lvasgn :x) :+ (int 1))",
+            "(op_asgn _ :- _)",
+        ),
+        ("x ||= 1", "(or_asgn (lvasgn :x) (int 1))", "(and_asgn _ _)"),
+        ("x &&= 1", "(and_asgn (lvasgn :x) (int 1))", "(op_asgn ...)"),
+        (
+            "@x += 1",
+            "(op_asgn (ivasgn :@x) :+ (int 1))",
+            "(op_asgn (lvasgn _) ...)",
+        ),
+        (
+            "h[k] += 1",
+            "(op_asgn (send (send nil? :h) :[] (send nil? :k)) :+ (int 1))",
+            "(op_asgn (send _ :[] (send nil? :other)) ...)",
+        ),
+        (
+            "foo.bar ||= 1",
+            "(or_asgn (send (send nil? :foo) :bar) (int 1))",
+            "(or_asgn (send _ :baz) _)",
+        ),
         // Singleton class and definitions.
         ("class << self; end", "(sclass (self) nil?)", "(class ...)"),
         (
             "def self.m; end",
-            "(defs (self) :m nil? nil?)",
+            // Parser always builds an `(args)` node, empty or not.
+            "(defs (self) :m (args) nil?)",
             "(def :m nil? nil?)",
         ),
         ("def m; end", "any_def", "(defs ...)"),
@@ -4448,5 +5010,490 @@ mod tests {
         let captures = match_with_captures("(numblock $(send _ :each) $_ _)", &node).unwrap();
         assert_eq!(captured_src(&captures, 0), "items.each { _2 }");
         assert_eq!(captured_name(&captures, 1), "2");
+    }
+
+    // ── The Parser body rule and the always-present `(args)` ──────────────
+
+    /// `(ruby, pattern, should_match)` for the two child-slot rules Prism
+    /// forces on us.
+    ///
+    /// **Body.** Parser builds a node for a statement *list* only when it holds
+    /// two or more statements (`Builders::Default#compstmt`, and the note on
+    /// `DefNode#body`): 0 is `nil`, 1 is the statement itself, 2+ is
+    /// `(begin …)`. Prism always materializes a `StatementsNode`, so
+    /// [`body_child`] peels it at every body slot.
+    ///
+    /// **`(args)`.** Parser always builds an `args` node for a `def`, `defs` or
+    /// block, empty or not; Prism has no node there, so [`args_child`]
+    /// synthesizes one with no children.
+    const BODY_AND_ARGS_CASES: &[(&str, &str, bool)] = &[
+        // ── `def` / `defs` body: the three rows of the rule ──
+        ("def m; end", "(def :m (args) nil?)", true),
+        ("def m; x; end", "(def :m (args) (send nil? :x))", true),
+        // One statement is *not* a `begin`.
+        ("def m; x; end", "(def :m (args) (begin ...))", false),
+        (
+            "def m; x; y; end",
+            "(def :m (args) (begin (send nil? :x) (send nil? :y)))",
+            true,
+        ),
+        ("def m; x; y; end", "(def :m (args) (send nil? :x))", false),
+        (
+            "def self.m; x; end",
+            "(defs (self) :m (args) (send nil? :x))",
+            true,
+        ),
+        // ── the always-present `(args)` ──
+        ("def m; end", "(def :m (args) _)", true),
+        // …with no children, so a child term has to fail.
+        ("def m; end", "(def :m (args _) _)", false),
+        // …and it is a node, so `nil?` has to fail.
+        ("def m; end", "(def :m nil? _)", false),
+        ("def m; end", "(def :m args _)", true),
+        ("def m(); end", "(def :m (args) _)", true),
+        ("def m(a); end", "(def :m (args (arg :a)) nil?)", true),
+        ("def m(a); end", "(def :m (args) nil?)", false),
+        ("def self.m; end", "(defs (self) :m (args) nil?)", true),
+        // ── blocks, including the `lambda` and `it`/`_1` spellings ──
+        ("foo { }", "(block (send nil? :foo) (args) nil?)", true),
+        ("foo { }", "(block (send nil? :foo) (args _) _)", false),
+        (
+            "foo { bar }",
+            "(block (send nil? :foo) (args) (send nil? :bar))",
+            true,
+        ),
+        (
+            "foo { bar; baz }",
+            "(block (send nil? :foo) (args) (begin (send nil? :bar) (send nil? :baz)))",
+            true,
+        ),
+        (
+            "foo { |a| bar }",
+            "(block (send nil? :foo) (args (arg :a)) (send nil? :bar))",
+            true,
+        ),
+        (
+            "foo { _1 }",
+            "(numblock (send nil? :foo) 1 (lvar :_1))",
+            true,
+        ),
+        (
+            "foo { it }",
+            "(itblock (send nil? :foo) :it (lvar :it))",
+            true,
+        ),
+        (
+            "-> { bar }",
+            "(block (lambda) (args) (send nil? :bar))",
+            true,
+        ),
+        ("-> { bar }", "(block (lambda) (args _) _)", false),
+        ("->(a) { bar }", "(block (lambda) (args (arg :a)) _)", true),
+        // ── `if`: the `then` half, and the `else` half Prism wraps in an
+        //    `ElseNode` that Parser does not have at all ──
+        (
+            "if a then b end",
+            "(if (send nil? :a) (send nil? :b) nil?)",
+            true,
+        ),
+        ("if a then end", "(if (send nil? :a) nil? nil?)", true),
+        (
+            "if a then b else c end",
+            "(if _ (send nil? :b) (send nil? :c))",
+            true,
+        ),
+        (
+            "if a then b else c; d end",
+            "(if _ _ (begin (send nil? :c) (send nil? :d)))",
+            true,
+        ),
+        // An `elsif` is a nested `if` upstream too, so it is left alone.
+        (
+            "if a then b elsif c then d end",
+            "(if _ _ (if (send nil? :c) (send nil? :d) nil?))",
+            true,
+        ),
+        ("b if a", "(if (send nil? :a) (send nil? :b) nil?)", true),
+        ("a ? b : c", "(if _ (send nil? :b) (send nil? :c))", true),
+        // ── loops ──
+        (
+            "while a; b; end",
+            "(while (send nil? :a) (send nil? :b))",
+            true,
+        ),
+        ("while a; end", "(while (send nil? :a) nil?)", true),
+        (
+            "until a; b; end",
+            "(until (send nil? :a) (send nil? :b))",
+            true,
+        ),
+        // A value-less assignment target is still a Parser `lvasgn`.
+        (
+            "for i in xs; b; end",
+            "(for (lvasgn :i) (send nil? :xs) (send nil? :b))",
+            true,
+        ),
+        ("a, b = 1, 2", "(masgn _ (array (int 1) (int 2)))", true),
+        // ── `case` / `when` / `in` ──
+        (
+            "case x; when 1 then a; else b; end",
+            "(case (send nil? :x) (when (int 1) (send nil? :a)) (send nil? :b))",
+            true,
+        ),
+        (
+            "case x; when 1 then a; end",
+            "(case _ (when (int 1) (send nil? :a)) nil?)",
+            true,
+        ),
+        (
+            "case x; when 1; end",
+            "(case _ (when (int 1) nil?) nil?)",
+            true,
+        ),
+        (
+            "case x; in Integer then a; end",
+            "(case_match _ (in_pattern (const nil? :Integer) nil? (send nil? :a)) nil?)",
+            true,
+        ),
+        // ── `class` / `module` / `sclass` ──
+        (
+            "class C; a; end",
+            "(class (const nil? :C) nil? (send nil? :a))",
+            true,
+        ),
+        ("class C; end", "(class (const nil? :C) nil? nil?)", true),
+        (
+            "module M; a; end",
+            "(module (const nil? :M) (send nil? :a))",
+            true,
+        ),
+        (
+            "class << self; a; end",
+            "(sclass (self) (send nil? :a))",
+            true,
+        ),
+        // ── a parenthesized expression is a Parser `begin` in its own right,
+        //    and the body rule must not touch it ──
+        ("(a).freeze", "(send (begin (send nil? :a)) :freeze)", true),
+    ];
+
+    /// `(ruby, pattern, should_match)` for Parser's `rescue` / `ensure` /
+    /// `resbody` shapes, which Prism folds into one `BeginNode` plus a chain of
+    /// `RescueNode`s.
+    ///
+    /// Parser: `begin; a; rescue E => e; b; else; c; ensure; d; end` is
+    /// `(kwbegin (ensure (rescue (send nil :a) (resbody (array (const nil :E))
+    /// (lvasgn :e) (send nil :b)) (send nil :c)) (send nil :d)))`. Without the
+    /// `begin` keyword there is no `kwbegin` and the clause node *is* the body.
+    const RESCUE_CASES: &[(&str, &str, bool)] = &[
+        // A keyword-less `BeginNode` is the clause node, not a `begin`.
+        (
+            "def m; a; rescue; b; end",
+            "(def :m (args) (rescue (send nil? :a) (resbody nil? nil? (send nil? :b)) nil?))",
+            true,
+        ),
+        (
+            "def m; a; rescue; b; end",
+            "(def :m (args) (begin ...))",
+            false,
+        ),
+        (
+            "def m; a; ensure; b; end",
+            "(def :m (args) (ensure (send nil? :a) (send nil? :b)))",
+            true,
+        ),
+        (
+            "def m; a; rescue; b; ensure; c; end",
+            "(def :m (args) (ensure (rescue (send nil? :a) (resbody ...) nil?) (send nil? :c)))",
+            true,
+        ),
+        // `begin … end` keeps its `kwbegin`, with the clause as its one child.
+        (
+            "begin; a; rescue; b; end",
+            "(kwbegin (rescue (send nil? :a) (resbody nil? nil? (send nil? :b)) nil?))",
+            true,
+        ),
+        (
+            "begin; a; b; end",
+            "(kwbegin (send nil? :a) (send nil? :b))",
+            true,
+        ),
+        (
+            "begin; a; rescue; b; else; c; end",
+            "(kwbegin (rescue (send nil? :a) (resbody ...) (send nil? :c)))",
+            true,
+        ),
+        // Several `rescue` clauses are flat between the body and the `else`.
+        (
+            "begin; a; rescue A; b; rescue B; c; end",
+            "(kwbegin (rescue (send nil? :a) (resbody (array (const nil? :A)) nil? _) \
+             (resbody (array (const nil? :B)) nil? _) nil?))",
+            true,
+        ),
+        // The exception list is Parser's `(array …)`, `nil` when there is none.
+        (
+            "begin; a; rescue E => e; b; end",
+            "(kwbegin (rescue _ (resbody (array (const nil? :E)) (lvasgn :e) _) nil?))",
+            true,
+        ),
+        (
+            "begin; a; rescue; b; end",
+            "(kwbegin (rescue _ (resbody (array ...) _ _) nil?))",
+            false,
+        ),
+        // `` ` `` walks through the virtual clause nodes.
+        (
+            "begin; a; rescue; b; end",
+            "`(resbody nil? nil? (send nil? :b))",
+            true,
+        ),
+        (
+            "def m; a; rescue E; b; end",
+            "`(resbody (array (const nil? :E)) nil? _)",
+            true,
+        ),
+    ];
+
+    #[test]
+    fn rescue_and_ensure_follow_the_parser_shape() {
+        for (source, pattern, expected) in RESCUE_CASES {
+            assert_eq!(
+                matches_src(pattern, source),
+                *expected,
+                "`{pattern}` against `{source}` should be {expected}",
+            );
+        }
+    }
+
+    /// `Lint/SuppressedExceptionInNumberConversion`, verbatim, which is the
+    /// only vendored pattern with a `(kwbegin (rescue …))` head.
+    #[test]
+    fn the_vendored_kwbegin_rescue_pattern_matches() {
+        let pattern = "(kwbegin\n  (rescue\n    $(send nil? :Integer _)\n    (resbody $_? nil?\n      {(nil) nil?}) nil?))";
+        assert!(matches_src(
+            pattern,
+            "begin\n  Integer(x)\nrescue\n  nil\nend"
+        ));
+        assert!(!matches_src(
+            pattern,
+            "begin\n  Integer(x)\nrescue\n  0\nend"
+        ));
+    }
+
+    #[test]
+    fn body_and_args_slots_follow_the_parser_rule() {
+        for (source, pattern, expected) in BODY_AND_ARGS_CASES {
+            assert_eq!(
+                matches_src(pattern, source),
+                *expected,
+                "`{pattern}` against `{source}` should be {expected}",
+            );
+        }
+    }
+
+    /// Vendored patterns that cannot match at all without the two rules above,
+    /// against a realistic snippet each.
+    ///
+    /// `(cop, pattern, ruby, should_match)`. Every pattern is the verbatim text
+    /// from `vendor/`, so these double as a regression net on the extractor's
+    /// view of them.
+    const VENDORED_BODY_AND_ARGS_PATTERNS: &[(&str, &str, &str, bool)] = &[
+        (
+            "Rails/Blank#defining_blank?",
+            "(def :blank? (args) ...)",
+            "def blank?; true; end",
+            true,
+        ),
+        (
+            "Rails/Blank#defining_blank?",
+            "(def :blank? (args) ...)",
+            "def blank?(strict); true; end",
+            false,
+        ),
+        (
+            "Style/RedundantInitialize#initialize_forwards?",
+            "(def _ (args $arg*) $({super zsuper} ...))",
+            "def initialize(a, b); super; end",
+            true,
+        ),
+        (
+            "Style/RedundantInitialize#initialize_forwards?",
+            "(def _ (args $arg*) $({super zsuper} ...))",
+            "def initialize(a); @a = a; end",
+            false,
+        ),
+        (
+            "Style/TrivialAccessors#looks_like_trivial_writer?",
+            "{(def    _ (args (arg ...)) (ivasgn _ (lvar _)))\n (defs _ _ (args (arg ...)) (ivasgn _ (lvar _)))}",
+            "def foo=(val); @foo = val; end",
+            true,
+        ),
+        (
+            "Style/TrivialAccessors#looks_like_trivial_writer?",
+            "{(def    _ (args (arg ...)) (ivasgn _ (lvar _)))\n (defs _ _ (args (arg ...)) (ivasgn _ (lvar _)))}",
+            "def self.foo=(val); @foo = val; end",
+            true,
+        ),
+        (
+            "Performance/RedundantBlockCall#blockarg_def",
+            "{(def  _   (args ... (blockarg $_)) $_)\n (defs _ _ (args ... (blockarg $_)) $_)}",
+            "def m(&block); block.call; end",
+            true,
+        ),
+        (
+            "Style/SignalException#custom_fail_methods",
+            "{(def :fail ...) (defs _ :fail ...)}",
+            "def fail(msg); raise msg; end",
+            true,
+        ),
+        (
+            "Rails/ReversibleMigrationMethodDefinition#change_method?",
+            "`(def :change (args) _)",
+            "class M < Base; def change; add_column; end; end",
+            true,
+        ),
+        (
+            "Rails/ReversibleMigrationMethodDefinition#change_method?",
+            "`(def :change (args) _)",
+            "class M < Base; def change(dir); add_column; end; end",
+            false,
+        ),
+        (
+            "Rails/DefaultScope#class_method_definition?",
+            "(defs _ :default_scope args ...)",
+            "def self.default_scope; where(a: 1); end",
+            true,
+        ),
+        (
+            "Rails/DefaultScope#eigenclass_method_definition?",
+            "(sclass (self) $(def :default_scope args ...))",
+            "class << self\n  def default_scope; where(a: 1); end\nend",
+            true,
+        ),
+        (
+            "Style/RedundantSortBy#redundant_sort_by_block",
+            "(block $(call _ :sort_by) (args (arg $_x)) (lvar _x))",
+            "xs.sort_by { |a| a }",
+            true,
+        ),
+        (
+            "Style/RedundantSortBy#redundant_sort_by_block",
+            "(block $(call _ :sort_by) (args (arg $_x)) (lvar _x))",
+            "xs.sort_by { |a| b }",
+            false,
+        ),
+        (
+            "Style/RedundantSortBy#redundant_sort_by_numblock",
+            "(numblock $(call _ :sort_by) 1 (lvar :_1))",
+            "xs.sort_by { _1 }",
+            true,
+        ),
+        (
+            "Style/RedundantSortBy#redundant_sort_by_itblock",
+            "(itblock $(call _ :sort_by) _ (lvar :it))",
+            "xs.sort_by { it }",
+            true,
+        ),
+        (
+            "RSpecRails/AvoidSetupHook#setup_call",
+            "(block\n  $(send nil? :setup)\n  (args) _)",
+            "setup do\n  foo\nend",
+            true,
+        ),
+        (
+            "RSpec/DescribedClass#described_constant",
+            "(block (send _ :describe $(const ...) ...) (args) $_)",
+            "describe Foo do\n  bar\nend",
+            true,
+        ),
+        (
+            "RSpec/DescribedClass#described_constant",
+            "(block (send _ :describe $(const ...) ...) (args) $_)",
+            "describe Foo do |x|\n  bar\nend",
+            false,
+        ),
+        // The body rule cuts both ways: `(begin ...)` demands a *list*, so a
+        // one-statement `reduce` block must not match.
+        (
+            "Lint/NextWithoutAccumulator#on_block_body_of_reduce",
+            "{\n  (block (call _recv {:reduce :inject} !sym) _blockargs $(begin ...))\n  (numblock (call _recv {:reduce :inject} !sym) _argscount $(begin ...))\n}",
+            "xs.reduce(0) { |a, b| next if a; a + b }",
+            true,
+        ),
+        (
+            "Lint/NextWithoutAccumulator#on_block_body_of_reduce",
+            "{\n  (block (call _recv {:reduce :inject} !sym) _blockargs $(begin ...))\n  (numblock (call _recv {:reduce :inject} !sym) _argscount $(begin ...))\n}",
+            "xs.reduce(0) { |a, b| a + b }",
+            false,
+        ),
+        (
+            "Style/BitwisePredicate#allbits?",
+            "{\n  (send (begin (send _ :& _flags)) :== _flags)\n  (send (begin (send _flags :& _)) :== _flags)\n}",
+            "(x & FLAG) == FLAG",
+            true,
+        ),
+        (
+            "Style/SafeNavigation#and_inside_begin?",
+            "`(begin and ...)",
+            "foo((a && b))",
+            true,
+        ),
+        (
+            "Style/RedundantFreeze#operation_produces_immutable_object",
+            "(begin (send {float int} {:+ :- :* :** :/ :% :<<} _))",
+            "(1 + 2)",
+            true,
+        ),
+    ];
+
+    #[test]
+    fn vendored_body_and_args_patterns_match_their_snippets() {
+        for (cop, pattern, source, expected) in VENDORED_BODY_AND_ARGS_PATTERNS {
+            assert_eq!(
+                matches_src(pattern, source),
+                *expected,
+                "{cop}: `{pattern}` against `{source}` should be {expected}",
+            );
+        }
+    }
+
+    /// A `$` on the synthesized `(args)` has no node to bind, so it binds the
+    /// empty slice. Documented, not desired: an IR cop that wants the
+    /// parameter list must read it off the `def` node itself.
+    #[test]
+    fn capturing_an_empty_args_binds_no_node() {
+        let result = ruby_prism::parse(b"def m; end");
+        let node = first_stmt(&result);
+        let captures = match_with_captures("(def :m $(args) _)", &node).unwrap();
+        assert!(matches!(captures[0], CaptureValue::Name(b"")));
+    }
+
+    /// The body rule changes what a `$` on a body slot binds: the statement,
+    /// not Prism's wrapper.
+    #[test]
+    fn capturing_a_one_statement_body_binds_the_statement() {
+        let result = ruby_prism::parse(b"def m; foo; end");
+        let node = first_stmt(&result);
+        let captures = match_with_captures("(def :m (args) $_)", &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "foo");
+
+        let result = ruby_prism::parse(b"def m; foo; bar; end");
+        let node = first_stmt(&result);
+        let captures = match_with_captures("(def :m (args) $_)", &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "foo; bar");
+    }
+
+    /// `^` from inside a one-statement body sees the `def`, not the wrapper —
+    /// the child-slot rule and [`super::ancestors`] agree.
+    #[test]
+    fn a_one_statement_body_is_not_a_level_of_ancestry() {
+        assert!(matches_at("^(def :m ...)", "def m; foo; end\n", "foo"));
+        // Two statements *are* a `begin`, so there the wrapper is a level.
+        assert!(matches_at("^(begin ...)", "def m; foo; bar; end\n", "foo"));
+        assert!(matches_at(
+            "^^(def :m ...)",
+            "def m; foo; bar; end\n",
+            "foo"
+        ));
     }
 }

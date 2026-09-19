@@ -9,6 +9,19 @@
 //! place to look for the approximations each type carries. Types whose Parser
 //! children Prism does not materialize at all (`regopt`, and the `int` child of
 //! `numblock`) are synthesized there and have no accessor here.
+//!
+//! Three rules cut across the table and live in `get_children` rather than in a
+//! per-row accessor:
+//!
+//! - **Bodies.** Prism always wraps a body in a `StatementsNode`; Parser builds
+//!   a node only for a list of two or more. `interpreter::body_child` peels the
+//!   one-statement case, reports the empty one as absent, and peels the
+//!   `ElseNode` Parser has no node for at all.
+//! - **`(args)`.** Parser always gives a `def`, `defs` or block an `args` node,
+//!   empty or not; `interpreter::args_child` synthesizes the empty one.
+//! - **`rescue` / `ensure`.** One Prism `BeginNode` stands for up to three
+//!   Parser nodes; `interpreter::begin_parser_type` picks which one it answers
+//!   to and `begin_clause_child` supplies the rest as virtual children.
 
 use std::collections::HashMap;
 
@@ -375,6 +388,25 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
             cast_method: "as_begin_node",
             child_accessors: &[("body", "statements().body()")],
         },
+        // `rescue` and `ensure` are the same `BeginNode` seen without a `begin`
+        // keyword; the interpreter picks between them, and the `kwbegin` case
+        // carries one of them as a virtual child.
+        NodeMapping {
+            parser_type: "rescue",
+            prism_type: "BeginNode",
+            cast_method: "as_begin_node",
+            child_accessors: &[
+                ("body", "statements()"),
+                ("resbodies", "rescue_clause()"),
+                ("else", "else_clause()"),
+            ],
+        },
+        NodeMapping {
+            parser_type: "ensure",
+            prism_type: "BeginNode",
+            cast_method: "as_begin_node",
+            child_accessors: &[("body", "statements()"), ("ensure", "ensure_clause()")],
+        },
         NodeMapping {
             parser_type: "block_pass",
             prism_type: "BlockArgumentNode",
@@ -513,7 +545,11 @@ pub fn build_mapping_table() -> HashMap<&'static str, &'static NodeMapping> {
             parser_type: "resbody",
             prism_type: "RescueNode",
             cast_method: "as_rescue_node",
-            child_accessors: &[("var", "reference()"), ("body", "statements()")],
+            child_accessors: &[
+                ("exceptions", "exceptions()"),
+                ("var", "reference()"),
+                ("body", "statements()"),
+            ],
         },
         NodeMapping {
             parser_type: "cbase",
@@ -608,6 +644,9 @@ mod tests {
             "blockarg",
             "case_match",
             "in_pattern",
+            "rescue",
+            "ensure",
+            "resbody",
             "xstr",
             "irange",
             "erange",
