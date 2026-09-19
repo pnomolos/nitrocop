@@ -761,7 +761,9 @@ impl Cop for FetchEnvVar {
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
-        let allowed_vars = config.get_string_array("AllowedVars");
+        // Renamed AllowedVars -> AllowedVariables in rubocop 1.9x (config/obsoletion.yml
+        // warns on the old name but does not translate its value; matches real RuboCop).
+        let allowed_vars = config.get_string_array("AllowedVariables");
         let default_to_nil = config.get_bool("DefaultToNil", true);
 
         let mut visitor = FetchEnvVarVisitor {

@@ -20,6 +20,23 @@ use crate::parse::source::SourceFile;
 /// improved the cop from Actual=428 to Actual=427 against Expected=425.
 /// Remaining gap is concentrated in `jruby` (+5) and `jsonapi-resources` (+1),
 /// offset by two repos with missing detections; those patterns were deferred.
+///
+/// ## Vendor bump (rubocop 1.84.2 -> 1.91.0)
+///
+/// Upstream dropped the `AllowedMethods` option entirely (no `include AllowedMethods`
+/// mixin, no `cop_config.fetch('AllowedMethods', ...)` call left in
+/// lib/rubocop/cop/style/module_member_existence_check.rb) — removed the config read
+/// and allowlist check below to match.
+///
+/// **Known follow-up (not fixed here — changing cop logic, out of scope for a vendor
+/// bump):** the same upstream change also dropped `constants`/`included_modules` from
+/// `METHOD_REPLACEMENTS` (the new doc comment explains `constants.include?` was never
+/// actually safe to autocorrect, since `const_defined?` has different lookup
+/// semantics), but nitrocop's `METHOD_MAPPINGS` below still includes both. This is a
+/// latent corpus-FP source post-bump: nitrocop will keep flagging
+/// `X.constants.include?(:foo)` / `X.included_modules.include?(:foo)`, which real
+/// RuboCop 1.91 no longer does. A correct fix removes both entries from
+/// `METHOD_MAPPINGS` and `METHODS_WITHOUT_INHERIT_PARAM`, backed by a fixture update.
 pub struct ModuleMemberExistenceCheck;
 
 /// Maps array-returning methods to their predicate equivalents
@@ -56,12 +73,10 @@ impl Cop for ModuleMemberExistenceCheck {
         source: &SourceFile,
         node: &ruby_prism::Node<'_>,
         _parse_result: &ruby_prism::ParseResult<'_>,
-        config: &CopConfig,
+        _config: &CopConfig,
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
-        let allowed_methods = config.get_string_array("AllowedMethods");
-
         let call = match node.as_call_node() {
             Some(c) => c,
             None => return,
@@ -112,14 +127,6 @@ impl Cop for ModuleMemberExistenceCheck {
             }
             Some(_) => return,
             None => {}
-        }
-
-        // Check AllowedMethods
-        if let Some(ref allowed) = allowed_methods {
-            let recv_str = std::str::from_utf8(recv_bytes).unwrap_or("");
-            if allowed.iter().any(|m| m == recv_str) {
-                return;
-            }
         }
 
         let msg_loc = recv_call

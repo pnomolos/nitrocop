@@ -15,11 +15,31 @@ use crate::parse::source::SourceFile;
 /// which suppresses the `Style/DoubleCopDisableDirective` offense on that line.
 /// Fix: renamed synthetic test cop names to multi-character names (`Style/Aaa`).
 /// The nitrocop cop logic is correct and matches RuboCop's behavior.
+///
+/// ## Vendor bump (rubocop 1.84.2 -> 1.91.0)
+///
+/// RuboCop 1.91.0 removed this cop entirely, superseded by `Lint/CopDirectiveSyntax`,
+/// which now reports and corrects more than one directive per line itself
+/// (https://github.com/rubocop/rubocop/pull/15616 — see vendor `config/obsoletion.yml`,
+/// which tells RuboCop users to switch to `Lint/CopDirectiveSyntax`). It no longer
+/// appears in vendor `config/default.yml`, so `scripts/generate_baseline_cops.py` now
+/// drops it from `src/resources/baseline_cops.json`; it reads as `outside_baseline` in
+/// `--rules`/`--migrate` output for any config that still references it, matching real
+/// RuboCop 1.91, which rejects that cop name as unrecognized.
+/// `default_enabled()` is overridden to `false` here (rather than removing the cop
+/// outright) so nitrocop doesn't keep firing offenses for a cop that no longer exists
+/// upstream when no explicit `.rubocop.yml` config is present. The nitrocop
+/// implementation itself is left in place: fully retiring it (registry, fixtures,
+/// tier entry) is cop-logic-adjacent cleanup out of scope for this vendor bump.
 pub struct DoubleCopDisableDirective;
 
 impl Cop for DoubleCopDisableDirective {
     fn name(&self) -> &'static str {
         "Style/DoubleCopDisableDirective"
+    }
+
+    fn default_enabled(&self) -> bool {
+        false
     }
 
     fn check_source(

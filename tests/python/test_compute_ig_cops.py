@@ -45,14 +45,6 @@ def test_rails_db_cops_included():
     assert "Rails/Output" in cops
 
 
-def test_rails_spec_test_cops_included():
-    """Rails cops with `spec/**/*.rb`/`test/**/*.rb` Include."""
-    cops = derive()
-    assert "Rails/I18nLocaleAssignment" in cops
-    assert "Rails/TimeZoneAssignment" in cops
-    assert "Rails/HttpPositionalArguments" in cops
-
-
 def test_glob_prefixed_cops_excluded():
     """Cops whose Include starts with `**/` resolve correctly in the main
     pipeline and should NOT be in the IG list."""
@@ -60,6 +52,15 @@ def test_glob_prefixed_cops_excluded():
     assert "Rails/ActionControllerTestCase" not in cops  # **/test/**/*.rb
     assert "Rails/EnumSyntax" not in cops  # **/app/models/**/*.rb
     assert "Rails/HttpStatusNameConsistency" not in cops  # **/app/controllers/**/*.rb
+    # rubocop-rails 2.37.0 widened these from `spec/**/*`/`test/**/*` (no **/
+    # prefix, so they used to be IG'd) to `**/spec/**/*`/`**/test/**/*` for
+    # Engine/Packwerk nested-spec compatibility — they no longer belong in the
+    # IG list. See docs of the rubocop 1.91 vendor bump.
+    assert "Rails/I18nLocaleAssignment" not in cops
+    assert "Rails/TimeZoneAssignment" not in cops
+    assert "Rails/HttpPositionalArguments" not in cops
+    assert "Rails/RedundantTravelBack" not in cops
+    assert "Rails/ResponseParsedBody" not in cops
 
 
 def test_core_rubocop_parses_despite_ruby_tags():

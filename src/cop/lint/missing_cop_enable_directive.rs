@@ -221,9 +221,11 @@ fn format_message(cop: &str, max_range: Option<usize>) -> String {
 }
 
 fn get_max_range_size(config: &CopConfig) -> f64 {
+    // Renamed MaximumRangeSize -> MaxRangeSize in rubocop 1.9x (config/obsoletion.yml
+    // warns on the old name but does not translate its value; matches real RuboCop).
     config
         .options
-        .get("MaximumRangeSize")
+        .get("MaxRangeSize")
         .and_then(|v| {
             v.as_f64()
                 .or_else(|| v.as_u64().map(|u| u as f64))

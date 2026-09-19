@@ -51,7 +51,7 @@ These cops cannot be triggered under current Ruby versions:
 
 ### Rails Cops and `railties` Gem Requirement
 
-RuboCop-Rails 2.34.3 uses a `requires_gem` API for version-gated cops. When a cop declares `minimum_target_rails_version 6.1`, this translates to `requires_gem('railties', '>= 6.1')`. RuboCop checks the **project's `Gemfile.lock`** for the `railties` gem version — not the `TargetRailsVersion` config key.
+RuboCop-Rails 2.37.0 uses a `requires_gem` API for version-gated cops. When a cop declares `minimum_target_rails_version 6.1`, this translates to `requires_gem('railties', '>= 6.1')`. RuboCop checks the **project's `Gemfile.lock`** for the `railties` gem version — not the `TargetRailsVersion` config key.
 
 Without `railties` in the Gemfile.lock, 18+ Rails cops silently disable themselves:
 - `Rails/CompactBlank` (>= 6.1), `Rails/IndexWith` (>= 6.0), `Rails/Pick` (>= 6.0)

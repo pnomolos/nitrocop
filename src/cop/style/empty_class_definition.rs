@@ -49,10 +49,15 @@ impl Cop for EmptyClassDefinition {
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
-        let enforced_style = config.get_str("EnforcedStyle", "class_definition");
+        // Vendor bump (rubocop 1.84.2 -> 1.91.0): default flipped from
+        // `class_definition` to `class_keyword`. Real RuboCop treats both names as the
+        // same style (`%i[class_keyword class_definition].include?(style)` in
+        // lib/rubocop/cop/style/empty_class_definition.rb) — `class_definition` is kept
+        // only as a deprecated alias — so both match arms below share one behavior.
+        let enforced_style = config.get_str("EnforcedStyle", "class_keyword");
 
         match enforced_style {
-            "class_definition" => {
+            "class_definition" | "class_keyword" => {
                 diagnostics.extend(check_class_definition_style(self, source, node))
             }
             "class_new" => diagnostics.extend(check_class_new_style(self, source, node)),

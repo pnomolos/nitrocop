@@ -88,7 +88,9 @@ impl Cop for GemComment {
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
-        let ignored_gems = config.get_string_array("IgnoredGems").unwrap_or_default();
+        // Renamed IgnoredGems -> AllowedGems in rubocop 1.9x (config/obsoletion.yml
+        // warns on the old name but does not translate its value; matches real RuboCop).
+        let ignored_gems = config.get_string_array("AllowedGems").unwrap_or_default();
         let only_for = config.get_string_array("OnlyFor").unwrap_or_default();
         let check_version_specifiers = only_for.iter().any(|s| s == "version_specifiers");
 

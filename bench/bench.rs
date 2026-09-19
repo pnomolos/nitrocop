@@ -72,7 +72,7 @@ static REPOS: &[BenchRepo] = &[
     BenchRepo {
         name: "rubocop",
         url: "https://github.com/rubocop/rubocop.git",
-        tag: "v1.84.2",
+        tag: "v1.91.0",
     },
     BenchRepo {
         name: "chatwoot",
