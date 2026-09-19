@@ -319,6 +319,11 @@ impl CodeGenerator {
                     pattern_summary(&PatternNode::AnyOrder(items.clone()))
                 ));
             }
+            PatternNode::Repetition { .. } => {
+                // `x*` spans a variable number of children, which the
+                // straight-line generator cannot express either.
+                self.writeln(&format!("// TODO: repetition: {}", pattern_summary(node)));
+            }
         }
     }
 

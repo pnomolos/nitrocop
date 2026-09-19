@@ -50,7 +50,7 @@
 use super::ancestors;
 use super::captures::{CaptureValue, Captures, MatchEnv, dup_node};
 use super::lexer::Lexer;
-use super::parser::{COMPLEX_SEQ_HEAD, Parser, PatternError, PatternNode};
+use super::parser::{COMPLEX_SEQ_HEAD, Parser, PatternError, PatternNode, RepeatKind};
 use super::predicates::{self, Arg, Arity, NodeId, PredCtx, PredTarget};
 use super::resolve::{NoResolver, Params, Resolver};
 
@@ -488,7 +488,8 @@ pub fn collect_unresolved(
         }
         PatternNode::Negation(inner)
         | PatternNode::ParentRef(inner)
-        | PatternNode::DescendRef(inner) => collect_unresolved(inner, resolver, out),
+        | PatternNode::DescendRef(inner)
+        | PatternNode::Repetition { inner, .. } => collect_unresolved(inner, resolver, out),
         PatternNode::Capture { inner, .. } => collect_unresolved(inner, resolver, out),
         _ => {}
     }
@@ -534,7 +535,8 @@ fn check_arities(pattern: &PatternNode) -> Result<(), PatternError> {
         }
         PatternNode::Negation(inner)
         | PatternNode::ParentRef(inner)
-        | PatternNode::DescendRef(inner) => check_arities(inner)?,
+        | PatternNode::DescendRef(inner)
+        | PatternNode::Repetition { inner, .. } => check_arities(inner)?,
         PatternNode::Capture { inner, .. } => check_arities(inner)?,
         _ => {}
     }
@@ -1899,6 +1901,13 @@ fn matches_complex_sequence<'pr>(
         env.rollback(mark);
         return false;
     };
+    if let Some(matched) = match_value_only_children(parser_type, node, rest, env) {
+        if matched {
+            return true;
+        }
+        env.rollback(mark);
+        return false;
+    }
     let Some(children) = get_children(parser_type, node) else {
         env.rollback(mark);
         return rest.is_empty();
@@ -1958,6 +1967,42 @@ fn matches_seq_head<'pr>(
                 .unwrap_or("");
             matches_name(pattern, type_name.as_bytes(), type_name.as_bytes(), env)
         }
+    }
+}
+
+/// The value-only node types, whose single "child" Prism stores inline:
+/// `(int 42)`, `(str "foo")`, `(sym :bar)`.
+///
+/// Returns `None` when `effective_type` is not one of them, so the caller
+/// falls through to the ordinary child list.
+fn match_value_only_children<'pr>(
+    effective_type: &str,
+    node: &ruby_prism::Node<'pr>,
+    pattern_children: &[PatternNode],
+    env: &mut MatchEnv<'pr, '_>,
+) -> Option<bool> {
+    let first = pattern_children.first()?;
+    match effective_type {
+        "int" => Some(matches_node(first, node, env)),
+        "str" => {
+            let Some(string) = node.as_string_node() else {
+                return Some(false);
+            };
+            // Compare against the unescaped value but capture a `'pr`-lived
+            // slice of the source.
+            let captured = string.content_loc().as_slice();
+            Some(matches_name(first, string.unescaped(), captured, env))
+        }
+        "sym" => {
+            let Some(symbol) = node.as_symbol_node() else {
+                return Some(false);
+            };
+            let captured = symbol
+                .value_loc()
+                .map_or_else(|| symbol.location().as_slice(), |loc| loc.as_slice());
+            Some(matches_name(first, symbol.unescaped(), captured, env))
+        }
+        _ => None,
     }
 }
 
@@ -2030,47 +2075,14 @@ fn matches_node<'pr>(
 
             let mark = env.mark();
 
-            // Value-only nodes: (int 42), (str "foo"), (sym :bar)
-            if !pattern_children.is_empty() {
-                match effective_type {
-                    "int" => {
-                        if matches_node(&pattern_children[0], node, env) {
-                            return true;
-                        }
-                        env.rollback(mark);
-                        return false;
-                    }
-                    "str" => {
-                        if let Some(str_node) = node.as_string_node() {
-                            // Compare against the unescaped value but capture a
-                            // `'pr`-lived slice of the source.
-                            let captured = str_node.content_loc().as_slice();
-                            if matches_name(
-                                &pattern_children[0],
-                                str_node.unescaped(),
-                                captured,
-                                env,
-                            ) {
-                                return true;
-                            }
-                        }
-                        env.rollback(mark);
-                        return false;
-                    }
-                    "sym" => {
-                        if let Some(sym) = node.as_symbol_node() {
-                            let captured = sym
-                                .value_loc()
-                                .map_or_else(|| sym.location().as_slice(), |loc| loc.as_slice());
-                            if matches_name(&pattern_children[0], sym.unescaped(), captured, env) {
-                                return true;
-                            }
-                        }
-                        env.rollback(mark);
-                        return false;
-                    }
-                    _ => {}
+            if let Some(matched) =
+                match_value_only_children(effective_type, node, pattern_children, env)
+            {
+                if matched {
+                    return true;
                 }
+                env.rollback(mark);
+                return false;
             }
 
             let Some(actual_children) = get_children(effective_type, node) else {
@@ -2139,10 +2151,10 @@ fn matches_node<'pr>(
         // where `match_sequence` splices it; anywhere else it matches nothing.
         PatternNode::Subsequence(_) => false,
 
-        // Likewise `<>`: it consumes a run of children, so it is only
-        // meaningful as a term of a child list (RuboCop forbids it in sequence
-        // head position too — `ForbidInSeqHead`, `node.rb:179`).
-        PatternNode::AnyOrder(_) => false,
+        // Likewise `<>` and `x*`: both consume a run of children, so they are
+        // only meaningful as a term of a child list (RuboCop forbids them in
+        // sequence head position too — `ForbidInSeqHead`, `node.rb:143, 179`).
+        PatternNode::AnyOrder(_) | PatternNode::Repetition { .. } => false,
 
         PatternNode::Rest => true,
 
@@ -2273,7 +2285,9 @@ fn as_rest_term(pattern: &PatternNode) -> Option<Option<usize>> {
 /// (RuboCop's `Node#variadic?`).
 fn is_variadic_term(pattern: &PatternNode) -> bool {
     match pattern {
-        PatternNode::Subsequence(_) | PatternNode::AnyOrder(_) => true,
+        PatternNode::Subsequence(_) | PatternNode::AnyOrder(_) | PatternNode::Repetition { .. } => {
+            true
+        }
         PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => true,
         PatternNode::Alternatives(alts) => alts.iter().any(is_variadic_term),
         _ => as_rest_term(pattern).is_some(),
@@ -2283,6 +2297,11 @@ fn is_variadic_term(pattern: &PatternNode) -> bool {
 /// Whether a term can consume an unbounded number of children.
 fn contains_rest(pattern: &PatternNode) -> bool {
     match pattern {
+        // `x*` / `x+` have no upper bound, so the enclosing list's arity is
+        // `n..∞` and every child has to be accounted for, exactly as with
+        // `...`. `x?` is bounded and leaves the list's permissive tail rule
+        // alone.
+        PatternNode::Repetition { kind, .. } => kind.is_unbounded(),
         PatternNode::Alternatives(items)
         | PatternNode::Subsequence(items)
         | PatternNode::AnyOrder(items) => items.iter().any(contains_rest),
@@ -2425,6 +2444,113 @@ fn match_any_order<'pr>(
     false
 }
 
+/// Every capture slot inside `pattern`, in slot order.
+fn capture_slots(pattern: &PatternNode, out: &mut Vec<usize>) {
+    match pattern {
+        PatternNode::Capture { slot, inner } => {
+            out.push(*slot);
+            capture_slots(inner, out);
+        }
+        PatternNode::NodeMatch { children, .. } => {
+            for child in children {
+                capture_slots(child, out);
+            }
+        }
+        PatternNode::Alternatives(items)
+        | PatternNode::Conjunction(items)
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => {
+            for item in items {
+                capture_slots(item, out);
+            }
+        }
+        PatternNode::HelperCall { args, .. } | PatternNode::Predicate { args, .. } => {
+            for arg in args {
+                capture_slots(arg, out);
+            }
+        }
+        PatternNode::Negation(inner)
+        | PatternNode::ParentRef(inner)
+        | PatternNode::DescendRef(inner)
+        | PatternNode::Repetition { inner, .. } => capture_slots(inner, out),
+        _ => {}
+    }
+}
+
+/// Match `inner` against a run of `take` consecutive children, accumulating
+/// what its captures bound on each pass.
+///
+/// RuboCop pushes `captures[range]` per iteration and `transpose`s at the end
+/// (`sequence_subcompiler.rb:185-200`), so a `$` under a repetition binds an
+/// Array with one entry per repetition — and an empty Array when the run is
+/// empty, which is the case the transpose hack in upstream exists to handle.
+fn match_repetition_run<'pr>(
+    inner: &PatternNode,
+    slots: &[usize],
+    take: usize,
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr, '_>,
+) -> bool {
+    let mut accumulated: Vec<Vec<CaptureValue<'pr>>> =
+        (0..slots.len()).map(|_| Vec::new()).collect();
+    for actual in &actuals[..take] {
+        if !matches_child(inner, actual, env) {
+            return false;
+        }
+        for (column, slot) in slots.iter().enumerate() {
+            let Some(value) = env.get(*slot) else {
+                continue;
+            };
+            accumulated[column].push(value.clone());
+        }
+    }
+    for (column, slot) in slots.iter().enumerate() {
+        env.set(
+            *slot,
+            CaptureValue::List(std::mem::take(&mut accumulated[column])),
+        );
+    }
+    true
+}
+
+/// Match `term?` / `term*` / `term+` against the head of `actuals`, then the
+/// rest of the sequence against what is left.
+///
+/// Upstream compiles a plain greedy loop that never gives a child back
+/// (`sequence_subcompiler.rb:77-84, 358-364`). This tries the longest run
+/// first and then shorter ones, so it accepts everything upstream accepts plus
+/// the cases upstream's greed loses — `(send _ _ int* int)` against two
+/// integers, say. That is the same divergence class as `<>`'s backtracking
+/// assignment, and no vendored pattern is in that shape: every repetition in
+/// the corpus is either last or followed by terms its own term cannot match.
+fn match_repetition<'pr>(
+    inner: &PatternNode,
+    kind: RepeatKind,
+    rest_terms: &[&PatternNode],
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr, '_>,
+    exact: bool,
+) -> bool {
+    let (min, max) = kind.arity();
+    if actuals.len() < min {
+        return false;
+    }
+    let mut slots = Vec::new();
+    capture_slots(inner, &mut slots);
+    let limit = max.min(actuals.len());
+
+    for take in (min..=limit).rev() {
+        let mark = env.mark();
+        if match_repetition_run(inner, &slots, take, actuals, env)
+            && match_sequence(rest_terms, &actuals[take..], env, exact)
+        {
+            return true;
+        }
+        env.rollback(mark);
+    }
+    false
+}
+
 /// Match a list of pattern children against a list of actual children.
 ///
 /// A rest term (`...`, `$...`) matches a variable-length run, so the walk
@@ -2482,6 +2608,10 @@ fn match_sequence<'pr>(
         return match_any_order(group_slot, items, rest_terms, actuals, env, exact);
     }
 
+    if let PatternNode::Repetition { inner, kind } = term {
+        return match_repetition(inner, *kind, rest_terms, actuals, env, exact);
+    }
+
     if let Some(capture_slot) = as_rest_term(term) {
         for take in 0..=actuals.len() {
             let mark = env.mark();
@@ -2535,6 +2665,237 @@ mod tests {
         test_support::with_node_and_chain(source, needle, |node, chain| {
             compiled.matches_with_ancestors(node, chain, params, resolver)
         })
+    }
+
+    // ---------------------------------------------------------------------
+    // `?` / `*` / `+` repetition
+    // ---------------------------------------------------------------------
+
+    /// Match `pattern` against the first statement of `source`.
+    fn matches_src(pattern: &str, source: &str) -> bool {
+        let compiled = CompiledPattern::compile(pattern)
+            .unwrap_or_else(|| panic!("{pattern:?} should compile"));
+        let result = ruby_prism::parse(source.as_bytes());
+        compiled.matches(&first_stmt(&result))
+    }
+
+    /// Match `pattern` and return the capture slots as debug strings.
+    fn captures_src(pattern: &str, source: &str) -> Option<Vec<String>> {
+        let compiled = CompiledPattern::compile(pattern)
+            .unwrap_or_else(|| panic!("{pattern:?} should compile"));
+        let result = ruby_prism::parse(source.as_bytes());
+        let captures = compiled.match_captures(&first_stmt(&result))?;
+        Some(
+            captures
+                .iter()
+                .map(|slot| match slot {
+                    Some(CaptureValue::List(items)) => format!(
+                        "[{}]",
+                        items
+                            .iter()
+                            .map(describe_capture)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    Some(value) => describe_capture(value),
+                    None => "<unbound>".to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    fn describe_capture(value: &CaptureValue<'_>) -> String {
+        match value {
+            CaptureValue::Node(node) => {
+                String::from_utf8_lossy(node.location().as_slice()).into_owned()
+            }
+            CaptureValue::Name(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            CaptureValue::Absent => "<absent>".to_string(),
+            CaptureValue::List(items) => format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(describe_capture)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
+    }
+
+    #[test]
+    fn repetition_arities() {
+        let cases: &[(&str, &str, bool)] = &[
+            // `?` is 0..1. Note the space: `sym?` with none is `tPREDICATE`
+            // upstream (`/#{IDENTIFIER}\?/` wins over the punctuation rule),
+            // which is why every vendored optional term is written `_ ?`,
+            // `(sym)?` or `{…}?`.
+            ("(send nil? :f sym ?)", "f", true),
+            ("(send nil? :f sym ?)", "f :a", true),
+            ("(send nil? :f sym ? sym)", "f :a, :b", true),
+            // `*` is 0..∞ and, being unbounded, makes the list's arity exact.
+            ("(send nil? :f sym*)", "f", true),
+            ("(send nil? :f sym*)", "f :a, :b, :c", true),
+            ("(send nil? :f sym*)", "f :a, 1", false),
+            // `+` is 1..∞.
+            ("(send nil? :f sym+)", "f", false),
+            ("(send nil? :f sym+)", "f :a", true),
+            ("(send nil? :f sym+)", "f :a, :b", true),
+            ("(send nil? :f sym+)", "f 1", false),
+            // A repetition is greedy but backtracks, so a following term can
+            // still take a child the run could have eaten.
+            ("(send nil? :f sym* sym)", "f :a, :b", true),
+            // A repeated union and a repeated sequence.
+            ("(send nil? :f {sym str}+)", "f :a, 'b'", true),
+            ("(send nil? :f (sym :a)+)", "f :a, :a", true),
+            ("(send nil? :f (sym :a)+)", "f :a, :b", false),
+            // A negated term repeated (`Mixin/DigHelp::dig?`).
+            ("(call _ :dig !{hash block_pass}+)", "x.dig(:a, :b)", true),
+            ("(call _ :dig !{hash block_pass}+)", "x.dig", false),
+            // `_?` is a wildcard repeated, not an identifier called `_?`.
+            ("(send nil? :f _? sym)", "f 1, :a", true),
+            ("(send nil? :f _? sym)", "f :a", true),
+            // Repetition alongside `...`.
+            ("(send nil? :f (sym _)* ...)", "f :a, :b, 1", true),
+        ];
+        for &(pattern, source, expected) in cases {
+            assert_eq!(
+                matches_src(pattern, source),
+                expected,
+                "{pattern} @ {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capture_under_a_repetition_binds_a_list() {
+        // RuboCop pushes `captures[range]` per pass and transposes
+        // (`sequence_subcompiler.rb:185-200`), so each `$` gets one entry per
+        // repetition — and an empty list when the run is empty.
+        assert_eq!(
+            captures_src("(send nil? :f (sym $_)+)", "f :a, :b, :c"),
+            Some(vec!["[a, b, c]".to_string()]),
+        );
+        assert_eq!(
+            captures_src("(send nil? :f $sym ?)", "f"),
+            Some(vec!["[]".to_string()]),
+        );
+        assert_eq!(
+            captures_src("(send nil? :f $sym ?)", "f :a"),
+            Some(vec!["[:a]".to_string()]),
+        );
+        // Two captures under one repetition transpose into two lists.
+        assert_eq!(
+            captures_src("(send nil? :f (send nil? $_ (int $_))+)", "f x(1), y(2)"),
+            Some(vec!["[x, y]".to_string(), "[1, 2]".to_string()]),
+        );
+        // A capture outside the repetition is untouched by it.
+        assert_eq!(
+            captures_src("(send nil? :f $int (sym $_)*)", "f 1, :a, :b"),
+            Some(vec!["1".to_string(), "[a, b]".to_string()]),
+        );
+    }
+
+    #[test]
+    fn repetition_is_only_a_term_of_a_child_list() {
+        // The grammar's `variadic_pattern` covers a sequence's children and a
+        // union's branches, nothing else: `[…]`, `<…>` and an argument list
+        // are plain `node_pattern_list`s.
+        assert!(CompiledPattern::compile("(send nil? :f [sym ? str])").is_none());
+        assert!(CompiledPattern::compile("(send nil? :f <sym ? str>)").is_none());
+        assert!(CompiledPattern::compile("(send nil? :f literal?(sym ?))").is_none());
+        // A `[…]` term *inside* a sequence is itself variadic-positioned, so
+        // repeating the whole intersection is fine.
+        assert!(CompiledPattern::compile("(send nil? :f [sym !nil?] ?)").is_some());
+        // So is a repetition inside a union branch.
+        assert!(CompiledPattern::compile("(send nil? :f {sym+ str})").is_some());
+    }
+
+    #[test]
+    fn vendored_repetition_patterns_match_real_snippets() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // `Lint/UselessTimes::times_call?`
+            (
+                "(send (int $_) :times (block-pass (sym $_))?)",
+                "3.times(&:foo)",
+                "with a block-pass",
+                true,
+            ),
+            (
+                "(send (int $_) :times (block-pass (sym $_))?)",
+                "3.times",
+                "without one",
+                true,
+            ),
+            // `Lint/DuplicateMethods::delegate_method?`
+            (
+                "(send nil? :delegate ({sym str} $_)+ (hash <(pair (sym :to) {sym str}) ...>))",
+                "delegate :a, :b, to: :c",
+                "two delegated names",
+                true,
+            ),
+            (
+                "(send nil? :delegate ({sym str} $_)+ (hash <(pair (sym :to) {sym str}) ...>))",
+                "delegate to: :c",
+                "no delegated name",
+                false,
+            ),
+            // `Rails/AttributeDefaultBlockValue::default_attribute` — the
+            // `_ ?_` form, where the first wildcard is the optional one.
+            (
+                "(send nil? :attribute _ ?_ (hash <$(pair (sym :default) _) ...>))",
+                "attribute :foo, :string, default: 1",
+                "with the optional type argument",
+                true,
+            ),
+            // `Style/HashLikeCase::hash_like_case?`
+            (
+                "(case _ (when ${str_type? sym_type?} $[!nil? recursive_basic_literal?])+ nil?)",
+                "case x\nwhen :a then 1\nwhen :b then 2\nend",
+                "two literal whens",
+                true,
+            ),
+            // `FactoryBot/ConsistentParenthesesStyle::factory_call`, with the
+            // `#factory_call?` helper dropped (it is cop-local).
+            (
+                "(send nil? :create {sym str send lvar} _*)",
+                "create :user, name: 'x'",
+                "trailing wildcard run",
+                true,
+            ),
+            // `RSpecRails/MinitestAssertions`
+            (
+                "(send nil? {:assert_nil :assert_not_nil :refute_nil} $_ $_?)",
+                "assert_nil foo",
+                "without the message",
+                true,
+            ),
+            (
+                "(send nil? {:assert_nil :assert_not_nil :refute_nil} $_ $_?)",
+                "assert_nil foo, 'msg'",
+                "with the message",
+                true,
+            ),
+            // `Performance/ReverseFirst::reverse_first_candidate?`
+            (
+                "(call $(call _ :reverse) :first (int _)?)",
+                "x.reverse.first(3)",
+                "with a count",
+                true,
+            ),
+            (
+                "(call $(call _ :reverse) :first (int _)?)",
+                "x.reverse.first",
+                "without a count",
+                true,
+            ),
+        ];
+        for &(pattern, source, label, expected) in cases {
+            assert_eq!(
+                matches_src(pattern, source),
+                expected,
+                "{label}: {pattern} @ {source:?}",
+            );
+        }
     }
 
     #[test]

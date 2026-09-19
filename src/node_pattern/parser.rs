@@ -13,6 +13,46 @@ use super::lexer::Token;
 /// name, so it cannot collide with a real one.
 pub const COMPLEX_SEQ_HEAD: &str = "_complex";
 
+/// The three postfix repetition operators (`parser.y:57-61`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatKind {
+    /// `?` — `0..1`.
+    ZeroOrOne,
+    /// `*` — `0..∞`.
+    ZeroOrMore,
+    /// `+` — `1..∞`.
+    OneOrMore,
+}
+
+impl RepeatKind {
+    /// How many children the term may consume
+    /// (`Node::Repetition::ARITIES`, `node.rb:149-157`).
+    #[must_use]
+    pub fn arity(self) -> (usize, usize) {
+        match self {
+            RepeatKind::ZeroOrOne => (0, 1),
+            RepeatKind::ZeroOrMore => (0, usize::MAX),
+            RepeatKind::OneOrMore => (1, usize::MAX),
+        }
+    }
+
+    /// Whether the term can consume an unbounded run.
+    #[must_use]
+    pub fn is_unbounded(self) -> bool {
+        self.arity().1 == usize::MAX
+    }
+
+    /// The operator, for [`pattern_summary`].
+    #[must_use]
+    pub fn symbol(self) -> char {
+        match self {
+            RepeatKind::ZeroOrOne => '?',
+            RepeatKind::ZeroOrMore => '*',
+            RepeatKind::OneOrMore => '+',
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PatternNode {
     /// (node_type child1 child2 ...)
@@ -119,6 +159,15 @@ pub enum PatternNode {
     /// Type predicate: int?, str?, sym?, etc.
     TypePredicate(String),
     /// ^pattern — parent node
+    /// `term?` / `term*` / `term+` — a term repeated, legal only where the
+    /// grammar allows a `variadic_pattern`: a sequence's child list and a
+    /// union's branches (`parser.y:41-46`).
+    Repetition {
+        /// The repeated term.
+        inner: Box<PatternNode>,
+        /// How many times it may repeat.
+        kind: RepeatKind,
+    },
     ParentRef(Box<PatternNode>),
     /// `pattern — descend
     DescendRef(Box<PatternNode>),
@@ -287,6 +336,20 @@ impl Parser {
         }
     }
 
+    /// Record a syntax error if a repetition operator sits where the grammar
+    /// has a plain `node_pattern_list` — inside `[…]`, `<…>` or an argument
+    /// list (`parser.y:84-90`).
+    fn reject_repetition(&mut self) -> bool {
+        if matches!(
+            self.peek(),
+            Some(Token::Question | Token::Star | Token::Plus)
+        ) {
+            self.error.get_or_insert(PatternError::Syntax);
+            return true;
+        }
+        false
+    }
+
     pub fn parse(&mut self) -> Option<PatternNode> {
         let node = self.parse_node();
         // Inner errors are not threaded through every `Option` return, so a
@@ -295,6 +358,28 @@ impl Parser {
             return None;
         }
         node
+    }
+
+    /// `variadic_pattern` — a term, optionally followed by a repetition
+    /// operator (`parser.y:41-46`).
+    ///
+    /// Only a sequence's child list and a union's branches are variadic; a
+    /// `[…]` intersection, a `<…>` any-order group and an argument list are
+    /// plain `node_pattern_list`s, so a `?` there is a syntax error upstream
+    /// and is left unconsumed here (which the caller turns into one).
+    fn parse_variadic_node(&mut self) -> Option<PatternNode> {
+        let inner = self.parse_node()?;
+        let kind = match self.peek() {
+            Some(Token::Question) => RepeatKind::ZeroOrOne,
+            Some(Token::Star) => RepeatKind::ZeroOrMore,
+            Some(Token::Plus) => RepeatKind::OneOrMore,
+            _ => return Some(inner),
+        };
+        self.advance();
+        Some(PatternNode::Repetition {
+            inner: Box::new(inner),
+            kind,
+        })
     }
 
     fn parse_node(&mut self) -> Option<PatternNode> {
@@ -439,6 +524,9 @@ impl Parser {
                 self.advance();
                 continue;
             }
+            if self.reject_repetition() {
+                break;
+            }
             let Some(arg) = self.parse_node() else { break };
             args.push(arg);
         }
@@ -450,7 +538,7 @@ impl Parser {
         self.expect(&Token::LParen);
 
         // First element is the node type (or could be a complex expression)
-        let first = self.parse_node()?;
+        let first = self.parse_variadic_node()?;
 
         // Determine if this is a node match or something else
         let node_type = match &first {
@@ -462,7 +550,7 @@ impl Parser {
 
         // Parse remaining children
         while self.peek().is_some() && self.peek() != Some(&Token::RParen) {
-            if let Some(child) = self.parse_node() {
+            if let Some(child) = self.parse_variadic_node() {
                 children.push(child);
             } else {
                 break;
@@ -518,7 +606,9 @@ impl Parser {
                 continue;
             }
             let start = self.captures;
-            let Some(node) = self.parse_node() else { break };
+            let Some(node) = self.parse_variadic_node() else {
+                break;
+            };
             let allocated = self.captures - start;
             groups
                 .last_mut()
@@ -590,6 +680,9 @@ impl Parser {
 
         let mut children = Vec::new();
         while self.peek().is_some() && self.peek() != Some(&Token::RAngle) {
+            if self.reject_repetition() {
+                return None;
+            }
             let node = self.parse_node()?;
             children.push(node);
         }
@@ -627,6 +720,9 @@ impl Parser {
         let mut items = Vec::new();
 
         while self.peek().is_some() && self.peek() != Some(&Token::RBracket) {
+            if self.reject_repetition() {
+                return None;
+            }
             if let Some(node) = self.parse_node() {
                 items.push(node);
             } else {
@@ -672,7 +768,8 @@ fn shift_capture_slots(node: &mut PatternNode, delta: usize) {
         }
         PatternNode::Negation(inner)
         | PatternNode::ParentRef(inner)
-        | PatternNode::DescendRef(inner) => shift_capture_slots(inner, delta),
+        | PatternNode::DescendRef(inner)
+        | PatternNode::Repetition { inner, .. } => shift_capture_slots(inner, delta),
         PatternNode::HelperCall { args, .. } | PatternNode::Predicate { args, .. } => {
             for arg in args {
                 shift_capture_slots(arg, delta);
@@ -727,6 +824,9 @@ pub fn pattern_summary(node: &PatternNode) -> String {
         PatternNode::ParamNamed(p) => format!("%{p}"),
         PatternNode::ParamConst(p) => format!("%{p}"),
         PatternNode::Regexp { body, flags } => format!("/{body}/{flags}"),
+        PatternNode::Repetition { inner, kind } => {
+            format!("{}{}", pattern_summary(inner), kind.symbol())
+        }
         PatternNode::ParentRef(inner) => format!("^{}", pattern_summary(inner)),
         PatternNode::DescendRef(inner) => format!("`{}", pattern_summary(inner)),
         PatternNode::Ident(name) => name.clone(),
@@ -987,7 +1087,8 @@ mod tests {
                 }
                 PatternNode::Negation(inner)
                 | PatternNode::ParentRef(inner)
-                | PatternNode::DescendRef(inner) => walk(inner, out),
+                | PatternNode::DescendRef(inner)
+                | PatternNode::Repetition { inner, .. } => walk(inner, out),
                 _ => {}
             }
         }
