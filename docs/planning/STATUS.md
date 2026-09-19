@@ -26,7 +26,7 @@ Planning branch, not for upstream. Read this first when resuming.
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); #21 discovery open | in progress |
-| W8 | Hand-written Rust cops for the 9 bucket-C 1.91 cops (non-index): batch 1 in progress (branch cops/rubocop-1.91-batch-1, base #6) | in progress |
+| W8 | Hand-written Rust cops for the 9 bucket-C 1.91 cops (non-index): batch 1 (UnreachablePatternBranch, DiscardedMatcher, MatchWithSimpleRegex, SelectByRange, OneClassPerFile) and batch 2 (MisplacedMagicComment, DirectiveScope, PartitionInsteadOfDoubleSelect, ReduceToHash) in progress, both based on #6 | in progress |
 | W7 | Post-merge follow-ups: shared tab-aware `indentation_of` + dedup; `Severity:` config parity; HashAlignment 1.91 semantics; MethodCallWithArgsParentheses omit_parentheses reparse rule | blocked on merges |
 | W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15, #25 open. Pipeline complete; humans still needed for: wiring into embedded.rs, capture naming, semantic review of synthesized guards, spec fixture gaps, corpus gate | done (v1) |
 
@@ -46,6 +46,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #21 ir: user-cop discovery `.nitrocop/cops/**/*.cop.yml` + `AllCops.CustomCopPaths`, `(custom)` classification, fail-closed, cache key (base #16)
 - #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16)
 - #23 ir: pilot batch 2/2 (TallyMethod, SelectByKind, RedundantStructKeywordInit) (base #19). 7/8 landed; 8 engine additions incl. `_name` unification, `%TABLE` via `constants:`, `min_target_ruby:`, sibling access. Blocked on vocabulary: RSpec/MatchWithSimpleRegex (regex→string transform), Style/MapJoin (needs `.last_line` / loc-part line access in expressions)
+- #26 ir: loc-part/position access in expressions, list-valued `constants:`, `in:` over consts/cfg, two-pass matcher resolution, Style/MapJoin (base #23); fixed eval_ctx not passing Params/Resolver to guard-level `matches:`
 - #25 ir: ir_synth.py (Opus, schema-constrained to when/bind/offense) + ir_verify.py (8 hard gates incl. differential vs real RuboCop at two TargetRubyVersions, `-A` convergence, embedded_freshness) + CI job (base #23). Live TimeNow verify: PASS 8/8
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
@@ -79,7 +80,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - **ProjectIndexHelp** (5 new cops need a cross-file symbol index): build the index infra, or leave those 5 unimplemented.
 
 ## Merge order for the IR stream
-main ← #3 ← #4 ← #5 ← #7 ← #11 ← #13 ← #24 (np) ; main ← #9 ← #12 (merges #7) ← #14 (merges #13) ← #16 ← pilot ; #15 (Python) on #12. Merging the np stack first flattens the merge commits in #12/#14.
+main ← #3 ← #4 ← #5 ← #7 ← #11 ← #13 ← #24 (np) ; main ← #9 ← #12 (merges #7) ← #14 (merges #13) ← #16 ← #19 ← #23 ← #26 ; #21 on #16 ; #25 on #23 ; #15 (Python) on #12. Merging the np stack first flattens the merge commits in #12/#14.
 
 ## Sequencing notes
 - After #2 merges: dispatch corpus oracle on main, then triage drift (W2). Three cops replicate RuboCop 1.84 crashes that upstream fixed: Layout/HashAlignment, Layout/IndentationWidth, Lint/LiteralAsCondition.
