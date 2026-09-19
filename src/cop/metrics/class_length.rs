@@ -413,6 +413,10 @@ mod tests {
         let mut args = crate::cli::Args::parse_from(["nitrocop"]);
         args.only = vec!["Metrics/ClassLength".to_string()];
         args.format = "text".to_string();
+        // Result caching defaults on; without this, the `run_linter` calls
+        // below (via `department_disable_...` / `vendor_exclude_...`) would
+        // read/write the developer's real `~/.cache/nitrocop`.
+        args.no_cache = true;
         args
     }
 
