@@ -292,3 +292,32 @@ def stub
            status: 400
          )
 end
+
+# `#{ ... }` is a grouped expression (a `begin` node with a `begin` location),
+# so `not_for_this_cop?` skips chains inside interpolation.
+def loaded
+  x "loaded (#{self.class.properties.sort_by { |name, p| name }
+    .select { |name, p| p.is_set?(self) }
+    .join(", ")})"
+end
+
+# Hash pair whose chain base receiver IS a hash: the base is the chain's first
+# dotted call, which is the node itself on the first continuation line.
+def opts(headers, params, msg, status)
+  {
+    headers: { "User-Agent" => "Backup" }
+      .merge(headers).reject { |_, value| value.nil? }
+      .merge("Content-Type" => "application/x-www-form-urlencoded"),
+    body: URI.encode_www_form({ "message" => msg }
+        .merge(params).reject { |_, value| value.nil? }
+        .merge("status" => status.to_s))
+  }
+end
+
+# `kw_node_with_special_indentation` skips ternaries, so the chain in a ternary
+# condition gets plain indentation rather than the condition's column.
+def new_email
+  method = %w[smtp sendmail exim file test]
+    .index(@delivery_method.to_s) ? @delivery_method.to_s : "smtp"
+  method
+end

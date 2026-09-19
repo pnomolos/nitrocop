@@ -1195,9 +1195,12 @@ fn find_first_dot_alignment(
         }
     }
 
-    // For array literal bases, the first dot is valid even on a different line
-    if chain_root_is_array(&receiver) {
-        return Some(first_dot_col);
+    // `method_on_receiver_last_line?(node, base_receiver, :array)` accepts an
+    // array-literal base only when the dot sits on the array's *last* line.
+    if let Some(array_end_line) = chain_root_array_end_line(source, &receiver) {
+        if first_dot_line == array_end_line {
+            return Some(first_dot_col);
+        }
     }
 
     if first_dot_line != first_call_start_line {
@@ -1431,6 +1434,10 @@ fn find_keyword_expression_base<'a>(
 ) -> Option<ruby_prism::Node<'a>> {
     for ancestor in ancestors.iter().rev().skip(1) {
         if let Some(node) = ancestor.as_if_node() {
+            // `kw_node_with_special_indentation` skips ternaries outright.
+            if crate::cop::shared::util::is_ternary(&node) {
+                continue;
+            }
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
                 return Some(predicate);
@@ -1772,6 +1779,18 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
         self.in_paren_args = saved_paren;
     }
 
+    fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
+        // `#{ ... }` is a `begin` node with a `begin` location in the parser
+        // gem, so `not_for_this_cop?`'s `grouped_expression?` skips chains
+        // inside string / heredoc / symbol interpolation.
+        let saved_paren = self.in_paren_args;
+        self.in_paren_args = true;
+        if let Some(statements) = node.statements() {
+            self.visit_statements_node(&statements);
+        }
+        self.in_paren_args = saved_paren;
+    }
+
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
         // Visit key normally
         self.visit(&node.key());
@@ -1804,7 +1823,10 @@ fn find_hash_pair_alignment_base_col(
     if !chain_base_receiver_is_hash(&receiver) {
         return None;
     }
-    let (_, col, _) = find_first_call_dot(source, &receiver)?;
+    // `first_call_has_a_dot(node)` starts at the node itself, so for
+    // `{ ... }\n  .merge(x)` the first dotted call is `.merge`, not something
+    // in the (dot-less) receiver.
+    let (_, col, _) = find_first_call_dot(source, &call_node.as_node())?;
     Some(col)
 }
 
@@ -1953,13 +1975,16 @@ fn chain_root_is_paren(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Opti
 }
 
 /// Check if the chain root is an array literal.
-fn chain_root_is_array(node: &ruby_prism::Node<'_>) -> bool {
+/// Last line of the chain root when that root is an array literal, else `None`.
+fn chain_root_array_end_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Option<usize> {
     if let Some(call) = node.as_call_node() {
         if let Some(recv) = call.receiver() {
-            return chain_root_is_array(&recv);
+            return chain_root_array_end_line(source, &recv);
         }
     }
-    node.as_array_node().is_some()
+    let array = node.as_array_node()?;
+    let (end_line, _) = source.offset_to_line_col(array.location().end_offset());
+    Some(end_line)
 }
 
 /// Check if the chain root is inside a keyword expression and return extra indent.
