@@ -1019,38 +1019,85 @@ fn find_descendant_block_chain_call<'a>(
 }
 
 /// Mirrors RuboCop's `node.each_descendant(:any_block).first` followed by
-/// `block_node&.multiline?` — only the *first* descendant block (in source
-/// order) matters. If it is single-line, this returns false even when later
-/// descendant blocks are multiline.
+/// `block_node&.multiline?` — only the *first* descendant block matters, and
+/// "first" is parser pre-order, not Prism source order.
+///
+/// The parser gem wraps a block-bearing send in a `block` node whose range
+/// starts at the receiver, so `each_descendant` reaches the *outer* block of
+/// `a.reject { ... }.map { ... }` before the inner one. Prism instead hangs a
+/// `BlockNode` (whose range is just the braces) off each `CallNode`, so
+/// ordering by start offset picks the inner `reject` block. This walker
+/// restores parser order: at every call, its own block counts first, then the
+/// receiver, then the arguments. A `LambdaNode` is a `block` node too.
 fn first_descendant_block_is_multiline(source: &SourceFile, node: &ruby_prism::Node<'_>) -> bool {
     struct Finder<'a> {
         source: &'a SourceFile,
-        first_offset: Option<usize>,
-        first_is_multiline: bool,
+        at_root: bool,
+        found: Option<bool>,
+    }
+
+    impl Finder<'_> {
+        fn record(&mut self, loc: ruby_prism::Location<'_>) {
+            let (start_line, _) = self.source.offset_to_line_col(loc.start_offset());
+            let (end_line, _) = self.source.offset_to_line_col(loc.end_offset());
+            self.found = Some(start_line != end_line);
+        }
     }
 
     impl<'pr> ruby_prism::Visit<'pr> for Finder<'_> {
-        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
-            let loc = node.location();
-            let start_offset = loc.start_offset();
-            if self.first_offset.is_none_or(|prior| start_offset < prior) {
-                let (start_line, _) = self.source.offset_to_line_col(start_offset);
-                let (end_line, _) = self.source.offset_to_line_col(loc.end_offset());
-                self.first_offset = Some(start_offset);
-                self.first_is_multiline = start_line != end_line;
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            let was_root = self.at_root;
+            self.at_root = false;
+
+            if !was_root && has_real_block(node) {
+                if let Some(block) = node.block().and_then(|block| block.as_block_node()) {
+                    self.record(block.location());
+                    return;
+                }
             }
 
-            ruby_prism::visit_block_node(self, node);
+            if let Some(receiver) = node.receiver() {
+                self.visit(&receiver);
+            }
+            if self.found.is_some() {
+                return;
+            }
+            if let Some(arguments) = node.arguments() {
+                self.visit_arguments_node(&arguments);
+            }
+            if self.found.is_some() {
+                return;
+            }
+            if let Some(block) = node.block() {
+                self.visit(&block);
+            }
+        }
+
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            self.record(node.location());
+        }
+
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            self.record(node.location());
         }
     }
 
     let mut finder = Finder {
         source,
-        first_offset: None,
-        first_is_multiline: false,
+        at_root: true,
+        found: None,
     };
     finder.visit(node);
-    finder.first_is_multiline
+    finder.found.unwrap_or(false)
 }
 
 fn call_receiver_is_post_multiline_block_call(

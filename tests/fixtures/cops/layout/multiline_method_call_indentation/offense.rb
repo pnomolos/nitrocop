@@ -328,3 +328,22 @@ def actions
     wait(2)
   end
 end
+
+# `each_descendant(:any_block).first` is parser pre-order: the outer `.map { }`
+# block of the argument comes before the inner `.reject { ... }` one, and it is
+# single-line, so no descendant-block alignment applies and the chain falls
+# back to the assignment RHS.
+def list
+  subquery = joins(:dates, :translations)
+    .select("events.*", "event_dates.start_at")
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 278.
+    .select(Event::Translation.column_names
+    ^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.select` with `joins(:dates, :translations)` on line 278.
+                              .reject { |col|
+              ["id", "event_id"].include?(col)
+            }
+                              .map { |col| "event_translations.#{col}" })
+    .preload_all_dates
+    ^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.preload_all_dates` with `joins(:dates, :translations)` on line 278.
+  subquery
+end

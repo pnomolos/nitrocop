@@ -279,3 +279,16 @@ def events_by_id
   }
   recursive_query
 end
+
+# A `->() {}` argument is a descendant block, so the following continuation
+# aligns with the receiver call's dot (`handle_descendant_block`).
+def stub
+  WebMock.stub_request(:post, "https://api.stripe.com/v1/payment_intents")
+         .with(body: ->(request) {
+           params = Rack::Utils.parse_query(request)
+           expect(params["confirm"]).to eq "true"
+         })
+         .to_return(
+           status: 400
+         )
+end
