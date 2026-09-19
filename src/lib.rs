@@ -188,11 +188,28 @@ fn run_corpus_check(
 }
 
 /// Run the linter. Returns the exit code: 0 = clean, 1 = offenses, 2 = strict failure, 3 = error.
-/// `--validate-ir`: load each cop IR document, report failures, and return the
-/// process exit code (2 if any document failed to load).
+/// `--validate-ir PATH...`: load each cop IR document, report failures, and
+/// return the process exit code (2 if any document failed to load).
+///
+/// Explicit paths load in [`cop::ir::LoadMode::Builtin`] — this is the form
+/// used on `src/resources/ir/**` in CI, where built-in departments are legal.
+/// The no-argument form validates the *discovered* set instead and is handled
+/// in [`run`], after config resolution, in `LoadMode::User`.
 fn validate_ir_paths(paths: &[PathBuf]) -> i32 {
+    // A directory expands to the `*.cop.yml` documents under it, so both
+    // `--validate-ir src/resources/ir` and `--validate-ir .nitrocop/cops` work.
+    let expanded: Vec<PathBuf> = paths
+        .iter()
+        .flat_map(|p| {
+            if p.is_dir() {
+                cop::ir::discover::discover(std::slice::from_ref(p))
+            } else {
+                vec![p.clone()]
+            }
+        })
+        .collect();
     let mut failed = 0usize;
-    for path in paths {
+    for path in &expanded {
         match cop::ir::load_path(path) {
             Ok(cop) => println!("{}: ok ({})", path.display(), cop.name()),
             Err(err) => {
@@ -212,8 +229,10 @@ fn validate_ir_paths(paths: &[PathBuf]) -> i32 {
 pub fn run(args: Args) -> Result<i32> {
     // --validate-ir: schema-check IR cop definitions and exit. Independent of
     // config, the registry and file discovery.
-    if !args.validate_ir.is_empty() {
-        return Ok(validate_ir_paths(&args.validate_ir));
+    if let Some(paths) = args.validate_ir.as_deref()
+        && !paths.is_empty()
+    {
+        return Ok(validate_ir_paths(paths));
     }
 
     // Warn about unsupported --require flag
@@ -246,45 +265,9 @@ pub fn run(args: Args) -> Result<i32> {
         }
     });
 
-    let registry = CopRegistry::default_registry();
-    let tier_map = TierMap::load();
+    let mut registry = CopRegistry::default_registry();
+    let mut tier_map = TierMap::load();
     let allowlist = cop::autocorrect_allowlist::AutocorrectAllowlist::load();
-
-    // --list-cops: print all registered cop names and exit (no config needed)
-    if args.list_cops {
-        let mut names: Vec<&str> = registry.cops().iter().map(|c| c.name()).collect();
-        names.sort();
-        for name in names {
-            println!("{name}");
-        }
-        return Ok(0);
-    }
-
-    // --list-autocorrectable-cops: print cops that support autocorrect and exit
-    if args.list_autocorrectable_cops {
-        let mut names: Vec<&str> = registry
-            .cops()
-            .iter()
-            .filter(|c| c.supports_autocorrect())
-            .map(|c| c.name())
-            .collect();
-        names.sort();
-        for name in names {
-            println!("{name}");
-        }
-        return Ok(0);
-    }
-
-    // --rules: list all cops with tier, implementation status, baseline presence
-    if args.rules {
-        let rule_list = rules::build_rules(&registry, &tier_map, args.tier.as_deref());
-        if args.format == "json" {
-            rules::print_json(&rule_list);
-        } else {
-            rules::print_table(&rule_list);
-        }
-        return Ok(0);
-    }
 
     // --cache-clear: remove result cache directory and exit
     if args.cache_clear {
@@ -330,6 +313,10 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.rubocop_only
         && !args.list_target_files
         && !args.force_default_config
+        && !args.list_cops
+        && !args.list_autocorrectable_cops
+        && !args.rules
+        && args.validate_ir.is_none()
         && args.stdin.is_none();
 
     // Load config — use lockfile if available
@@ -378,6 +365,84 @@ pub fn run(args: Args) -> Result<i32> {
             eprintln!("debug: no config file found");
         }
         eprintln!("debug: global excludes: {:?}", config.global_excludes());
+    }
+
+    // User cop discovery (design §4.1). Must happen after config resolution —
+    // the config root is the search root and `AllCops.CustomCopPaths` is a
+    // config key — and before anything that reads the registry, so a custom cop
+    // is listed, classified and run exactly like a built-in one.
+    let (user_cops, ir_errors) = cop::ir::discover::discover_and_load(
+        config.config_dir(),
+        target_dir,
+        config.custom_cop_paths(),
+        &registry,
+    );
+    if !ir_errors.is_empty() {
+        for err in &ir_errors {
+            eprintln!("{err}");
+        }
+        eprintln!("{} invalid cop IR definition(s)", ir_errors.len());
+    }
+    // --validate-ir with no PATH: report on the discovered set and exit.
+    if args.validate_ir.is_some() {
+        for (path, name) in user_cops.paths.iter().zip(&user_cops.names) {
+            println!("{}: ok ({name})", path.display());
+        }
+        if user_cops.is_empty() && ir_errors.is_empty() {
+            println!("no user cop definitions found");
+        }
+        return Ok(i32::from(!ir_errors.is_empty()) * 2);
+    }
+    // Fail closed (design §4.4): a silently dropped cop is an invisible false
+    // negative, so an invalid document aborts before a single file is linted.
+    if !ir_errors.is_empty() && !args.ignore_invalid_cops {
+        eprintln!("Use --ignore-invalid-cops to downgrade this to a warning.");
+        return Ok(2);
+    }
+    if args.debug && !user_cops.is_empty() {
+        eprintln!("debug: {} user cops loaded", user_cops.names.len());
+    }
+    tier_map.set_custom_cops(&user_cops.names, user_cops.digest());
+    user_cops.register_all(&mut registry);
+
+    // --list-cops: print all registered cop names and exit
+    if args.list_cops {
+        let mut names: Vec<&str> = registry.cops().iter().map(|c| c.name()).collect();
+        names.sort();
+        for name in names {
+            if tier_map.is_custom(name) {
+                println!("{name} (custom)");
+            } else {
+                println!("{name}");
+            }
+        }
+        return Ok(0);
+    }
+
+    // --list-autocorrectable-cops: print cops that support autocorrect and exit
+    if args.list_autocorrectable_cops {
+        let mut names: Vec<&str> = registry
+            .cops()
+            .iter()
+            .filter(|c| c.supports_autocorrect())
+            .map(|c| c.name())
+            .collect();
+        names.sort();
+        for name in names {
+            println!("{name}");
+        }
+        return Ok(0);
+    }
+
+    // --rules: list all cops with tier, implementation status, baseline presence
+    if args.rules {
+        let rule_list = rules::build_rules(&registry, &tier_map, args.tier.as_deref());
+        if args.format == "json" {
+            rules::print_json(&rule_list);
+        } else {
+            rules::print_table(&rule_list);
+        }
+        return Ok(0);
     }
 
     // --rubocop-only: print uncovered cops and exit

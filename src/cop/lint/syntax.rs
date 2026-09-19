@@ -161,7 +161,8 @@ mod tests {
             verify: false,
             rubocop_cmd: "bundle exec rubocop".to_string(),
             corpus_check: None,
-            validate_ir: vec![],
+            validate_ir: None,
+            ignore_invalid_cops: false,
         }
     }
 

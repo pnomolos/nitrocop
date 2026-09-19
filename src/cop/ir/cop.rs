@@ -377,6 +377,7 @@ impl IrCopRunner {
         ancestors: &'a [ruby_prism::Node<'pr>],
         caps: &'a Captures<'pr>,
         config_values: &'pr [serde_yml::Value],
+        severity_override: Option<Severity>,
         diagnostics: &mut Vec<Diagnostic>,
         corrections: Option<&mut Vec<Correction>>,
     ) {
@@ -426,7 +427,11 @@ impl IrCopRunner {
 
         let (line, column) = source.offset_to_line_col(start);
         let mut diag = self.diagnostic(source, line, column, render(&spec.message));
-        diag.severity = plan.severity;
+        // `Severity:` in `.rubocop.yml` beats both the per-hook override and
+        // the document's own `severity:`. The `Cop` trait's
+        // `default_severity()` is a per-cop constant, so an IR cop — whose
+        // severity varies per hook — has to apply the config value here.
+        diag.severity = severity_override.unwrap_or(plan.severity);
 
         if let Some(corr) = corrections
             && !plan.corrections.is_empty()
@@ -583,6 +588,7 @@ impl Cop for IrCopRunner {
                 ancestors,
                 &caps,
                 config_values,
+                config.severity,
                 diagnostics,
                 corrections.as_deref_mut(),
             );

@@ -215,7 +215,12 @@ pub fn run_linter(
         && args.autocorrect_mode() == crate::cli::AutocorrectMode::Off;
     let cache_enabled = cache_enabled && !has_dir_overrides;
     let cache = if cache_enabled {
-        let c = ResultCache::new(env!("CARGO_PKG_VERSION"), &base_configs, args);
+        let c = ResultCache::new(
+            env!("CARGO_PKG_VERSION"),
+            &base_configs,
+            args,
+            tier_map.custom_digest(),
+        );
         if args.debug {
             eprintln!("debug: result cache enabled");
         }
@@ -1406,7 +1411,8 @@ mod tests {
             verify: false,
             rubocop_cmd: "bundle exec rubocop".to_string(),
             corpus_check: None,
-            validate_ir: vec![],
+            validate_ir: None,
+            ignore_invalid_cops: false,
         }
     }
 

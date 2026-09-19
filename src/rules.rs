@@ -23,6 +23,10 @@ pub struct RuleEntry {
     pub implemented: bool,
     pub in_baseline: bool,
     pub default_enabled: bool,
+    /// A user cop loaded from `.nitrocop/cops/**` or `AllCops.CustomCopPaths`.
+    /// Such a cop is implemented and stable but deliberately absent from the
+    /// RuboCop baseline, which is otherwise how an unknown cop looks.
+    pub custom: bool,
 }
 
 /// Build the full rules list (union of registry + baseline cops).
@@ -64,7 +68,8 @@ pub fn build_rules(
 
         let implemented = registry_names.contains(name.as_str());
         let in_baseline = baseline.contains_key(name.as_str());
-        let default_enabled = baseline.get(name.as_str()).copied().unwrap_or(false);
+        let custom = tier_map.is_custom(name);
+        let default_enabled = custom || baseline.get(name.as_str()).copied().unwrap_or(false);
 
         rules.push(RuleEntry {
             name: name.clone(),
@@ -72,6 +77,7 @@ pub fn build_rules(
             implemented,
             in_baseline,
             default_enabled,
+            custom,
         });
     }
 
@@ -89,7 +95,13 @@ pub fn print_table(rules: &[RuleEntry]) {
 
     for rule in rules {
         let impl_mark = if rule.implemented { "yes" } else { "-" };
-        let baseline_mark = if rule.in_baseline { "yes" } else { "-" };
+        let baseline_mark = if rule.custom {
+            "custom"
+        } else if rule.in_baseline {
+            "yes"
+        } else {
+            "-"
+        };
         let default_mark = if rule.default_enabled { "yes" } else { "-" };
         println!(
             "{:<45} {:<8} {:<12} {:<10} {}",
@@ -103,8 +115,9 @@ pub fn print_table(rules: &[RuleEntry]) {
     let implemented = rules.iter().filter(|r| r.implemented).count();
     let in_baseline = rules.iter().filter(|r| r.in_baseline).count();
     let preview = rules.iter().filter(|r| r.tier == "preview").count();
+    let custom = rules.iter().filter(|r| r.custom).count();
     println!(
-        "{total} cops total, {implemented} implemented, {in_baseline} in baseline, {preview} preview-tier"
+        "{total} cops total, {implemented} implemented, {in_baseline} in baseline, {preview} preview-tier, {custom} custom"
     );
 }
 
