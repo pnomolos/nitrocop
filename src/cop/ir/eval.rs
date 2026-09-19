@@ -982,6 +982,24 @@ mod tests {
             .more("  konst:\n    pattern: \"(const nil? :Time)\"\n"),
             Case::new("Time.new", TIME_NEW, "{ matches: [node, \"is_new\"] }")
                 .extra("predicates:\n  is_new:\n    expr: { eq: [node.method_name, \":new\"] }\n"),
+            // Two-pass matcher compilation, end to end: a union whose operands
+            // are declared after it — upstream's
+            // `Style/RedundantStructKeywordInit#keyword_init?` shape — and a
+            // self-recursive matcher that descends into the receiver.
+            Case::new("Time.new", TIME_NEW, "{ matches: [node, \"either?\"] }")
+                .more(
+                    "  either?:\n    pattern: \"{#date_new #time_new}\"\n  date_new:\n    pattern: \"(send (const nil? :Date) :new)\"\n  time_new:\n    pattern: \"(send (const nil? :Time) :new)\"\n",
+                ),
+            Case::new("Date.today", "(send (const nil? :Date) :today)", "{ matches: [node, \"either?\"] }")
+                .more(
+                    "  either?:\n    pattern: \"{#date_new #time_new}\"\n  date_new:\n    pattern: \"(send (const nil? :Date) :new)\"\n  time_new:\n    pattern: \"(send (const nil? :Time) :new)\"\n",
+                )
+                .falsey(),
+            Case::new("root.a.b", "(send _ :b)", "{ matches: [node, \"chain?\"] }")
+                .more("  chain?:\n    pattern: \"{(send nil? :root) (send #chain? _)}\"\n"),
+            Case::new("other.a.b", "(send _ :b)", "{ matches: [node, \"chain?\"] }")
+                .more("  chain?:\n    pattern: \"{(send nil? :root) (send #chain? _)}\"\n")
+                .falsey(),
             // `%CONST` inside a matcher resolves against the document's own
             // `constants:` — upstream's `%KIND_METHODS` spelling, verbatim.
             Case::new("x.is_a?(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")

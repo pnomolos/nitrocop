@@ -100,10 +100,28 @@ matchers:
 Patterns are **copied verbatim from upstream, never synthesized**; each is
 fully compiled at load (`CompiledPattern::compile_with`), so an unresolvable
 `#helper`, `%param` or `pred?` is a load error rather than a silent `true`.
-Matchers are compiled in name order and each sees the ones before it as
-`#helper` targets, which makes the pattern reference graph acyclic by
-construction; declaring more capture names than the pattern has `$` slots is an
-error. A name may not be declared as both a matcher and a predicate.
+Declaring more capture names than the pattern has `$` slots is an error. A name
+may not be declared as both a matcher and a predicate.
+
+Matchers compile in **two passes** — every name is declared, then every pattern
+is compiled — so a `#helper` may name a matcher declared later, a mutually
+recursive partner, or itself. That is upstream's rule (`def_node_matcher`
+defines methods, and a method body may name any other), and it is what lets
+`Style/RedundantStructKeywordInit` copy
+
+```ruby
+def_node_matcher :keyword_init?, '{#redundant_keyword_init? #keyword_init_false?}'
+```
+
+verbatim, although `?` (0x3F) sorts before `_` (0x5F) and both operands are
+declared after it. The cost is that pattern-level acyclicity is no longer free:
+a matcher that recurses *without descending* (`a: "#a"`) overflows the stack at
+match time, exactly as upstream's method would. One that recurses through `^`,
+or into a child, terminates because the chain and the subtree are finite.
+
+`predicates:` keep the DAG rule — a `matches:` cycle between them is an
+`IrErrorKind::Cycle` at load — because a predicate expression has no descending
+step to make the recursion well-founded.
 
 ## `hooks:`
 

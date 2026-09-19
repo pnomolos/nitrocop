@@ -768,6 +768,61 @@ hooks:
         assert_eq!(err.kind, IrErrorKind::Department);
     }
 
+    /// `matchers:` compile in two passes, so a `#helper` may name a matcher
+    /// declared later (`a?` sorts before `b?` here, and `?` sorts before `_`,
+    /// which is what defeated the single pass), a mutually recursive partner,
+    /// or itself.
+    #[test]
+    fn matchers_resolve_forward_and_mutual_references() {
+        const MUTUAL: &str = r#"
+schema: 1
+cop: "Custom/Mutual"
+matchers:
+  a?:
+    pattern: "{(send nil? :stop) (send #b? _)}"
+  b?:
+    pattern: "{(send nil? :stop) (send #a? _)}"
+  self?:
+    pattern: "{(send nil? :stop) (send #self? _)}"
+hooks:
+  - on: [send]
+    match: "a?"
+    when: { matches: [node, "self?"] }
+    offense:
+      location: node
+      message: "x"
+"#;
+        let cop = load_str_with(MUTUAL, "memory.cop.yml", LoadMode::User).unwrap();
+        assert_eq!(cop.compiled.matcher_names, ["a?", "b?", "self?"]);
+    }
+
+    /// The DAG rule is kept for `predicates:`, whose bodies have no descending
+    /// step to make a recursion well-founded.
+    #[test]
+    fn predicate_cycles_are_still_rejected() {
+        const CYCLE: &str = r#"
+schema: 1
+cop: "Custom/Cycle"
+matchers:
+  probe:
+    pattern: "(send nil? :foo)"
+predicates:
+  one:
+    expr: { matches: [node, "two"] }
+  two:
+    expr: { matches: [node, "one"] }
+hooks:
+  - on: [send]
+    match: probe
+    when: { matches: [node, "one"] }
+    offense:
+      location: node
+      message: "x"
+"#;
+        let err = load_str_with(CYCLE, "memory.cop.yml", LoadMode::User).unwrap_err();
+        assert_eq!(err.kind, IrErrorKind::Cycle);
+    }
+
     #[test]
     fn error_renders_as_origin_line_column_message() {
         let err = IrError {

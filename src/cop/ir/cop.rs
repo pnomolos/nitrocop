@@ -369,6 +369,8 @@ impl IrCopRunner {
         ancestors: &'a [ruby_prism::Node<'pr>],
         caps: &'a Captures<'pr>,
         config_values: &'pr [serde_yml::Value],
+        params: &'a Params,
+        resolver: &'a dyn Resolver,
         diagnostics: &mut Vec<Diagnostic>,
         corrections: Option<&mut Vec<Correction>>,
     ) {
@@ -383,7 +385,15 @@ impl IrCopRunner {
         for (_, expr) in &compiled.binds {
             let value = {
                 let ctx = self
-                    .eval_ctx(source, node, ancestors, caps, config_values)
+                    .eval_ctx(
+                        source,
+                        node,
+                        ancestors,
+                        caps,
+                        config_values,
+                        params,
+                        resolver,
+                    )
                     .with_binds(&binds);
                 eval(expr, &ctx)
             };
@@ -392,7 +402,15 @@ impl IrCopRunner {
 
         if let Some(when) = &compiled.when {
             let ctx = self
-                .eval_ctx(source, node, ancestors, caps, config_values)
+                .eval_ctx(
+                    source,
+                    node,
+                    ancestors,
+                    caps,
+                    config_values,
+                    params,
+                    resolver,
+                )
                 .with_binds(&binds);
             if !eval(when, &ctx).truthy() {
                 return;
@@ -456,6 +474,7 @@ impl IrCopRunner {
         diagnostics.push(diag);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval_ctx<'a, 'pr>(
         &'pr self,
         source: &'pr SourceFile,
@@ -463,11 +482,18 @@ impl IrCopRunner {
         ancestors: &'a [ruby_prism::Node<'pr>],
         caps: &'a Captures<'pr>,
         config_values: &'pr [serde_yml::Value],
+        params: &'a Params,
+        resolver: &'a dyn Resolver,
     ) -> EvalCtx<'a, 'pr> {
         EvalCtx::new(node, source, self.compiled())
             .with_ancestors(ancestors)
             .with_captures(caps)
             .with_config(config_values)
+            // A `matches:` against a named matcher runs the real NodePattern
+            // engine, so it needs the same `#helper` / `%TABLE` resolution the
+            // hook's own `match:` got. Without this a matcher that calls one —
+            // upstream's `keyword_init?` union, say — silently answers false.
+            .with_params(params, resolver)
     }
 }
 
@@ -582,6 +608,8 @@ impl Cop for IrCopRunner {
                 ancestors,
                 &caps,
                 config_values,
+                params,
+                &resolver,
                 diagnostics,
                 corrections.as_deref_mut(),
             );

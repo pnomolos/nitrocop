@@ -27,10 +27,24 @@
 //!
 //! ## Matcher compilation order
 //!
-//! `matchers:` are compiled in `BTreeMap` (i.e. name) order, each seeing the
-//! ones compiled before it as `#helper` targets. A forward reference is an
-//! `UnknownMatcher`-style [`IrErrorKind::Pattern`] error rather than a cycle,
-//! which is how pattern-level acyclicity is enforced for free.
+//! `matchers:` compile in **two passes**: every name is declared, then every
+//! pattern is compiled against that declaration set. Compilation only asks
+//! whether a `#helper` name is *known* ([`crate::node_pattern::collect_unresolved`]),
+//! and matching resolves it against the finished table through
+//! [`DocResolver`], so a matcher may refer to one declared later, to a
+//! mutually recursive partner, or to itself. That is upstream's own rule —
+//! `def_node_matcher` defines methods on the cop class, and a method body may
+//! name any other — and `Style/RedundantStructKeywordInit`'s
+//! `keyword_init?` = `{#redundant_keyword_init? #keyword_init_false?}` is the
+//! shape a single pass could not express, because `?` sorts before `_`.
+//!
+//! What that gives up is the acyclicity a single pass enforced for free. A
+//! matcher that recurses without descending (`a: "#a"`) overflows the stack at
+//! match time, exactly as upstream's method would; a matcher that recurses
+//! through `^`, or into a child, terminates because the chain and the subtree
+//! are finite. `predicates:` keep the DAG rule — their cycles are still
+//! rejected at load ([`IrErrorKind::Cycle`]) — because a predicate expression
+//! has no such descending step to make the recursion well-founded.
 
 use regex::RegexBuilder;
 
@@ -376,19 +390,26 @@ impl CompiledDoc {
     }
 }
 
-/// Resolves `#helper` against the matchers compiled so far, and `%TABLE`
+/// Resolves `#helper` against the *declared* matcher names and `%TABLE`
 /// against the document's `constants:`.
-struct MatcherResolver<'a> {
+///
+/// Every declared name resolves to the same stand-in pattern, which is enough
+/// for compilation: `collect_unresolved` only asks whether a name is known,
+/// and the stand-in is never matched against — [`DocResolver`] answers at
+/// match time, from the finished table.
+struct DeclaredResolver<'a> {
     names: &'a [String],
-    compiled: &'a [CompiledPattern],
+    stand_in: &'a CompiledPattern,
     const_names: &'a [String],
     const_args: &'a [Arg],
 }
 
-impl Resolver for MatcherResolver<'_> {
+impl Resolver for DeclaredResolver<'_> {
     fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
-        let index = self.names.iter().position(|n| n == name)?;
-        self.compiled.get(index)
+        self.names
+            .iter()
+            .any(|declared| declared == name)
+            .then_some(self.stand_in)
     }
 
     fn constant(&self, name: &str) -> Option<&Arg> {
@@ -518,25 +539,30 @@ impl<'a> CompileCtx<'a> {
         Ok(ctx)
     }
 
+    /// Pass 1 declares every matcher name; pass 2 compiles every pattern
+    /// against that set. See the module docs for why, and for what it costs.
     fn compile_matchers(&mut self) -> Result<(), IrError> {
+        let stand_in = CompiledPattern::compile("_").expect("`_` is a valid pattern");
+        let names: Vec<String> = self.doc.matchers.keys().cloned().collect();
+        let mut compiled = Vec::with_capacity(names.len());
         for (name, decl) in &self.doc.matchers {
             let text = decl.pattern.trim();
             if text.is_empty() {
                 cerr!(self, Pattern, "matcher `{name}`: empty pattern");
             }
-            let resolver = MatcherResolver {
-                names: &self.matcher_names,
-                compiled: &self.matchers,
+            let resolver = DeclaredResolver {
+                names: &names,
+                stand_in: &stand_in,
                 const_names: &self.const_names,
                 const_args: &self.const_args,
             };
-            let compiled = match CompiledPattern::compile_with(text, &resolver) {
-                Ok(compiled) => compiled,
+            match CompiledPattern::compile_with(text, &resolver) {
+                Ok(pattern) => compiled.push(pattern),
                 Err(e) => cerr!(self, Pattern, "matcher `{name}`: {e}"),
-            };
-            self.matcher_names.push(name.clone());
-            self.matchers.push(compiled);
+            }
         }
+        self.matcher_names = names;
+        self.matchers = compiled;
         Ok(())
     }
 

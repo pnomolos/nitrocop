@@ -21,6 +21,12 @@ matchers:
   struct_new:
     pattern: |
       ^^(call (const {nil? cbase} :Struct) :new ...)
+  # `matchers:` compile in two passes, so this union resolves both of its
+  # operands although `?` (0x3F) sorts before `_` (0x5F) and both are declared
+  # after it.
+  keyword_init?:
+    pattern: |
+      {#redundant_keyword_init? #keyword_init_false?}
   redundant_keyword_init?:
     pattern: |
       (pair (sym :keyword_init) {(true) (nil)})
@@ -34,12 +40,6 @@ hooks:
   # once per redundant one. As in `Lint/DataDefineOverride`, a hook reports
   # once, so the dispatch is inverted: the hook fires on the **pair** and the
   # matcher ascends two Parser-visible levels (pair -> hash -> call).
-  #
-  # `keyword_init?`, upstream's `{#redundant_keyword_init? #keyword_init_false?}`
-  # union, is not declared as a matcher: `matchers:` compile in name order and
-  # `keyword_init?` sorts *before* both of its operands, so it could not see
-  # them. It is the two-armed `any:` of `all_kw` below instead; the two leaf
-  # patterns stay verbatim, which is what matters.
   #
   # Three upstream guards, in order:
   #
@@ -75,10 +75,7 @@ hooks:
             of: parent
             over: children
             var: p
-            body:
-              any:
-                - { matches: [p, "redundant_keyword_init?"] }
-                - { matches: [p, "keyword_init_false?"] }
+            body: { matches: [p, "keyword_init?"] }
         # `range_emptying_hash`: `(preceding = pair.parent.left_sibling).is_a?(AST::Node)`.
         - { ne: [parent.left_sibling, null] }
     offense: &rski_offense
