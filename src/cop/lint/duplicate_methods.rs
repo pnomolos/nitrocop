@@ -217,6 +217,41 @@ use ruby_prism::Visit;
 ///   (matching RuboCop's `sym_name` pattern which only matches symbol nodes, not strings)
 ///   to avoid FP on `attr 'string-name'` calls used as DSL methods.
 ///   (1 FN: love2d helpers.rb)
+///
+/// ## `DelegatingMethods` (rubocop 1.91, vendor bump 2026-09)
+///
+/// `DelegatingMethods` (default `["delegate"]`) lists method names treated as
+/// `delegate`-shaped macros (`name :a, :b, to: :target`), in addition to (or
+/// instead of) the built-in `delegate`. Like the built-in case, this is only
+/// consulted when `ActiveSupportExtensionsEnabled` is true, matching
+/// RuboCop's `delegating_method?`. The list is used as-is, not merged with
+/// the `["delegate"]` default — a project that sets `DelegatingMethods` must
+/// list `delegate` explicitly to keep it recognized, matching RuboCop's
+/// `cop_config.fetch('DelegatingMethods', ['delegate'])`.
+///
+/// ## `AllowedCrossFilePaths` (rubocop 1.91, vendor bump 2026-09) — NOT IMPLEMENTED
+///
+/// Upstream's cross-file duplicate detection depends on `AllCops/UseProjectIndex`
+/// plus the `rubydex` gem building a project-wide method index; when a
+/// duplicate's other definition lives in another file, `AllowedCrossFilePaths`
+/// glob/regexp-matches that file's path (same semantics as `Exclude`) to
+/// decide whether to suppress the offense.
+///
+/// nitrocop has no equivalent to `UseProjectIndex`: every cop, including this
+/// one, only ever sees a single file per invocation (rayon workers parse and
+/// analyze one file at a time — see the "No `Mutex` fields for per-file
+/// state" constraint in AGENTS.md), so nitrocop's `DuplicateMethods` cannot
+/// detect cross-file duplicates in the first place. `AllowedCrossFilePaths`
+/// therefore has nothing to filter today: the config key is read (below) so
+/// it round-trips through config resolution without erroring, but the value
+/// is discarded and has no effect on any diagnostic.
+///
+/// A faithful implementation would need: (1) a project-wide indexing pass run
+/// once per-project rather than per-file, (2) either a shared concurrent
+/// index or a two-phase pipeline (build the index, then re-check each file
+/// against it), and (3) reuse of the existing `Exclude`-style glob/regexp
+/// matcher against the other definition's file path. That's substantially
+/// more than a per-cop, per-file change and is out of scope for this PR.
 pub struct DuplicateMethods;
 
 impl Cop for DuplicateMethods {
@@ -238,6 +273,15 @@ impl Cop for DuplicateMethods {
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
         let active_support = config.get_bool("ActiveSupportExtensionsEnabled", false);
+        let delegating_methods = config
+            .get_string_array("DelegatingMethods")
+            .unwrap_or_else(|| vec!["delegate".to_string()]);
+        // Read but not consulted: nitrocop has no cross-file duplicate
+        // detection to filter. See the `///` doc comment on `DuplicateMethods`
+        // for why this is a documented gap rather than a real implementation.
+        let _allowed_cross_file_paths = config
+            .get_string_array("AllowedCrossFilePaths")
+            .unwrap_or_default();
         let mut visitor = DupMethodVisitor {
             cop: self,
             source,
@@ -252,6 +296,7 @@ impl Cop for DuplicateMethods {
             ensure_forgiven: Vec::new(),
             rescue_ensure_type_stack: Vec::new(),
             active_support_extensions: active_support,
+            delegating_methods,
         };
         visitor.visit(&parse_result.node());
         diagnostics.extend(visitor.diagnostics);
@@ -294,6 +339,11 @@ struct DupMethodVisitor<'a, 'src> {
     rescue_ensure_type_stack: Vec<RescueEnsureType>,
     /// Whether ActiveSupport extensions are enabled (for `delegate` tracking).
     active_support_extensions: bool,
+    /// Method names recognized as `delegate`-shaped macros (`DelegatingMethods`
+    /// config, default `["delegate"]`). Only consulted when
+    /// `active_support_extensions` is true, matching RuboCop's
+    /// `delegating_method?`.
+    delegating_methods: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -705,7 +755,9 @@ impl DupMethodVisitor<'_, '_> {
                     self.process_def_delegators(node, &arg_list);
                 }
             }
-            "delegate" if self.active_support_extensions => {
+            name if self.active_support_extensions
+                && self.delegating_methods.iter().any(|m| m == name) =>
+            {
                 if self.if_depth == 0 {
                     self.process_delegate(node, &arg_list);
                 }
@@ -1717,6 +1769,89 @@ mod tests {
         assert_eq!(n, 0, "delegate without :to should be ignored");
     }
 
+    fn count_offenses_with_delegating_methods(source: &[u8], methods: &[&str]) -> usize {
+        let mut config = CopConfig::default();
+        config
+            .options
+            .insert("ActiveSupportExtensionsEnabled".to_string(), true.into());
+        config.options.insert(
+            "DelegatingMethods".to_string(),
+            serde_yml::Value::Sequence(
+                methods
+                    .iter()
+                    .map(|m| serde_yml::Value::String((*m).to_string()))
+                    .collect(),
+            ),
+        );
+        run_cop_full_with_config(&DuplicateMethods, source, config).len()
+    }
+
+    #[test]
+    fn test_custom_delegating_method_registered() {
+        // With DelegatingMethods: [delegate, expose], a custom `expose` macro
+        // is recognized the same way as `delegate`.
+        let n = count_offenses_with_delegating_methods(
+            b"class Foo\n  def some_method; end\n  expose :some_method, to: :bar\nend\n",
+            &["delegate", "expose"],
+        );
+        assert_eq!(
+            n, 1,
+            "custom DelegatingMethods entry should be tracked like delegate"
+        );
+    }
+
+    #[test]
+    fn test_builtin_delegate_still_tracked_with_custom_delegating_methods() {
+        // Registering a custom name via DelegatingMethods doesn't replace
+        // the RuboCop default of `delegate` unless the project excludes it —
+        // but since this list is exhaustive (not merged with the default),
+        // `delegate` must be listed explicitly to keep working, matching
+        // RuboCop's `cop_config.fetch('DelegatingMethods', ['delegate'])`.
+        let n = count_offenses_with_delegating_methods(
+            b"class Foo\n  def some_method; end\n  delegate :some_method, to: :bar\nend\n",
+            &["delegate", "expose"],
+        );
+        assert_eq!(n, 1, "delegate must still work when explicitly listed");
+    }
+
+    #[test]
+    fn test_custom_delegating_method_not_recognized_by_default() {
+        // Without DelegatingMethods configured, an arbitrary macro named
+        // `expose` is just a regular method call, not tracked as a
+        // delegate-shaped definition.
+        let n = count_offenses_with_active_support(
+            b"class Foo\n  def some_method; end\n  expose :some_method, to: :bar\nend\n",
+        );
+        assert_eq!(
+            n, 0,
+            "expose is not delegate-shaped without DelegatingMethods"
+        );
+    }
+
+    #[test]
+    fn test_custom_delegating_method_requires_active_support() {
+        // DelegatingMethods only takes effect when ActiveSupportExtensionsEnabled
+        // is true, matching RuboCop's `delegating_method?` gate.
+        let mut config = CopConfig::default();
+        config.options.insert(
+            "DelegatingMethods".to_string(),
+            serde_yml::Value::Sequence(vec![
+                serde_yml::Value::String("delegate".to_string()),
+                serde_yml::Value::String("expose".to_string()),
+            ]),
+        );
+        let n = run_cop_full_with_config(
+            &DuplicateMethods,
+            b"class Foo\n  def some_method; end\n  expose :some_method, to: :bar\nend\n",
+            config,
+        )
+        .len();
+        assert_eq!(
+            n, 0,
+            "DelegatingMethods should have no effect when ActiveSupportExtensionsEnabled is false"
+        );
+    }
+
     #[test]
     fn test_sclass_constant_path_detects_dups() {
         // RuboCop's parent_module_name returns `#<Class:Multiton::ClassMethods>` for
@@ -1860,5 +1995,33 @@ mod tests {
             n, 1,
             "delegate then def inside class << self should detect dup"
         );
+    }
+
+    #[test]
+    fn test_allowed_cross_file_paths_read_without_effect() {
+        // AllowedCrossFilePaths is read (see the doc comment on
+        // `DuplicateMethods` for why) but has no cross-file detection to
+        // filter, so it must not change same-file offense detection either
+        // way: same-file duplicates are still reported...
+        let mut config = CopConfig::default();
+        config.options.insert(
+            "AllowedCrossFilePaths".to_string(),
+            serde_yml::Value::Sequence(vec![serde_yml::Value::String("script/**/*".to_string())]),
+        );
+        let n = run_cop_full_with_config(
+            &DuplicateMethods,
+            b"class Foo\n  def bar; end\n  def bar; end\nend\n",
+            config.clone(),
+        )
+        .len();
+        assert_eq!(
+            n, 1,
+            "AllowedCrossFilePaths must not suppress same-file duplicates"
+        );
+
+        // ...and a config with no list at all behaves identically, since
+        // nothing consults the value either way.
+        let n_default = count_offenses(b"class Foo\n  def bar; end\n  def bar; end\nend\n");
+        assert_eq!(n_default, n);
     }
 }

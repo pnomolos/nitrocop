@@ -1,3 +1,3 @@
 # -*- encoding : utf-8 -*-
 require 'something'
-^ Layout/EmptyLineAfterMagicComment: Add an empty line after magic comments.
+^ Layout/EmptyLineAfterMagicComment: Expected at least 1 empty line after magic comments; found 0.

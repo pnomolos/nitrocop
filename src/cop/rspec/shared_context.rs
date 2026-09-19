@@ -36,6 +36,26 @@ use crate::parse::source::SourceFile;
 /// when `call.receiver().is_some()`, skipping all receiver-qualified calls.
 /// RuboCop's `#rspec?` predicate accepts both receiverless calls and `RSpec.`
 /// prefixed calls. Fixed by allowing `RSpec` constant receiver.
+///
+/// ## `Strict` (rubocop-rspec 3.10, vendor bump 2026-09)
+///
+/// `Strict` (default `false`) changes when a `shared_context` containing
+/// examples is flagged:
+/// - `false` (default): only flagged when it has examples and NO context
+///   setup (let/subject/hooks/include_context) — matches the pre-existing
+///   behavior above.
+/// - `true`: flagged whenever it contains ANY examples, even if it also has
+///   context setup. Matches RuboCop's
+///   `yield if examples?(node) && (strict? || !context?(node))` — when
+///   `strict?` is true the `context?(node)` check is short-circuited away
+///   entirely.
+///
+/// The message also changes under `Strict: true`: "Use `shared_examples`
+/// when you define examples." instead of "...when you don't define
+/// context.". This cop has no autocorrector in nitrocop (`supports_autocorrect`
+/// is false), so RuboCop's `can_correct?` gating — which additionally
+/// suppresses the fixer under `Strict: true` when context setup is also
+/// present — has no nitrocop equivalent to port.
 pub struct SharedContext;
 
 impl Cop for SharedContext {
@@ -60,10 +80,11 @@ impl Cop for SharedContext {
         source: &SourceFile,
         node: &ruby_prism::Node<'_>,
         _parse_result: &ruby_prism::ParseResult<'_>,
-        _config: &CopConfig,
+        config: &CopConfig,
         diagnostics: &mut Vec<Diagnostic>,
         _corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
+        let strict = config.get_bool("Strict", false);
         let call = match node.as_call_node() {
             Some(c) => c,
             None => return,
@@ -111,13 +132,13 @@ impl Cop for SharedContext {
         let loc = call.location();
         let (line, col) = source.offset_to_line_col(loc.start_offset());
 
-        if is_shared_context && has_examples && !has_context_setup {
-            diagnostics.push(self.diagnostic(
-                source,
-                line,
-                col,
-                "Use `shared_examples` when you don't define context.".to_string(),
-            ));
+        if is_shared_context && has_examples && (strict || !has_context_setup) {
+            let message = if strict {
+                "Use `shared_examples` when you define examples."
+            } else {
+                "Use `shared_examples` when you don't define context."
+            };
+            diagnostics.push(self.diagnostic(source, line, col, message.to_string()));
         }
 
         if is_shared_examples && has_context_setup && !has_examples {
@@ -235,4 +256,17 @@ mod tests {
     use super::*;
 
     crate::cop_fixture_tests!(SharedContext, "cops/rspec/shared_context");
+    crate::cop_variant_fixture_tests!(SharedContext, "cops/rspec/shared_context", strict_true,);
+
+    #[test]
+    fn strict_false_default_does_not_flag_context_with_examples_and_setup() {
+        // Default (Strict: false, the pre-existing behavior): shared_context
+        // with BOTH examples and setup is not flagged, only examples-only.
+        let source = b"shared_context 'foo' do\n  let(:foo) { :bar }\n\n  it 'performs actions' do\n  end\nend\n";
+        let diags = crate::testutil::run_cop_full(&SharedContext, source);
+        assert!(
+            diags.is_empty(),
+            "default Strict:false should not flag context with setup + examples"
+        );
+    }
 }

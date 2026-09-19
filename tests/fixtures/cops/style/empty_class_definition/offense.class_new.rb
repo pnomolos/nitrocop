@@ -2,8 +2,3 @@
                 ^ Style/EmptyClassDefinition: Prefer `Class.new` over class definition for classes with no body.
   self
 end
-
-class MyClass
-^ Style/EmptyClassDefinition: Prefer `Class.new` over class definition for classes with no body.
-  self
-end

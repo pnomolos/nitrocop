@@ -47,6 +47,23 @@ use std::sync::OnceLock;
 /// require a blank line after a leading magic comment. This implementation now
 /// stops the top-of-file scan at an exact `__END__` line; prefixed, indented,
 /// or trailing-space variants still count as code because RuboCop flags them.
+///
+/// ## `NumberOfEmptyLines` (rubocop 1.91, vendor bump 2026-09)
+///
+/// RuboCop's `NumberOfEmptyLines` sets the minimum number of empty lines
+/// required after the last magic comment (default `1`). Set to `2` for YARD
+/// projects, which otherwise treat magic comments as documentation for the
+/// first class/module. This implementation counts *all* consecutive blank
+/// lines after the last magic comment (not just whether the next line is
+/// blank) and compares against the configured minimum, matching RuboCop's
+/// `empty_lines_after` helper. Autocorrect inserts exactly the missing
+/// number of newlines before the first non-blank line, same as upstream.
+///
+/// RuboCop additionally raises `ValidationError` at cop-validation time when
+/// `NumberOfEmptyLines` isn't a positive integer (0, negative, float, or a
+/// string). nitrocop has no equivalent hard-failure path for malformed cop
+/// config, so an invalid value here silently falls back to the default of
+/// `1` via `CopConfig::get_usize`, rather than aborting the run.
 pub struct EmptyLineAfterMagicComment;
 
 impl Cop for EmptyLineAfterMagicComment {
@@ -61,49 +78,65 @@ impl Cop for EmptyLineAfterMagicComment {
     fn check_lines(
         &self,
         source: &SourceFile,
-        _config: &CopConfig,
+        config: &CopConfig,
         diagnostics: &mut Vec<Diagnostic>,
         mut corrections: Option<&mut Vec<crate::correction::Correction>>,
     ) {
+        let required = config.get_usize("NumberOfEmptyLines", 1).max(1);
+
         let lines: Vec<&[u8]> = source.lines().collect();
         let last_magic_idx = match last_magic_comment_line(&lines) {
             Some(idx) => idx,
             None => return,
         };
 
-        // Check if the line after the last magic comment is blank
-        let next_idx = last_magic_idx + 1;
-        if next_idx >= lines.len() {
+        // Count consecutive blank lines after the last magic comment.
+        let mut actual = 0usize;
+        let mut idx = last_magic_idx + 1;
+        while idx < lines.len() && is_blank_line(lines[idx]) {
+            actual += 1;
+            idx += 1;
+        }
+
+        // `idx` now points at the first non-blank line, or one past the end.
+        // Trailing empty lines are Layout/TrailingEmptyLines' responsibility.
+        if idx >= lines.len() {
+            return;
+        }
+        if actual >= required {
             return;
         }
 
-        let next_line = lines[next_idx];
-        let is_blank = next_line
-            .iter()
-            .all(|&b| b == b' ' || b == b'\t' || b == b'\r');
+        let offending_line_idx = last_magic_idx + 1;
+        let lines_word = if required == 1 { "line" } else { "lines" };
+        let message = format!(
+            "Expected at least {required} empty {lines_word} after magic comments; found {actual}."
+        );
 
-        if !is_blank {
-            let mut diag = self.diagnostic(
-                source,
-                next_idx + 1, // 1-indexed
-                0,
-                "Add an empty line after magic comments.".to_string(),
-            );
-            if let Some(ref mut corr) = corrections {
-                if let Some(offset) = source.line_col_to_offset(next_idx + 1, 0) {
-                    corr.push(crate::correction::Correction {
-                        start: offset,
-                        end: offset,
-                        replacement: "\n".to_string(),
-                        cop_name: self.name(),
-                        cop_index: 0,
-                    });
-                    diag.corrected = true;
-                }
+        let mut diag = self.diagnostic(
+            source,
+            offending_line_idx + 1, // 1-indexed
+            0,
+            message,
+        );
+        if let Some(ref mut corr) = corrections {
+            if let Some(offset) = source.line_col_to_offset(offending_line_idx + 1, 0) {
+                corr.push(crate::correction::Correction {
+                    start: offset,
+                    end: offset,
+                    replacement: "\n".repeat(required - actual),
+                    cop_name: self.name(),
+                    cop_index: 0,
+                });
+                diag.corrected = true;
             }
-            diagnostics.push(diag);
         }
+        diagnostics.push(diag);
     }
+}
+
+fn is_blank_line(line: &[u8]) -> bool {
+    line.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r')
 }
 
 fn last_magic_comment_line(lines: &[&[u8]]) -> Option<usize> {
@@ -290,6 +323,59 @@ mod tests {
         rbs_inline_enabled = "rbs_inline_enabled.rb",
     );
 
+    crate::cop_variant_fixture_tests!(
+        EmptyLineAfterMagicComment,
+        "cops/layout/empty_line_after_magic_comment",
+        number_of_empty_lines_2,
+    );
+
+    #[test]
+    fn number_of_empty_lines_2_offense_when_one_blank_line_present() {
+        use std::collections::HashMap;
+
+        let config = CopConfig {
+            options: HashMap::from([(
+                "NumberOfEmptyLines".into(),
+                serde_yml::Value::Number(serde_yml::Number::from(2)),
+            )]),
+            ..CopConfig::default()
+        };
+        let input = b"# frozen_string_literal: true\n\nclass Foo; end\n";
+        let diags =
+            crate::testutil::run_cop_full_with_config(&EmptyLineAfterMagicComment, input, config);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "Expected at least 2 empty lines after magic comments; found 1."
+        );
+    }
+
+    #[test]
+    fn number_of_empty_lines_2_autocorrect_adds_missing_lines() {
+        use std::collections::HashMap;
+
+        let config = CopConfig {
+            options: HashMap::from([(
+                "NumberOfEmptyLines".into(),
+                serde_yml::Value::Number(serde_yml::Number::from(2)),
+            )]),
+            ..CopConfig::default()
+        };
+        let input = b"# frozen_string_literal: true\nclass Foo; end\n";
+        let (_diags, corrections) = crate::testutil::run_cop_autocorrect_with_config(
+            &EmptyLineAfterMagicComment,
+            input,
+            config,
+        );
+        assert!(!corrections.is_empty());
+        let cs = crate::correction::CorrectionSet::from_vec(corrections);
+        let corrected = cs.apply(input);
+        assert_eq!(
+            corrected,
+            b"# frozen_string_literal: true\n\n\nclass Foo; end\n"
+        );
+    }
+
     #[test]
     fn autocorrect_insert_blank_after_frozen_string() {
         let input = b"# frozen_string_literal: true\nx = 1\n";
@@ -370,7 +456,10 @@ mod tests {
             "expected offense for __END__ prefix identifier after magic comment"
         );
         assert_eq!(diags[0].location.line, 2);
-        assert_eq!(diags[0].message, "Add an empty line after magic comments.");
+        assert_eq!(
+            diags[0].message,
+            "Expected at least 1 empty line after magic comments; found 0."
+        );
     }
 
     #[test]
@@ -383,7 +472,10 @@ mod tests {
             "expected offense for BOM-prefixed magic comment"
         );
         assert_eq!(diags[0].location.line, 2);
-        assert_eq!(diags[0].message, "Add an empty line after magic comments.");
+        assert_eq!(
+            diags[0].message,
+            "Expected at least 1 empty line after magic comments; found 0."
+        );
     }
 
     #[test]
@@ -396,6 +488,9 @@ mod tests {
             "expected offense for BOM-prefixed coding comment"
         );
         assert_eq!(diags[0].location.line, 2);
-        assert_eq!(diags[0].message, "Add an empty line after magic comments.");
+        assert_eq!(
+            diags[0].message,
+            "Expected at least 1 empty line after magic comments; found 0."
+        );
     }
 }

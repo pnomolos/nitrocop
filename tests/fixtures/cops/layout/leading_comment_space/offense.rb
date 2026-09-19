@@ -21,3 +21,9 @@ y = 2
 
 ##!/usr/bin/env ruby
 ^ Layout/LeadingCommentSpace: Missing space after `#`.
+
+# Some comment
+#-
+^^ Layout/LeadingCommentSpace: Missing space after `#`.
+class Foo
+end

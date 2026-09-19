@@ -20,6 +20,25 @@ use crate::parse::source::SourceFile;
 /// - The same style should still flag single-statement bodies like `self`,
 ///   `nil`, `true`, and `false`, because RuboCop treats those parser leaf
 ///   bodies as empty class definitions.
+///
+/// ## `AllowedParentClasses` (rubocop 1.91, vendor bump 2026-09)
+///
+/// `AllowedParentClasses` (default `[]`) permits both styles for specific
+/// parent classes, matched against the parent-class expression's exact
+/// source text (so a namespaced entry must be listed exactly as written,
+/// e.g. `Alchemy::Admin::PreviewUrl`, not just its final segment).
+///
+/// Implementing this for `EnforcedStyle: class_new` required adding a
+/// missing `return unless node.parent_class`-equivalent guard: nitrocop's
+/// `check_class_new_style` previously flagged empty classes with NO
+/// superclass at all (e.g. `class MyClass; end`), which contradicts both
+/// RuboCop's docs ("Class definitions without a superclass... are not
+/// detected") and its spec ("does not register an offense for two-line
+/// class definition without inheritance"). That pre-existing fixture case
+/// was factually wrong and has been moved from `offense.class_new.rb` to
+/// `no_offense.class_new.rb`; a superclass is now required before this style
+/// fires at all, matching upstream and making "what's the parent class to
+/// check against `AllowedParentClasses`" well-defined.
 pub struct EmptyClassDefinition;
 
 impl Cop for EmptyClassDefinition {
@@ -55,12 +74,20 @@ impl Cop for EmptyClassDefinition {
         // lib/rubocop/cop/style/empty_class_definition.rb) — `class_definition` is kept
         // only as a deprecated alias — so both match arms below share one behavior.
         let enforced_style = config.get_str("EnforcedStyle", "class_keyword");
+        let allowed_parent_classes = config
+            .get_string_array("AllowedParentClasses")
+            .unwrap_or_default();
 
         match enforced_style {
-            "class_definition" | "class_keyword" => {
-                diagnostics.extend(check_class_definition_style(self, source, node))
-            }
-            "class_new" => diagnostics.extend(check_class_new_style(self, source, node)),
+            "class_definition" | "class_keyword" => diagnostics.extend(
+                check_class_definition_style(self, source, node, &allowed_parent_classes),
+            ),
+            "class_new" => diagnostics.extend(check_class_new_style(
+                self,
+                source,
+                node,
+                &allowed_parent_classes,
+            )),
             _ => {}
         }
     }
@@ -70,6 +97,7 @@ fn check_class_definition_style(
     cop: &EmptyClassDefinition,
     source: &SourceFile,
     node: &ruby_prism::Node<'_>,
+    allowed_parent_classes: &[String],
 ) -> Vec<Diagnostic> {
     let value = node
         .as_constant_write_node()
@@ -115,6 +143,21 @@ fn check_class_definition_style(
                                     if arg.as_self_node().is_some() {
                                         return Vec::new();
                                     }
+
+                                    // AllowedParentClasses: matched against the
+                                    // parent argument's source text (so a
+                                    // namespaced name like `Foo::Bar` must be
+                                    // listed exactly as written), same as
+                                    // RuboCop's `allowed_parent_class?`.
+                                    let arg_loc = arg.location();
+                                    let arg_text = source.byte_slice(
+                                        arg_loc.start_offset(),
+                                        arg_loc.end_offset(),
+                                        "",
+                                    );
+                                    if allowed_parent_classes.iter().any(|c| c == arg_text) {
+                                        return Vec::new();
+                                    }
                                 }
 
                                 let loc = node.location();
@@ -150,10 +193,26 @@ fn check_class_new_style(
     cop: &EmptyClassDefinition,
     source: &SourceFile,
     node: &ruby_prism::Node<'_>,
+    allowed_parent_classes: &[String],
 ) -> Vec<Diagnostic> {
     // Check for empty class definitions
     if let Some(class_node) = node.as_class_node() {
+        // Classes without a superclass are not involved in inheritance and
+        // are left to `Lint/EmptyClass`, matching RuboCop's
+        // `return unless node.parent_class`.
+        let Some(superclass) = class_node.superclass() else {
+            return Vec::new();
+        };
+
         if !class_new_style_empty_body(class_node.body()) {
+            return Vec::new();
+        }
+
+        // AllowedParentClasses: matched against the superclass expression's
+        // source text, same as RuboCop's `allowed_parent_class?`.
+        let sc_loc = superclass.location();
+        let sc_text = source.byte_slice(sc_loc.start_offset(), sc_loc.end_offset(), "");
+        if allowed_parent_classes.iter().any(|c| c == sc_text) {
             return Vec::new();
         }
 
@@ -246,5 +305,100 @@ mod tests {
             ),
             class_new_config(),
         );
+    }
+
+    fn config_with(style: &str, allowed_parent_classes: &[&str]) -> CopConfig {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "EnforcedStyle".to_string(),
+            serde_yml::Value::String(style.to_string()),
+        );
+        options.insert(
+            "AllowedParentClasses".to_string(),
+            serde_yml::Value::Sequence(
+                allowed_parent_classes
+                    .iter()
+                    .map(|s| serde_yml::Value::String((*s).to_string()))
+                    .collect(),
+            ),
+        );
+        CopConfig {
+            options,
+            ..CopConfig::default()
+        }
+    }
+
+    #[test]
+    fn allowed_parent_classes_permits_class_new_with_allowed_parent() {
+        let config = config_with("class_keyword", &["StandardError"]);
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"FooError = Class.new(StandardError)\n",
+            config,
+        );
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn allowed_parent_classes_still_flags_non_allowed_parent() {
+        let config = config_with("class_keyword", &["StandardError"]);
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"FooError = Class.new(ActiveRecord::Base)\n",
+            config,
+        );
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn allowed_parent_classes_matches_namespaced_name_exactly() {
+        let config = config_with("class_keyword", &["Alchemy::Admin::PreviewUrl"]);
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"MyClass = Class.new(Alchemy::Admin::PreviewUrl)\n",
+            config.clone(),
+        );
+        assert!(diags.is_empty());
+
+        let diags_non_allowed = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"MyClass = Class.new(StandardError)\n",
+            config,
+        );
+        assert_eq!(diags_non_allowed.len(), 1);
+    }
+
+    #[test]
+    fn allowed_parent_classes_permits_class_new_style_with_allowed_parent() {
+        let config = config_with("class_new", &["ApplicationRecord"]);
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"class MyModel < ApplicationRecord\nend\n",
+            config,
+        );
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn allowed_parent_classes_still_flags_class_new_style_non_allowed_parent() {
+        let config = config_with("class_new", &["ApplicationRecord"]);
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"class FooError < StandardError\nend\n",
+            config,
+        );
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn class_new_style_without_superclass_never_flagged() {
+        // Fixed alongside AllowedParentClasses: a class with no superclass
+        // isn't involved in inheritance and is left to Lint/EmptyClass.
+        let diags = crate::testutil::run_cop_full_with_config(
+            &EmptyClassDefinition,
+            b"class MyClass\nend\n",
+            class_new_config(),
+        );
+        assert!(diags.is_empty());
     }
 }
