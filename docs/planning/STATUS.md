@@ -26,8 +26,9 @@ Planning branch, not for upstream. Read this first when resuming.
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); #21 discovery open | in progress |
+| W8 | Hand-written Rust cops for the 9 bucket-C 1.91 cops (non-index): batch 1 in progress (branch cops/rubocop-1.91-batch-1, base #6) | in progress |
 | W7 | Post-merge follow-ups: shared tab-aware `indentation_of` + dedup; `Severity:` config parity; HashAlignment 1.91 semantics; MethodCallWithArgsParentheses omit_parentheses reparse rule | blocked on merges |
-| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; ir_synth.py + ir_verify.py + CI job in progress (branch ir/translator-synth-verify, base #23) | in progress |
+| W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15, #25 open. Pipeline complete; humans still needed for: wiring into embedded.rs, capture naming, semantic review of synthesized guards, spec fixture gaps, corpus gate | done (v1) |
 
 ## Open PRs
 - #1 ci: skip corpus-oracle PR step without GH App secrets
@@ -45,6 +46,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #21 ir: user-cop discovery `.nitrocop/cops/**/*.cop.yml` + `AllCops.CustomCopPaths`, `(custom)` classification, fail-closed, cache key (base #16)
 - #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16)
 - #23 ir: pilot batch 2/2 (TallyMethod, SelectByKind, RedundantStructKeywordInit) (base #19). 7/8 landed; 8 engine additions incl. `_name` unification, `%TABLE` via `constants:`, `min_target_ruby:`, sibling access. Blocked on vocabulary: RSpec/MatchWithSimpleRegex (regex→string transform), Style/MapJoin (needs `.last_line` / loc-part line access in expressions)
+- #25 ir: ir_synth.py (Opus, schema-constrained to when/bind/offense) + ir_verify.py (8 hard gates incl. differential vs real RuboCop at two TargetRubyVersions, `-A` convergence, embedded_freshness) + CI job (base #23). Live TimeNow verify: PASS 8/8
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #22 fix: Lint/UselessAssignment (base main) — VariableForce engine gains `RescueModifierNode` branch handling; two RuboCop quirks replicated (loop-shape structural equality, declaration-order chained-assignment suppression)
