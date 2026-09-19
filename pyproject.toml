@@ -8,6 +8,7 @@ dependencies = [
   "tiktoken",
   "pyyaml",
   "jsonschema",
+  "anthropic>=0.125.0",
 ]
 
 [tool.pytest.ini_options]
