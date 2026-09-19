@@ -370,6 +370,33 @@ use crate::parse::source::SourceFile;
 ///
 ///   Sampled corpus effect: FN 77 → 33 (wxRuby3 41 → 0, gdelugre/origami
 ///   3 → 0, dependabot-core 3 → 0), FP unchanged at 23.
+/// - **Binary operator walk-up now reports**: `on_send`'s walk-up
+///   (`node = node.parent while node.parent&.send_type? || convertible_block?(node)
+///   || node.parent.is_a?(RuboCop::AST::BinaryOperatorNode)`) can land on an
+///   `and`/`or` node, and `offense?` then returns `require_backslash?(node)`.
+///   nitrocop only ever used this for *suppression*
+///   (`inside_binary_op_without_backslash`); the positive case was left to the
+///   Phase 2 text scan, which misses operators nested in array elements, hash
+///   values, `unless` conditions and parenthesized receivers. Added
+///   `visit_and_node`/`visit_or_node` with:
+///   - `binary_operator_walks_up()` — the walk-up continues when the parent is
+///     a `CallNode` (Prism's `ArgumentsNode` wrapper is transparent only for
+///     calls, since `return`/`yield`/`super` also carry one and are not
+///     `send_type?`) or another `and`/`or`; in that case the enclosing node is
+///     the one RuboCop checks;
+///   - `reaches_send()` — the walk-up only traverses send and binary-operator
+///     parents, so an operand that is a literal, a variable read or a
+///     parenthesized expression (Parser's `begin`) never reaches the operator
+///     and cannot trigger it. `( (a && b) \ || (c && d) )` reports the inner
+///     `&&`, never the outer `||` (ruby/tk `lib/tk/optionobj.rb:146`);
+///   - `operator_line_ends_with_backslash()` — `require_backslash?` verbatim,
+///     keyed on the line of `node.loc.operator`, so in
+///     `( (a \ && b ) \ || ( c \ && d ) )` only the first `&&` fires.
+///
+///   Sampled corpus effect: FN 33 → 8, FP unchanged at 23. The eight remaining
+///   sampled FNs are all in non-`.rb` or deliberately-unparseable corpus files
+///   (`Gemfile`, `*.gemspec`, `bad_syntax.rb`, `not-ruby.rb`), i.e. file
+///   discovery/parsing, not cop logic.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -1182,6 +1209,105 @@ impl<'a, 'pr> RedundantLineBreakVisitor<'a, 'pr> {
                 .is_some_and(|receiver| self.receiver_chain_contains_safe_navigation(&receiver))
     }
 
+    /// RuboCop's `on_send` walk-up:
+    ///
+    /// ```ruby
+    /// node = node.parent while node.parent&.send_type? ||
+    ///                          convertible_block?(node) ||
+    ///                          node.parent.is_a?(RuboCop::AST::BinaryOperatorNode)
+    /// ```
+    ///
+    /// `BinaryOperatorNode` is included only by `AndNode` and `OrNode`, so a
+    /// multiline `&&`/`||`/`and`/`or` expression can itself be the node that is
+    /// checked — and then `offense?` takes the `operator_keyword?` branch and
+    /// gates on `require_backslash?`. Returns true when the walk-up would
+    /// continue past this operator node, in which case the enclosing expression
+    /// is the one RuboCop checks.
+    fn binary_operator_walks_up(&self) -> bool {
+        // `ancestors` has the operator node itself as its last element.
+        if self.ancestors.len() < 2 {
+            return false;
+        }
+        let mut idx = self.ancestors.len() - 2;
+        // Prism puts call arguments in an `ArgumentsNode`; Parser hangs them
+        // directly off the send, so the wrapper is transparent here. It is only
+        // transparent for calls — `return a && b`, `yield(a && b)` and `super`
+        // also carry an `ArgumentsNode`, and none of those are `send_type?`.
+        if self.ancestors[idx].as_arguments_node().is_some() {
+            if idx == 0 {
+                return false;
+            }
+            idx -= 1;
+            return self.ancestors[idx].as_call_node().is_some();
+        }
+        let parent = &self.ancestors[idx];
+        parent.as_call_node().is_some()
+            || parent.as_and_node().is_some()
+            || parent.as_or_node().is_some()
+    }
+
+    /// Whether an `on_send` callback can actually walk up to this operator node.
+    /// The walk-up only traverses send and binary-operator parents, so an
+    /// operand that is a literal, a variable read or a parenthesized expression
+    /// (Parser's `begin`) never reaches the operator.
+    fn reaches_send(node: &ruby_prism::Node<'pr>) -> bool {
+        if node.as_call_node().is_some() {
+            return true;
+        }
+        if let Some(and) = node.as_and_node() {
+            return Self::reaches_send(&and.left()) || Self::reaches_send(&and.right());
+        }
+        if let Some(or) = node.as_or_node() {
+            return Self::reaches_send(&or.left()) || Self::reaches_send(&or.right());
+        }
+        false
+    }
+
+    /// RuboCop's `require_backslash?`:
+    /// `processed_source.lines[node.loc.operator.line - 1].end_with?('\\')`.
+    fn operator_line_ends_with_backslash(&self, operator_loc: &ruby_prism::Location<'pr>) -> bool {
+        let (op_line, _) = self.source.offset_to_line_col(operator_loc.start_offset());
+        let lines: Vec<&[u8]> = self.source.lines().collect();
+        if op_line == 0 || op_line > lines.len() {
+            return false;
+        }
+        trim_trailing_whitespace(lines[op_line - 1]).ends_with(b"\\")
+    }
+
+    /// Mirrors `on_send` for the case where the walk-up lands on an `and`/`or`
+    /// node: `offense?` returns `require_backslash?(node)` for
+    /// `operator_keyword?` nodes, short-circuiting on `multiline?` and
+    /// `suitable_as_single_line?` first.
+    fn check_binary_operator(
+        &mut self,
+        loc: &ruby_prism::Location<'pr>,
+        operator_loc: &ruby_prism::Location<'pr>,
+        left: &ruby_prism::Node<'pr>,
+        right: &ruby_prism::Node<'pr>,
+    ) {
+        if self.binary_operator_walks_up() {
+            return;
+        }
+        if !Self::reaches_send(left) && !Self::reaches_send(right) {
+            return;
+        }
+        let start_offset = loc.start_offset();
+        let end_offset = loc.end_offset();
+        if !self.is_multiline(start_offset, end_offset) {
+            return;
+        }
+        if !self.suitable_as_single_line(start_offset, end_offset) {
+            return;
+        }
+        if !self.operator_line_ends_with_backslash(operator_loc) {
+            return;
+        }
+        if self.part_of_reported_node(start_offset, end_offset) {
+            return;
+        }
+        self.register_offense(start_offset, end_offset);
+    }
+
     fn is_safe_navigation_call(node: &ruby_prism::CallNode<'_>) -> bool {
         node.call_operator_loc()
             .is_some_and(|loc| loc.as_slice() == b"&.")
@@ -1290,6 +1416,26 @@ impl<'pr> Visit<'pr> for RedundantLineBreakVisitor<'_, 'pr> {
         }
 
         ruby_prism::visit_call_node(self, node);
+    }
+
+    fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        self.check_binary_operator(
+            &node.location(),
+            &node.operator_loc(),
+            &node.left(),
+            &node.right(),
+        );
+        ruby_prism::visit_and_node(self, node);
+    }
+
+    fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        self.check_binary_operator(
+            &node.location(),
+            &node.operator_loc(),
+            &node.left(),
+            &node.right(),
+        );
+        ruby_prism::visit_or_node(self, node);
     }
 
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {

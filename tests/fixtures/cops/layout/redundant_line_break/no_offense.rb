@@ -546,3 +546,11 @@ params[:advanced_search] = {
     }
   ]
 }  
+
+# `offense?` returns `require_backslash?(node)` for `operator_keyword?` nodes:
+# a multiline `&&`/`||` whose operator line does NOT end with a backslash is
+# never reported, however short the joined line would be.
+def no_backslash?
+  to_idl_type.kind == :bits &&
+    @schema_hash.key?("const")
+end

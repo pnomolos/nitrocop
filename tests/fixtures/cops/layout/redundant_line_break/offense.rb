@@ -661,3 +661,59 @@ params[:advanced_search] = {
         @chkUseCurrent =
         ^ Layout/RedundantLineBreak: Redundant line break detected.
         @chkUseDisabled = nil
+
+# `on_send` walks up through parent `and`/`or` nodes (both include
+# `RuboCop::AST::BinaryOperatorNode`), and `offense?` then takes the
+# `operator_keyword?` branch: the offense is registered on the operator node
+# itself when its operator line ends with a backslash. The walk-up stops at the
+# array element, so the inner `&&` is what gets reported.
+unless [
+  node.type == LogicNodeType::Term,
+  (node.type == LogicNodeType::Not && \
+   ^ Layout/RedundantLineBreak: Redundant line break detected.
+    node.node_children.fetch(0).type == LogicNodeType::Term),
+  node.type == LogicNodeType::False
+].any?
+  raise 'unexpected node type'
+end
+
+# Backslash-continued `&&` as an `unless` condition: reported at the condition
+# expression, not at the keyword.
+def check_prominence
+  unless can?(:read, @outgoing_message) && \
+         ^ Layout/RedundantLineBreak: Redundant line break detected.
+         can?(:read, @outgoing_message.info_request)
+    render_hidden('request/_prominence')
+  end
+end
+
+# The `or` node is the receiver of a parenthesized call; the walk-up stops at
+# the enclosing `begin` (parentheses), so the `or` itself is the offense node.
+def run
+  (feature(:instance).downstream || \
+   ^ Layout/RedundantLineBreak: Redundant line break detected.
+   feature(:instance).upstream_install).setup_repositories(@version)
+end
+
+# The outer `&&` has a multiline parenthesized operand, which is a multiline
+# `begin` descendant and therefore not `safe_to_split?`. Only the inner `||`
+# chain inside the parentheses is reported.
+def max_val_known?
+  to_idl_type.kind == :bits && \
+    (@schema_hash.key?("const") || \
+     ^ Layout/RedundantLineBreak: Redundant line break detected.
+     @schema_hash.key?("maximum") || \
+     @schema_hash.key?("enum"))
+end
+
+# Both operands of the outer `||` are parenthesized, so no `on_send` walk-up
+# reaches it (Parser's `begin` stops the walk). Of the two inner `&&` nodes only
+# the first is reported: `require_backslash?` looks at the line holding the
+# operator, and the second `&&` sits on a line that ends with `) )`.
+def paren_operands
+  ( ( widget.kind_of?(TkObject) \
+      ^ Layout/RedundantLineBreak: Redundant line break detected.
+      && widget.respond_to?('exist?') ) \
+  || ( receiver.kind_of?(TkObject) \
+      && receiver.respond_to?('exist?') ) )
+end
