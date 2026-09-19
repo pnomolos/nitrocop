@@ -50,3 +50,21 @@ def reverse_charge_notice(chargeable)
       "Reverse Charge"
     end
 end
+
+# `postfix_conditional?` is `if_type? && modifier_form?`, so a modifier
+# `while` is a prefix keyword and still gets the doubled `IndentationWidth`.
+def modifier_while(a, b)
+  foo while a &&
+    b
+    ^ Layout/MultilineOperationIndentation: Use 4 (not 2) spaces for indenting a condition in a `while` statement spanning multiple lines.
+end
+
+# `not_for_this_cop?` is an AST check, so a parenthesis in a comment or in a
+# string literal no longer suppresses the whole file.
+# docs (
+def paren_noise(a, b)
+  warn "a ( b"
+  a ||
+  b
+  ^ Layout/MultilineOperationIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
+end

@@ -138,3 +138,47 @@ private_class_method def self.build_profiler_transport(settings, agent_settings)
       site: settings.site,
     )
 end
+
+# Tab-indented continuation measured from the tab: 1 (tab) + 2.
+def tab_indented
+	value ||
+	  other
+end
+
+# `kw_node_with_special_indentation` skips ternaries, so this is an ordinary
+# expression continuation rather than an aligned condition.
+def ternary_is_not_a_keyword_expression(cond, a, b, c)
+  cond ? a +
+    b : c
+end
+
+# `kwbegin` is in `UNALIGNED_RHS_TYPES`, so the outer assignment does not reach
+# the operands and ordinary continuation indentation applies.
+def kwbegin_breaks_the_assignment_walk(a, b)
+  x = begin
+    a ||
+      b
+  end
+end
+
+# A static regexp on the left of `=~` is a `match_with_lvasgn` node in the
+# parser gem, never a `send`, so this cop never sees it.
+def static_regexp_match(atomname)
+  if /\A[CHONSP]/ =~
+      atomname
+    1
+  end
+end
+
+# A block-pass argument stays in `SendNode#arguments`, so the operation is an
+# argument of `map` and aligns with the argument start.
+def block_pass_is_an_argument(inputs, graph)
+  inputs.map &curry(:map_array, graph) >>
+              curry(:map_node, graph)
+end
+
+# Interpolation is a grouped expression (`begin` node with a `begin` location).
+def interpolation_is_grouped(a, b)
+  "#{a ||
+     b}"
+end

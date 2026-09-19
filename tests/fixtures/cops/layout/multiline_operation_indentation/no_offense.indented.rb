@@ -12,3 +12,20 @@ def purchase_with_sales_tax_info_as_chargeable
     successful_purchases.find { _1.purchase_sales_tax_info&.business_vat_id.present? } ||
     purchase_with_tax_as_chargeable
 end
+
+# A modifier `if` *is* a postfix conditional, so the width is not doubled.
+def modifier_if(a, b)
+  foo if a &&
+    b
+end
+
+# Grouped expressions and interpolation are still excluded.
+def grouped(a, b, c)
+  (a ||
+   b) && c
+end
+
+def interpolation(a, b)
+  "#{a ||
+     b}"
+end

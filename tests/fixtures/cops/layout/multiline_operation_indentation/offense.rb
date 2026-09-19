@@ -101,3 +101,49 @@ def initialize_client
   end
 end
 # option docs )
+
+# `indentation` is `source_line =~ /\S/`, so a leading tab counts as one
+# column: the expected indentation here is 1 (tab) + 2.
+def tab_indented
+	value ||
+	other
+	^ Layout/MultilineOperationIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
+end
+
+# `keyword_message_tail` uses `loc.keyword.source`, so an `elsif` names itself
+# (and takes the `a` article, since only `i`/`u` keywords take `an`).
+def elsif_condition(a, b)
+  if a
+    1
+  elsif a &&
+  b
+  ^ Layout/MultilineOperationIndentation: Align the operands of a condition in a `elsif` statement spanning multiple lines.
+    2
+  end
+end
+
+# `numblock` is a distinct parser type that `disqualified_rhs?`'s
+# `block_type?` test does not match, so the outer assignment is still found.
+def numbered_block_parameter(list)
+  x = list.map { _1 +
+                   2 }
+                   ^ Layout/MultilineOperationIndentation: Align the operands of an expression in an assignment spanning multiple lines.
+end
+
+# `begin ... end while cond` is `while_post`, which is in neither
+# `KEYWORD_ANCESTOR_TYPES` nor `UNALIGNED_RHS_TYPES` — so this reports as a
+# plain expression, not as a condition in a `while` statement.
+def post_condition_loop(a, b)
+  begin
+    a
+  end while a ||
+  b
+  ^ Layout/MultilineOperationIndentation: Use 2 (not 0) spaces for indenting an expression spanning multiple lines.
+end
+
+# `used_indentation` is `rhs.column - indentation(lhs)` and may be negative.
+def negative_used_indentation(a, b)
+      a ||
+  b
+  ^ Layout/MultilineOperationIndentation: Use 2 (not -4) spaces for indenting an expression spanning multiple lines.
+end
