@@ -72,7 +72,7 @@ impl CodeGenerator {
     /// Scan the pattern tree for captures to determine function signature.
     fn count_captures(node: &PatternNode) -> usize {
         match node {
-            PatternNode::Capture(inner) => 1 + Self::count_captures(inner),
+            PatternNode::Capture { inner, .. } => 1 + Self::count_captures(inner),
             PatternNode::NodeMatch { children, .. } => {
                 children.iter().map(|c| Self::count_captures(c)).sum()
             }
@@ -224,7 +224,7 @@ impl CodeGenerator {
                     self.helper_stubs.push(fn_name.to_string());
                 }
             }
-            PatternNode::Capture(inner) => {
+            PatternNode::Capture { inner, .. } => {
                 let cap_idx = self.capture_count;
                 self.capture_count += 1;
                 let cap_var = format!("capture_{cap_idx}");
@@ -466,7 +466,7 @@ impl CodeGenerator {
                     self.generate_alternatives(alts, child_var);
                 }
             }
-            PatternNode::Capture(inner) => {
+            PatternNode::Capture { inner, .. } => {
                 let cap_idx = self.capture_count;
                 self.capture_count += 1;
                 self.writeln(&format!("let capture_{cap_idx} = {parent_var}.{accessor};"));
@@ -1230,7 +1230,10 @@ mod tests {
             node_type: "send".to_string(),
             children: vec![
                 PatternNode::Wildcard,
-                PatternNode::Capture(Box::new(PatternNode::SymbolLiteral("foo".to_string()))),
+                PatternNode::Capture {
+                    slot: 0,
+                    inner: Box::new(PatternNode::SymbolLiteral("foo".to_string())),
+                },
                 PatternNode::Rest,
             ],
         };
@@ -1251,8 +1254,14 @@ mod tests {
         let ast = PatternNode::NodeMatch {
             node_type: "send".to_string(),
             children: vec![
-                PatternNode::Capture(Box::new(PatternNode::Wildcard)),
-                PatternNode::Capture(Box::new(PatternNode::SymbolLiteral("x".to_string()))),
+                PatternNode::Capture {
+                    slot: 0,
+                    inner: Box::new(PatternNode::Wildcard),
+                },
+                PatternNode::Capture {
+                    slot: 1,
+                    inner: Box::new(PatternNode::SymbolLiteral("x".to_string())),
+                },
             ],
         };
         assert_eq!(CodeGenerator::count_captures(&ast), 2);

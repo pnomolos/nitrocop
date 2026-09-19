@@ -4,17 +4,35 @@
 //! pattern matches the node. This is used by the verifier to detect drift
 //! between RuboCop's NodePattern definitions and our hand-written Rust cops.
 //!
-//! ## Supported patterns (Phase 1)
+//! ## Supported patterns
 //!
 //! NodeMatch, Wildcard, Rest, NilPredicate, SymbolLiteral, IntLiteral,
 //! StringLiteral, TrueLiteral, FalseLiteral, NilLiteral, Alternatives,
-//! Conjunction, Negation, Capture (transparent), TypePredicate, Ident.
+//! Conjunction, Negation, Capture, TypePredicate, Ident.
+//!
+//! ## Captures
+//!
+//! `$` captures are real: the parser numbers them in source order and the
+//! matcher binds each slot in a [`MatchEnv`], which journals writes so a
+//! capture made inside a rejected union branch or `...` split is unwound (see
+//! `captures.rs`). [`match_with_captures`] returns the bound values;
+//! [`interpret_pattern`] keeps the boolean-only entry point.
+//!
+//! Known divergences from RuboCop's compiler, in addition to the stubs below:
+//!
+//! - `(int $_)` / `(float $_)` bind the literal node, not the numeric value.
+//! - `{a b | c}` does not build a subsequence for the multi-term group, so each
+//!   term is treated as its own branch (`builder.rb:57-68`).
+//! - A pattern list without `...` still tolerates extra trailing children,
+//!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
 //! ## Deferred
 //!
 //! HelperCall (#method) and ParamRef (%1) always return true (optimistic).
-//! ParentRef (^) and DescendRef (`) always return true.
+//! ParentRef (^) and DescendRef (`) always return true. Captures nested under
+//! those stubs are bound optimistically too.
 
+use super::captures::{CaptureValue, Captures, MatchEnv, dup_node};
 use super::lexer::Lexer;
 use super::parser::{Parser, PatternNode};
 
@@ -32,18 +50,78 @@ pub enum MatchChild<'pr> {
     Name(&'pr [u8]),
 }
 
+/// A parsed NodePattern plus the number of capture slots it allocates.
+#[derive(Debug, Clone)]
+pub struct CompiledPattern {
+    ast: PatternNode,
+    capture_count: usize,
+}
+
+impl CompiledPattern {
+    /// Lex and parse `pattern_str`, returning `None` on a parse error or an
+    /// invalid pattern (e.g. `{}` branches with different capture counts).
+    #[must_use]
+    pub fn compile(pattern_str: &str) -> Option<Self> {
+        let mut lexer = Lexer::new(pattern_str);
+        let mut parser = Parser::new(lexer.tokenize());
+        let ast = parser.parse()?;
+        Some(Self {
+            ast,
+            capture_count: parser.capture_count(),
+        })
+    }
+
+    /// Number of `$` capture slots in this pattern.
+    #[must_use]
+    pub fn capture_count(&self) -> usize {
+        self.capture_count
+    }
+
+    /// The parsed pattern AST.
+    #[must_use]
+    pub fn ast(&self) -> &PatternNode {
+        &self.ast
+    }
+
+    /// Whether the pattern matches `node`, discarding captures.
+    #[must_use]
+    pub fn matches(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let mut env = MatchEnv::new(self.capture_count);
+        matches_node(&self.ast, node, &mut env)
+    }
+
+    /// Match `node`, returning the bound captures on success.
+    ///
+    /// The returned [`Captures`] always has [`CompiledPattern::capture_count`]
+    /// slots; a slot can still be unbound if its capture sits under a stubbed
+    /// term (`#pred`, `%param`, `^`, `` ` ``).
+    #[must_use]
+    pub fn match_captures<'pr>(&self, node: &ruby_prism::Node<'pr>) -> Option<Captures<'pr>> {
+        let mut env = MatchEnv::new(self.capture_count);
+        if matches_node(&self.ast, node, &mut env) {
+            Some(env.into_captures())
+        } else {
+            None
+        }
+    }
+}
+
 /// Evaluate a NodePattern string against a Prism AST node.
 ///
 /// Returns `true` if the pattern matches the node, `false` otherwise.
 /// Returns `false` on parse error.
 pub fn interpret_pattern(pattern_str: &str, node: &ruby_prism::Node<'_>) -> bool {
-    let mut lexer = Lexer::new(pattern_str);
-    let tokens = lexer.tokenize();
-    let mut parser = Parser::new(tokens);
-    let Some(ast) = parser.parse() else {
-        return false;
-    };
-    matches_node(&ast, node)
+    CompiledPattern::compile(pattern_str).is_some_and(|pattern| pattern.matches(node))
+}
+
+/// Evaluate a NodePattern string and return the values bound by its `$`
+/// captures, or `None` if the pattern does not parse or does not match.
+#[must_use]
+pub fn match_with_captures<'pr>(
+    pattern_str: &str,
+    node: &ruby_prism::Node<'pr>,
+) -> Option<Captures<'pr>> {
+    CompiledPattern::compile(pattern_str)?.match_captures(node)
 }
 
 /// Get the NodePattern type name for a Prism node.
@@ -438,16 +516,33 @@ fn get_children<'pr>(
 }
 
 /// Match a PatternNode against a MatchChild (dispatcher).
-fn matches_child(pattern: &PatternNode, child: &MatchChild<'_>) -> bool {
+fn matches_child<'pr>(
+    pattern: &PatternNode,
+    child: &MatchChild<'pr>,
+    env: &mut MatchEnv<'pr>,
+) -> bool {
     match child {
-        MatchChild::Node(node) => matches_node(pattern, node),
-        MatchChild::Absent => matches_absent(pattern),
-        MatchChild::Name(bytes) => matches_name(pattern, bytes),
+        MatchChild::Node(node) => matches_node(pattern, node, env),
+        MatchChild::Absent => matches_absent(pattern, env),
+        MatchChild::Name(bytes) => matches_name(pattern, bytes, bytes, env),
+    }
+}
+
+/// The value a `$` binds for a given child, used when `$...` captures a run.
+fn capture_value_for<'pr>(child: &MatchChild<'pr>) -> CaptureValue<'pr> {
+    match child {
+        MatchChild::Node(node) => CaptureValue::Node(dup_node(node)),
+        MatchChild::Absent => CaptureValue::Absent,
+        MatchChild::Name(bytes) => CaptureValue::Name(bytes),
     }
 }
 
 /// Match a pattern against a Prism AST node.
-fn matches_node(pattern: &PatternNode, node: &ruby_prism::Node<'_>) -> bool {
+fn matches_node<'pr>(
+    pattern: &PatternNode,
+    node: &ruby_prism::Node<'pr>,
+    env: &mut MatchEnv<'pr>,
+) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
         PatternNode::NilPredicate => false, // Node is present, not absent
@@ -500,16 +595,45 @@ fn matches_node(pattern: &PatternNode, node: &ruby_prism::Node<'_>) -> bool {
                 return false;
             }
 
+            let mark = env.mark();
+
             // Value-only nodes: (int 42), (str "foo"), (sym :bar)
             if !pattern_children.is_empty() {
                 match node_type.as_str() {
-                    "int" | "str" => {
-                        return matches_node(&pattern_children[0], node);
+                    "int" => {
+                        if matches_node(&pattern_children[0], node, env) {
+                            return true;
+                        }
+                        env.rollback(mark);
+                        return false;
+                    }
+                    "str" => {
+                        if let Some(str_node) = node.as_string_node() {
+                            // Compare against the unescaped value but capture a
+                            // `'pr`-lived slice of the source.
+                            let captured = str_node.content_loc().as_slice();
+                            if matches_name(
+                                &pattern_children[0],
+                                str_node.unescaped(),
+                                captured,
+                                env,
+                            ) {
+                                return true;
+                            }
+                        }
+                        env.rollback(mark);
+                        return false;
                     }
                     "sym" => {
                         if let Some(sym) = node.as_symbol_node() {
-                            return matches_name(&pattern_children[0], sym.unescaped());
+                            let captured = sym
+                                .value_loc()
+                                .map_or_else(|| sym.location().as_slice(), |loc| loc.as_slice());
+                            if matches_name(&pattern_children[0], sym.unescaped(), captured, env) {
+                                return true;
+                            }
                         }
+                        env.rollback(mark);
                         return false;
                     }
                     _ => {}
@@ -525,13 +649,48 @@ fn matches_node(pattern: &PatternNode, node: &ruby_prism::Node<'_>) -> bool {
                 return pattern_children.is_empty();
             };
 
-            matches_children_list(pattern_children, &actual_children)
+            if matches_children_list(pattern_children, &actual_children, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
         }
 
-        PatternNode::Alternatives(alts) => alts.iter().any(|alt| matches_node(alt, node)),
-        PatternNode::Conjunction(items) => items.iter().all(|item| matches_node(item, node)),
-        PatternNode::Negation(inner) => !matches_node(inner, node),
-        PatternNode::Capture(inner) => matches_node(inner, node),
+        PatternNode::Alternatives(alts) => {
+            for alt in alts {
+                let mark = env.mark();
+                if matches_node(alt, node, env) {
+                    return true;
+                }
+                env.rollback(mark);
+            }
+            false
+        }
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items.iter().all(|item| matches_node(item, node, env)) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            // Captures under a negation never survive: the term only succeeds
+            // when the inner pattern failed.
+            let mark = env.mark();
+            let inner_matched = matches_node(inner, node, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Node(dup_node(node)));
+            if matches_node(inner, node, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
 
         PatternNode::HelperCall(_) => true,
         PatternNode::ParamRef(_) => true,
@@ -553,14 +712,43 @@ fn matches_node(pattern: &PatternNode, node: &ruby_prism::Node<'_>) -> bool {
 }
 
 /// Match a pattern against an absent child (`nil?` predicate target).
-fn matches_absent(pattern: &PatternNode) -> bool {
+fn matches_absent<'pr>(pattern: &PatternNode, env: &mut MatchEnv<'pr>) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
         PatternNode::NilPredicate => true,
-        PatternNode::Alternatives(alts) => alts.iter().any(matches_absent),
-        PatternNode::Conjunction(items) => items.iter().all(matches_absent),
-        PatternNode::Negation(inner) => !matches_absent(inner),
-        PatternNode::Capture(inner) => matches_absent(inner),
+        PatternNode::Alternatives(alts) => {
+            for alt in alts {
+                let mark = env.mark();
+                if matches_absent(alt, env) {
+                    return true;
+                }
+                env.rollback(mark);
+            }
+            false
+        }
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items.iter().all(|item| matches_absent(item, env)) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_absent(inner, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Absent);
+            if matches_absent(inner, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
         PatternNode::HelperCall(_) => true,
         PatternNode::ParamRef(_) => true,
         PatternNode::ParentRef(_) => true,
@@ -571,14 +759,57 @@ fn matches_absent(pattern: &PatternNode) -> bool {
 }
 
 /// Match a pattern against a name/value byte slice (method name, variable name).
-fn matches_name(pattern: &PatternNode, bytes: &[u8]) -> bool {
+///
+/// `bytes` is what the pattern is compared against; `captured` is the
+/// `'pr`-lived slice a `$` binds. They differ only for literal nodes whose
+/// decoded value is borrowed from a temporary node handle (`(str $_)`,
+/// `(sym $_)`), where the capture uses the corresponding source slice.
+fn matches_name<'pr>(
+    pattern: &PatternNode,
+    bytes: &[u8],
+    captured: &'pr [u8],
+    env: &mut MatchEnv<'pr>,
+) -> bool {
     match pattern {
         PatternNode::Wildcard => true,
         PatternNode::SymbolLiteral(name) => bytes == name.as_bytes(),
-        PatternNode::Alternatives(alts) => alts.iter().any(|alt| matches_name(alt, bytes)),
-        PatternNode::Conjunction(items) => items.iter().all(|item| matches_name(item, bytes)),
-        PatternNode::Negation(inner) => !matches_name(inner, bytes),
-        PatternNode::Capture(inner) => matches_name(inner, bytes),
+        PatternNode::StringLiteral(s) => bytes == s.as_bytes(),
+        PatternNode::Alternatives(alts) => {
+            for alt in alts {
+                let mark = env.mark();
+                if matches_name(alt, bytes, captured, env) {
+                    return true;
+                }
+                env.rollback(mark);
+            }
+            false
+        }
+        PatternNode::Conjunction(items) => {
+            let mark = env.mark();
+            if items
+                .iter()
+                .all(|item| matches_name(item, bytes, captured, env))
+            {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
+        PatternNode::Negation(inner) => {
+            let mark = env.mark();
+            let inner_matched = matches_name(inner, bytes, captured, env);
+            env.rollback(mark);
+            !inner_matched
+        }
+        PatternNode::Capture { slot, inner } => {
+            let mark = env.mark();
+            env.set(*slot, CaptureValue::Name(captured));
+            if matches_name(inner, bytes, captured, env) {
+                return true;
+            }
+            env.rollback(mark);
+            false
+        }
         PatternNode::HelperCall(_) => true,
         PatternNode::ParamRef(_) => true,
         PatternNode::ParentRef(_) => true,
@@ -588,38 +819,71 @@ fn matches_name(pattern: &PatternNode, bytes: &[u8]) -> bool {
     }
 }
 
+/// `Some(capture_slot)` if `pattern` is a variable-length rest term — `...` or
+/// `$...` — where the inner `Option` holds the slot of a captured rest.
+fn as_rest_term(pattern: &PatternNode) -> Option<Option<usize>> {
+    match pattern {
+        PatternNode::Rest => Some(None),
+        PatternNode::Capture { slot, inner } if matches!(**inner, PatternNode::Rest) => {
+            Some(Some(*slot))
+        }
+        _ => None,
+    }
+}
+
 /// Match a list of pattern children against a list of actual children.
 ///
-/// Walks patterns and actuals in parallel. `Rest` consumes all remaining.
-/// Without `Rest`, extra actuals after all patterns are consumed are tolerated
-/// (permissive for Phase 1).
-fn matches_children_list(patterns: &[PatternNode], actuals: &[MatchChild<'_>]) -> bool {
-    let mut pi = 0; // pattern index
-    let mut ai = 0; // actual index
+/// A rest term (`...`, `$...`) matches a variable-length run, so the walk
+/// backtracks over every split point and rewinds the captures written by a
+/// rejected split. With a rest term present the arity is exact — the rest
+/// absorbs the slack, as in RuboCop's sequence compiler. Without one, extra
+/// trailing children are still tolerated (pre-existing permissive behaviour).
+fn matches_children_list<'pr>(
+    patterns: &[PatternNode],
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr>,
+) -> bool {
+    let exact = patterns.iter().any(|p| as_rest_term(p).is_some());
+    match_sequence(patterns, actuals, env, exact)
+}
 
-    while pi < patterns.len() {
-        let pattern = &patterns[pi];
+fn match_sequence<'pr>(
+    patterns: &[PatternNode],
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr>,
+    exact: bool,
+) -> bool {
+    let Some((pattern, rest_patterns)) = patterns.split_first() else {
+        return !exact || actuals.is_empty();
+    };
 
-        if matches!(pattern, PatternNode::Rest) {
-            // Rest consumes all remaining actuals — match succeeds
-            return true;
+    if let Some(capture_slot) = as_rest_term(pattern) {
+        for take in 0..=actuals.len() {
+            let mark = env.mark();
+            if let Some(slot) = capture_slot {
+                let run = actuals[..take].iter().map(capture_value_for).collect();
+                env.set(slot, CaptureValue::List(run));
+            }
+            if match_sequence(rest_patterns, &actuals[take..], env, exact) {
+                return true;
+            }
+            env.rollback(mark);
         }
-
-        if ai >= actuals.len() {
-            // No more actuals but still have patterns — fail
-            return false;
-        }
-
-        if !matches_child(pattern, &actuals[ai]) {
-            return false;
-        }
-
-        pi += 1;
-        ai += 1;
+        return false;
     }
 
-    // All patterns consumed. Extra actuals are tolerated (permissive).
-    true
+    let Some((actual, rest_actuals)) = actuals.split_first() else {
+        return false;
+    };
+
+    let mark = env.mark();
+    if matches_child(pattern, actual, env)
+        && match_sequence(rest_patterns, rest_actuals, env, exact)
+    {
+        return true;
+    }
+    env.rollback(mark);
+    false
 }
 
 #[cfg(test)]
