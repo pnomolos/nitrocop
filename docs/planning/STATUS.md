@@ -25,7 +25,7 @@ Planning branch, not for upstream. Read this first when resuming.
 | W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Lint/UselessAssignment in progress (branch fix/lint-useless-assignment). After these, W2 pauses until #2/#6 merge and the oracle re-runs on main. Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
-| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); user-cop discovery in progress (branch ir/user-cop-discovery) | in progress |
+| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); #21 discovery open | in progress |
 | W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15 open; synth (ir_synth.py) + verify (ir_verify.py) after IrCop lands | in progress |
 
 ## Open PRs
@@ -40,6 +40,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - #12 ir: Expr compiler + evaluator (base #9, includes merge of np/predicate-resolution)
 - #14 ir: IrCopRunner + registry + `ir_cop_fixture_tests!` (base #12, includes merge of np/repetition); ~13 µs/file upper-bound overhead
 - #16 ir: first translated cop Style/TimeNow (base #14); engine fix: exact child arity for every sequence
+- #21 ir: user-cop discovery `.nitrocop/cops/**/*.cop.yml` + `AllCops.CustomCopPaths`, `(custom)` classification, fail-closed, cache key (base #16)
+- #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16); 2/2 in progress
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #20 fix: Layout/MultilineOperationIndentation (base main) — line-by-line port; 97-repo sample 19/39 → 0/0 (aligned), 49/173 → 0/0 (indented), zero message mismatches
@@ -55,6 +57,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - Local runs must be wrapped in `mise exec --` or `bundle info --path` plugin lookups fail silently and create phantom divergence.
 
 ## Owner decisions needed
+- **Custom cop config location (PR #21 finding):** RuboCop 1.84 exits 2 on any unknown cop section (`Custom/Foo: {Enabled: true}`) in `.rubocop.yml`, but only warns on unknown `AllCops` params. Teams running both tools can carry `AllCops.CustomCopPaths` but cannot configure custom cops there. Options: (a) accept the limitation (documented in docs/CUSTOM_COPS.md), (b) add a nitrocop-only overlay file (`.nitrocop.yml`, contrary to upstream PLAN.md's initial stance), (c) per-cop config inside the `.cop.yml` document itself. Recommendation: (b) as a thin overlay merged after `.rubocop.yml`.
+- **`Severity:` from `.rubocop.yml` is ignored by every hand-written cop** (parsed, never read). Wired for IR cops only in #21. A repo-wide fix moves corpus numbers and needs its own PR + oracle gate.
 - **Config-relative Include/Exclude (PR #8 cluster 4, 110 FN + 2 FP):** RuboCop absolutizes cop-level Include/Exclude against the config file's directory; the oracle passes a temp-dir config so RuboCop never runs include-gated cops there. Options: (a) match RuboCop in `CopFilterSet` (see docs/investigations/investigation-target-dir-relativization.md), or (b) teach the oracle's include-gated pass to re-derive Lint/RedundantCopDisableDirective. Do NOT ignore include-gated cops when marking directives used.
 - **ProjectIndexHelp** (5 new cops need a cross-file symbol index): build the index infra, or leave those 5 unimplemented.
 
