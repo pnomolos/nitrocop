@@ -343,12 +343,6 @@ enum MsgStyle {
     ReceiverRelative,
 }
 
-#[derive(Clone, Copy)]
-struct AlignedExpectationOptions {
-    allow_previous_continuation: bool,
-    allow_block_chain_alignment: bool,
-}
-
 struct ChainVisitor<'a> {
     cop: &'a MultilineMethodCallIndentation,
     source: &'a SourceFile,
@@ -518,20 +512,9 @@ impl ChainVisitor<'_> {
         rhs_col: usize,
         is_trailing_dot: bool,
     ) -> Option<usize> {
-        self.expected_aligned_impl(
-            call_node,
-            receiver,
-            rhs_line,
-            rhs_col,
-            is_trailing_dot,
-            AlignedExpectationOptions {
-                allow_previous_continuation: true,
-                allow_block_chain_alignment: true,
-            },
-        )
+        self.expected_aligned_impl(call_node, receiver, rhs_line, rhs_col, is_trailing_dot)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn expected_aligned_impl(
         &self,
         call_node: &ruby_prism::CallNode<'_>,
@@ -539,7 +522,6 @@ impl ChainVisitor<'_> {
         rhs_line: usize,
         rhs_col: usize,
         is_trailing_dot: bool,
-        options: AlignedExpectationOptions,
     ) -> Option<usize> {
         if self.in_hash_value {
             return self.expected_aligned_hash_pair(call_node, receiver, rhs_col, is_trailing_dot);
@@ -567,7 +549,7 @@ impl ChainVisitor<'_> {
 
         // Try block chain continuation — when receiver is a call with a
         // single-line block, align with the block-bearing call's dot.
-        if options.allow_block_chain_alignment && !is_trailing_dot {
+        if !is_trailing_dot {
             if let Some(col) = find_block_chain_alignment(self.source, call_node, rhs_line) {
                 return Some(col);
             }
@@ -612,61 +594,11 @@ impl ChainVisitor<'_> {
             return Some(col);
         }
 
-        if options.allow_previous_continuation && !is_trailing_dot {
-            // Try previous continuation dot alignment — when there's a
-            // continuation dot on a previous line in the chain, align with it.
-            if let Some(anchor) =
-                find_previous_continuation_dot_anchor(self.source, receiver, rhs_line)
-            {
-                let anchor_receiver_is_post_multiline_block_call =
-                    call_receiver_is_post_multiline_block_call(self.source, &anchor);
-                let can_use_anchor = anchor_receiver_is_post_multiline_block_call
-                    || !uses_outer_aligned_fallback_base(call_node, &self.ancestors);
-                if can_use_anchor
-                    && (anchor_receiver_is_post_multiline_block_call
-                        || self.previous_continuation_anchor_is_valid(&anchor))
-                {
-                    if let Some(dot_loc) = anchor.call_operator_loc() {
-                        let (_, dot_col) = self.source.offset_to_line_col(dot_loc.start_offset());
-                        return Some(dot_col);
-                    }
-                }
-            }
-        }
-
         if is_trailing_dot {
             return None;
         }
 
         None
-    }
-
-    fn previous_continuation_anchor_is_valid(&self, call_node: &ruby_prism::CallNode<'_>) -> bool {
-        let receiver = match call_node.receiver() {
-            Some(receiver) => receiver,
-            None => return false,
-        };
-        let dot_loc = match call_node.call_operator_loc() {
-            Some(dot_loc) => dot_loc,
-            None => return false,
-        };
-        let (rhs_line, rhs_col) = self.source.offset_to_line_col(dot_loc.start_offset());
-        let expected = match self.expected_aligned_impl(
-            call_node,
-            &receiver,
-            rhs_line,
-            rhs_col,
-            false,
-            AlignedExpectationOptions {
-                allow_previous_continuation: false,
-                allow_block_chain_alignment: false,
-            },
-        ) {
-            Some(col) => col,
-            None => self.expected_indented(call_node, &receiver),
-        };
-
-        rhs_col == expected
     }
 
     fn expected_aligned_hash_pair(
@@ -731,6 +663,10 @@ impl ChainVisitor<'_> {
         }
     }
 
+    /// RuboCop's `no_base_message`:
+    /// `"Use E (not U) spaces for indenting <what> spanning multiple lines."`
+    /// where `U = rhs.column - indentation(lhs)`, `E = correct_indentation(node)`
+    /// and `<what>` comes from `operation_description`.
     fn indented_message(
         &self,
         call_node: &ruby_prism::CallNode<'_>,
@@ -740,10 +676,10 @@ impl ChainVisitor<'_> {
         let base_line = self.indented_base_line(call_node);
         let chain_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
         let chain_indent = line_indentation(chain_line_bytes);
-        let _ = call_node;
+        let expected = self.width + keyword_extra_indent(self.source, call_node, self.width);
+        let what = operation_description(call_node, &self.ancestors);
         format!(
-            "Use {} (not {}) spaces for indentation of a chained method call.",
-            self.width,
+            "Use {expected} (not {}) spaces for indenting {what} spanning multiple lines.",
             rhs_col.saturating_sub(chain_indent)
         )
     }
@@ -1099,21 +1035,6 @@ fn first_descendant_block_is_multiline(source: &SourceFile, node: &ruby_prism::N
     finder.found.unwrap_or(false)
 }
 
-fn call_receiver_is_post_multiline_block_call(
-    source: &SourceFile,
-    call: &ruby_prism::CallNode<'_>,
-) -> bool {
-    let Some(receiver) = call.receiver() else {
-        return false;
-    };
-
-    receiver_is_multiline_block_call(source, &receiver)
-        || receiver
-            .as_call_node()
-            .and_then(|receiver_call| receiver_call.receiver())
-            .is_some_and(|inner_receiver| receiver_is_multiline_block_call(source, &inner_receiver))
-}
-
 /// Check if a given line has a `.` or `&.` at a specific column.
 /// Used for text-based approximation of RuboCop's `get_dot_right_above`.
 fn has_dot_at_col(source: &SourceFile, line: usize, col: usize) -> bool {
@@ -1427,10 +1348,57 @@ fn is_unaligned_rhs_type(node: &ruby_prism::Node<'_>) -> bool {
         || node.as_array_node().is_some()
 }
 
+/// RuboCop's `operation_description`: the tail of `no_base_message`.
+fn operation_description(
+    call_node: &ruby_prism::CallNode<'_>,
+    ancestors: &[ruby_prism::Node<'_>],
+) -> String {
+    let current = call_node.as_node();
+    if let Some(keyword) = find_special_indentation_keyword(&current, ancestors) {
+        let kind = if keyword == "for" {
+            "collection"
+        } else {
+            "condition"
+        };
+        let article = if keyword.starts_with('i') || keyword.starts_with('u') {
+            "an"
+        } else {
+            "a"
+        };
+        return format!("{kind} in {article} `{keyword}` statement");
+    }
+
+    if find_assignment_rhs_base(&current, ancestors).is_some() {
+        return "an expression in an assignment".to_string();
+    }
+
+    "an expression".to_string()
+}
+
+/// The keyword of the `kw_node_with_special_indentation` ancestor, if any.
+fn find_special_indentation_keyword(
+    current: &ruby_prism::Node<'_>,
+    ancestors: &[ruby_prism::Node<'_>],
+) -> Option<String> {
+    let base = find_keyword_expression_ancestor(current, ancestors)?;
+    Some(base.1)
+}
+
 fn find_keyword_expression_base<'a>(
     current: &ruby_prism::Node<'a>,
     ancestors: &[ruby_prism::Node<'a>],
 ) -> Option<ruby_prism::Node<'a>> {
+    find_keyword_expression_ancestor(current, ancestors).map(|(expression, _)| expression)
+}
+
+/// RuboCop's `kw_node_with_special_indentation`: the innermost `for`/`if`/
+/// `while`/`until`/`return` ancestor whose `indented_keyword_expression`
+/// contains `current`, together with that node's keyword text. Ternaries are
+/// skipped.
+fn find_keyword_expression_ancestor<'a>(
+    current: &ruby_prism::Node<'a>,
+    ancestors: &[ruby_prism::Node<'a>],
+) -> Option<(ruby_prism::Node<'a>, String)> {
     for ancestor in ancestors.iter().rev().skip(1) {
         if let Some(node) = ancestor.as_if_node() {
             // `kw_node_with_special_indentation` skips ternaries outright.
@@ -1439,27 +1407,31 @@ fn find_keyword_expression_base<'a>(
             }
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                let keyword = node
+                    .if_keyword_loc()
+                    .and_then(|loc| String::from_utf8(loc.as_slice().to_vec()).ok())
+                    .unwrap_or_else(|| "if".to_string());
+                return Some((predicate, keyword));
             }
         } else if let Some(node) = ancestor.as_unless_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                return Some((predicate, "unless".to_string()));
             }
         } else if let Some(node) = ancestor.as_while_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                return Some((predicate, "while".to_string()));
             }
         } else if let Some(node) = ancestor.as_until_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some(predicate);
+                return Some((predicate, "until".to_string()));
             }
         } else if let Some(node) = ancestor.as_for_node() {
             let collection = node.collection();
             if node_within_node(current, &collection) {
-                return Some(collection);
+                return Some((collection, "for".to_string()));
             }
         } else if let Some(node) = ancestor.as_return_node() {
             let Some(arguments) = node.arguments() else {
@@ -1469,7 +1441,7 @@ fn find_keyword_expression_base<'a>(
                 continue;
             };
             if node_within_node(current, &first_argument) {
-                return Some(first_argument);
+                return Some((first_argument, "return".to_string()));
             }
         }
     }
@@ -1574,42 +1546,6 @@ fn prev_line_ends_with_assignment(source: &SourceFile, receiver: &ruby_prism::No
     }
 }
 
-/// Find the earliest previous continuation-dot call in the receiver chain.
-/// A continuation dot is one that is the first non-whitespace on its line, or
-/// an inline post-block call like `end.compact` that RuboCop can use as the
-/// next chain anchor.
-fn find_previous_continuation_dot_anchor<'a>(
-    source: &SourceFile,
-    receiver: &ruby_prism::Node<'a>,
-    current_line: usize,
-) -> Option<ruby_prism::CallNode<'a>> {
-    if let Some(call) = receiver.as_call_node() {
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (dot_line, _dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            if dot_line < current_line
-                && (is_first_on_line(source, dot_loc.start_offset())
-                    || call_receiver_is_post_multiline_block_call(source, &call))
-            {
-                // Found a continuation dot on an earlier line.
-                // Check if there's an even earlier one to use as the alignment base.
-                if let Some(recv) = call.receiver() {
-                    if let Some(earlier) =
-                        find_previous_continuation_dot_anchor(source, &recv, dot_line)
-                    {
-                        return Some(earlier);
-                    }
-                }
-                return Some(call);
-            }
-            // Dot is inline or on same line; keep looking
-            if let Some(recv) = call.receiver() {
-                return find_previous_continuation_dot_anchor(source, &recv, current_line);
-            }
-        }
-    }
-    None
-}
-
 /// RuboCop's `left_hand_side(node.receiver)` climbs parent send nodes, not just
 /// the receiver chain. This matters for matcher chains nested inside
 /// non-parenthesized arguments such as:
@@ -1672,42 +1608,6 @@ fn left_hand_side_start_offset(
     }
 
     lhs_start
-}
-
-fn uses_outer_aligned_fallback_base(
-    call_node: &ruby_prism::CallNode<'_>,
-    ancestors: &[ruby_prism::Node<'_>],
-) -> bool {
-    if call_node.receiver().is_none() {
-        return false;
-    };
-
-    let current_loc = call_node.location();
-    let mut started = false;
-
-    for ancestor in ancestors.iter().rev() {
-        if !started {
-            if ancestor.as_call_node().is_some_and(|call| {
-                let loc = call.location();
-                loc.start_offset() == current_loc.start_offset()
-                    && loc.end_offset() == current_loc.end_offset()
-            }) {
-                started = true;
-            }
-            continue;
-        }
-
-        if ancestor.as_arguments_node().is_some() {
-            continue;
-        }
-
-        return ancestor.as_call_node().is_some_and(|call| {
-            call.call_operator_loc().is_some()
-                && !method_identifier_predicates::is_assignment_method(call.name().as_slice())
-        });
-    }
-
-    false
 }
 
 fn find_left_hand_side_description(
