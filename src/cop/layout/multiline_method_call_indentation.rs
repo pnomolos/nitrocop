@@ -474,7 +474,7 @@ impl ChainVisitor<'_> {
         let base_line = self.indented_base_line(call_node);
         let base_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
         let base_indent = line_indentation(base_line_bytes);
-        let kw_extra = keyword_extra_indent(self.source, call_node, self.width);
+        let kw_extra = keyword_extra_indent(call_node, &self.ancestors);
         base_indent + self.width + kw_extra
     }
 
@@ -676,7 +676,7 @@ impl ChainVisitor<'_> {
         let base_line = self.indented_base_line(call_node);
         let chain_line_bytes = self.source.lines().nth(base_line - 1).unwrap_or(b"");
         let chain_indent = line_indentation(chain_line_bytes);
-        let expected = self.width + keyword_extra_indent(self.source, call_node, self.width);
+        let expected = self.width + keyword_extra_indent(call_node, &self.ancestors);
         let what = operation_description(call_node, &self.ancestors);
         format!(
             "Use {expected} (not {}) spaces for indenting {what} spanning multiple lines.",
@@ -1365,7 +1365,7 @@ fn operation_description(
         } else {
             "a"
         };
-        return format!("{kind} in {article} `{keyword}` statement");
+        return format!("a {kind} in {article} `{keyword}` statement");
     }
 
     if find_assignment_rhs_base(&current, ancestors).is_some() {
@@ -1380,15 +1380,15 @@ fn find_special_indentation_keyword(
     current: &ruby_prism::Node<'_>,
     ancestors: &[ruby_prism::Node<'_>],
 ) -> Option<String> {
-    let base = find_keyword_expression_ancestor(current, ancestors)?;
-    Some(base.1)
+    let (_, keyword, _) = find_keyword_expression_ancestor(current, ancestors)?;
+    Some(keyword)
 }
 
 fn find_keyword_expression_base<'a>(
     current: &ruby_prism::Node<'a>,
     ancestors: &[ruby_prism::Node<'a>],
 ) -> Option<ruby_prism::Node<'a>> {
-    find_keyword_expression_ancestor(current, ancestors).map(|(expression, _)| expression)
+    find_keyword_expression_ancestor(current, ancestors).map(|(expression, _, _)| expression)
 }
 
 /// RuboCop's `kw_node_with_special_indentation`: the innermost `for`/`if`/
@@ -1398,7 +1398,7 @@ fn find_keyword_expression_base<'a>(
 fn find_keyword_expression_ancestor<'a>(
     current: &ruby_prism::Node<'a>,
     ancestors: &[ruby_prism::Node<'a>],
-) -> Option<(ruby_prism::Node<'a>, String)> {
+) -> Option<(ruby_prism::Node<'a>, String, bool)> {
     for ancestor in ancestors.iter().rev().skip(1) {
         if let Some(node) = ancestor.as_if_node() {
             // `kw_node_with_special_indentation` skips ternaries outright.
@@ -1411,27 +1411,29 @@ fn find_keyword_expression_ancestor<'a>(
                     .if_keyword_loc()
                     .and_then(|loc| String::from_utf8(loc.as_slice().to_vec()).ok())
                     .unwrap_or_else(|| "if".to_string());
-                return Some((predicate, keyword));
+                let postfix = crate::cop::shared::util::is_modifier_if(&node);
+                return Some((predicate, keyword, postfix));
             }
         } else if let Some(node) = ancestor.as_unless_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some((predicate, "unless".to_string()));
+                let postfix = crate::cop::shared::util::is_modifier_unless(&node);
+                return Some((predicate, "unless".to_string(), postfix));
             }
         } else if let Some(node) = ancestor.as_while_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some((predicate, "while".to_string()));
+                return Some((predicate, "while".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_until_node() {
             let predicate = node.predicate();
             if node_within_node(current, &predicate) {
-                return Some((predicate, "until".to_string()));
+                return Some((predicate, "until".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_for_node() {
             let collection = node.collection();
             if node_within_node(current, &collection) {
-                return Some((collection, "for".to_string()));
+                return Some((collection, "for".to_string(), false));
             }
         } else if let Some(node) = ancestor.as_return_node() {
             let Some(arguments) = node.arguments() else {
@@ -1441,7 +1443,7 @@ fn find_keyword_expression_ancestor<'a>(
                 continue;
             };
             if node_within_node(current, &first_argument) {
-                return Some((first_argument, "return".to_string()));
+                return Some((first_argument, "return".to_string(), false));
             }
         }
     }
@@ -1645,12 +1647,8 @@ impl<'pr> Visit<'pr> for ChainVisitor<'pr> {
 
         // RuboCop only skips actual parenthesized arg lists here. Prism also
         // reports `opening_loc` for `[]`/`[]=`, but square brackets do not
-        // suppress this cop.
-        let has_parens = if self.style == "aligned" {
-            call_has_parenthesized_args(node)
-        } else {
-            node.opening_loc().is_some()
-        };
+        // suppress this cop, in any `EnforcedStyle`.
+        let has_parens = call_has_parenthesized_args(node);
         if let Some(args) = node.arguments() {
             if has_parens {
                 let saved_paren = self.in_paren_args;
@@ -1887,71 +1885,29 @@ fn chain_root_array_end_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -
 }
 
 /// Check if the chain root is inside a keyword expression and return extra indent.
+/// `Layout/IndentationWidth`'s `Width`, which RuboCop's `correct_indentation`
+/// adds on top of this cop's own `IndentationWidth` for prefix keywords.
+const LAYOUT_INDENTATION_WIDTH: usize = 2;
+
+/// RuboCop's `correct_indentation`: this cop's `IndentationWidth` plus
+/// `Layout/IndentationWidth`'s own `Width` when the node sits in the condition
+/// (or collection) of a *prefix* keyword. Postfix conditionals ("next if foo &&
+/// \n  bar") get no such "special indentation".
 fn keyword_extra_indent(
-    source: &SourceFile,
     call_node: &ruby_prism::CallNode<'_>,
-    _width: usize,
+    ancestors: &[ruby_prism::Node<'_>],
 ) -> usize {
-    let receiver = match call_node.receiver() {
-        Some(r) => r,
-        None => return 0,
-    };
-    let Some(dot_loc) = call_node.call_operator_loc() else {
-        return 0;
-    };
-    if chain_starts_from_completed_keyword_receiver(source, &receiver, dot_loc.start_offset()) {
-        return 0;
-    }
-    let chain_start_line = find_chain_start_line(source, &receiver);
-    let chain_line_bytes = source.lines().nth(chain_start_line - 1).unwrap_or(b"");
-    let trimmed = chain_line_bytes
-        .iter()
-        .skip_while(|&&b| b == b' ' || b == b'\t');
-    let text: Vec<u8> = trimmed.copied().collect();
-    let keywords: &[&[u8]] = &[
-        b"return ", b"return(", b"if ", b"while ", b"until ", b"for ", b"unless ",
-    ];
-    for kw in keywords {
-        if text.starts_with(kw) {
-            return 2;
+    let current = call_node.as_node();
+    match find_keyword_expression_ancestor(&current, ancestors) {
+        Some((_, _, postfix)) => {
+            if postfix {
+                0
+            } else {
+                LAYOUT_INDENTATION_WIDTH
+            }
         }
+        None => 0,
     }
-    0
-}
-
-fn chain_starts_from_completed_keyword_receiver(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-    current_dot_offset: usize,
-) -> bool {
-    let Some(root_end_line) = completed_keyword_receiver_end_line(source, node) else {
-        return false;
-    };
-    let (dot_line, _) = source.offset_to_line_col(current_dot_offset);
-    dot_line > root_end_line
-}
-
-fn completed_keyword_receiver_end_line(
-    source: &SourceFile,
-    node: &ruby_prism::Node<'_>,
-) -> Option<usize> {
-    if let Some(call) = node.as_call_node() {
-        if let Some(recv) = call.receiver() {
-            return completed_keyword_receiver_end_line(source, &recv);
-        }
-    }
-
-    let is_keyword_receiver = node.as_if_node().is_some()
-        || node.as_unless_node().is_some()
-        || node.as_while_node().is_some()
-        || node.as_until_node().is_some()
-        || node.as_for_node().is_some();
-    if !is_keyword_receiver {
-        return None;
-    }
-
-    let (end_line, _) = source.offset_to_line_col(node.location().end_offset());
-    Some(end_line)
 }
 
 /// Find the start column of the chain root (deepest receiver).
