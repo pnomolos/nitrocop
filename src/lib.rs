@@ -188,7 +188,34 @@ fn run_corpus_check(
 }
 
 /// Run the linter. Returns the exit code: 0 = clean, 1 = offenses, 2 = strict failure, 3 = error.
+/// `--validate-ir`: load each cop IR document, report failures, and return the
+/// process exit code (2 if any document failed to load).
+fn validate_ir_paths(paths: &[PathBuf]) -> i32 {
+    let mut failed = 0usize;
+    for path in paths {
+        match cop::ir::load_path(path) {
+            Ok(cop) => println!("{}: ok ({})", path.display(), cop.name()),
+            Err(err) => {
+                eprintln!("{err}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("{failed} invalid cop IR definition(s)");
+        2
+    } else {
+        0
+    }
+}
+
 pub fn run(args: Args) -> Result<i32> {
+    // --validate-ir: schema-check IR cop definitions and exit. Independent of
+    // config, the registry and file discovery.
+    if !args.validate_ir.is_empty() {
+        return Ok(validate_ir_paths(&args.validate_ir));
+    }
+
     // Warn about unsupported --require flag
     if !args.require_libs.is_empty() {
         eprintln!("warning: --require is not supported; use `require:` in .rubocop.yml instead");
