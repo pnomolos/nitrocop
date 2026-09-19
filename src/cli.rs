@@ -181,6 +181,10 @@ pub struct Args {
     /// Batch corpus check: lint each subdirectory as a separate repo, output per-repo JSON
     #[arg(long, value_name = "DIR")]
     pub corpus_check: Option<PathBuf>,
+
+    /// Validate cop IR definitions (*.cop.yml) and exit (2 if any fail)
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub validate_ir: Vec<PathBuf>,
 }
 
 impl Args {
@@ -250,6 +254,7 @@ mod tests {
             verify: false,
             rubocop_cmd: "bundle exec rubocop".to_string(),
             corpus_check: None,
+            validate_ir: vec![],
         }
     }
 

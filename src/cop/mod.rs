@@ -2,6 +2,7 @@ pub mod autocorrect_allowlist;
 pub mod bundler;
 pub mod factory_bot;
 pub mod gemspec;
+pub mod ir;
 pub mod layout;
 pub mod lint;
 pub mod metrics;

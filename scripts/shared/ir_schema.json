@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/6/nitrocop/schemas/ir_schema.json",
+  "title": "nitrocop cop IR document (schema v1)",
+  "description": "Declarative cop definition, one per *.cop.yml file. Experimental. Mirrors src/cop/ir/schema.rs; tests/ir_fixtures.rs asserts the two stay in sync.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "cop", "hooks"],
+  "properties": {
+    "schema": { "const": 1, "description": "IR document major version." },
+    "cop": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]*/[A-Z][A-Za-z0-9]*$",
+      "description": "Cop name, Dept/Name. User cops may not use a built-in department."
+    },
+    "version_added": { "type": "string" },
+    "docs": { "type": "string" },
+    "severity": { "enum": ["convention", "warning", "error"], "default": "convention" },
+    "enabled_default": { "enum": [true, false, "pending"], "default": "pending" },
+    "tier": { "enum": ["preview", "stable"], "default": "preview" },
+    "autocorrect": { "enum": ["none", "safe", "unsafe"], "default": "none" },
+    "include": { "type": "array", "items": { "type": "string" } },
+    "exclude": { "type": "array", "items": { "type": "string" } },
+    "restrict_on_send": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Method-name prefilter for send/csend hooks (upstream RESTRICT_ON_SEND)."
+    },
+    "config": { "type": "object", "additionalProperties": { "$ref": "#/$defs/configDecl" } },
+    "constants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "integer" },
+            { "type": "boolean" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
+      }
+    },
+    "matchers": { "type": "object", "additionalProperties": { "$ref": "#/$defs/matcher" } },
+    "predicates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/predicate" } },
+    "hooks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/hook" } }
+  },
+  "$defs": {
+    "configType": {
+      "enum": ["enum", "string", "string_array", "int", "float", "bool", "string_map"]
+    },
+    "configDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": { "$ref": "#/$defs/configType" },
+        "values": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Required for, and only for, type: enum."
+        },
+        "default": {
+          "description": "Must match the declared type; for enum it must be a member of values."
+        }
+      }
+    },
+    "matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern"],
+      "properties": {
+        "pattern": { "type": "string", "description": "Verbatim upstream NodePattern source." },
+        "captures": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "description": "Names for the positional $ captures, in occurrence order."
+        },
+        "params": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Names for %name params; each must be a declared config key or constant table."
+        }
+      }
+    },
+    "predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expr"],
+      "properties": { "expr": { "$ref": "#/$defs/expr" } }
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["on", "match", "offense"],
+      "properties": {
+        "on": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Parser-gem node type names; numblock/itblock are virtual (design 1.2)."
+        },
+        "match": { "$ref": "#/$defs/matchSpec" },
+        "when": { "$ref": "#/$defs/expr" },
+        "bind": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/expr" },
+          "description": "Ordered name -> expr; later binds may reference earlier ones."
+        },
+        "offense": { "$ref": "#/$defs/offense" }
+      }
+    },
+    "matchSpec": {
+      "oneOf": [
+        { "type": "string", "description": "A declared matcher name." },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "maxProperties": 1,
+          "properties": {
+            "any_of": { "type": "array", "items": { "$ref": "#/$defs/matchSpec" } },
+            "all_of": { "type": "array", "items": { "$ref": "#/$defs/matchSpec" } }
+          }
+        }
+      ]
+    },
+    "offense": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location", "message"],
+      "properties": {
+        "location": { "$ref": "#/$defs/locationSpec" },
+        "message": {
+          "type": "string",
+          "description": "%{name} template over the hook's captures, binds and config keys; a literal percent is %%."
+        },
+        "severity": { "enum": ["convention", "warning", "error"] },
+        "correct": { "type": "array", "items": { "$ref": "#/$defs/correctionOp" } }
+      }
+    },
+    "locationSpec": {
+      "oneOf": [
+        { "$ref": "#/$defs/anchorPath" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "stop"],
+          "properties": {
+            "start": { "$ref": "#/$defs/anchorPath" },
+            "stop": { "$ref": "#/$defs/anchorPath" }
+          }
+        }
+      ]
+    },
+    "anchorPath": {
+      "type": "string",
+      "description": "<target>[.<accessor|part>]*[.start|.stop], target is node, parent or $capture.",
+      "pattern": "^(node|parent|\\$[A-Za-z_][A-Za-z0-9_]*)(\\.[a-z_]+)*$"
+    },
+    "correctionOp": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "range", "text"],
+          "properties": {
+            "op": { "const": "replace" },
+            "range": { "$ref": "#/$defs/locationSpec" },
+            "text": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "range"],
+          "properties": {
+            "op": { "const": "remove" },
+            "range": { "$ref": "#/$defs/locationSpec" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "at", "text"],
+          "properties": {
+            "op": { "enum": ["insert_before", "insert_after"] },
+            "at": { "$ref": "#/$defs/anchorPath" },
+            "text": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "expr": {
+      "description": "Design 2.1 surface syntax. A scalar is a literal or a path reference (node, parent, $capture, cfg.Key, bind.Name, consts.Table); a mapping is a single-key operator application; nesting of operator mappings is capped at 6.",
+      "oneOf": [
+        { "type": ["string", "integer", "number", "boolean", "null"] },
+        { "type": "array", "items": { "$ref": "#/$defs/expr" } },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "all", "any", "not",
+              "eq", "ne", "lt", "le", "gt", "ge", "in",
+              "if", "lit", "lookup", "attr",
+              "pred", "matches", "regex",
+              "any_of", "all_of", "none_of", "count"
+            ]
+          },
+          "additionalProperties": { "$ref": "#/$defs/expr" }
+        }
+      ]
+    }
+  }
+}

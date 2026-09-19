@@ -1,0 +1,12 @@
+schema: 1
+cop: "Style/TimeNow"
+matchers:
+  time_new:
+    pattern: |
+      (call (const {nil? cbase} :Time) :new)
+hooks:
+  - on: [send]
+    match: time_new
+    offense:
+      location: node.callee
+      message: "Prefer `Time.now`."
