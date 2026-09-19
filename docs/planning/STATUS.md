@@ -22,10 +22,10 @@ Planning branch, not for upstream. Read this first when resuming.
 |---|--------|-------|
 | W0 | Corpus oracle baseline on fork (run 35413735947, success). 99.99%, 1,047 FP / 716 FN, 6 diverging cops. See 06-oracle-baseline-2026-09-19.md | done |
 | W1 | Vendor bump to latest: PR #2 (bump only, config_audit red on 8 new options) + stacked PR implementing the 8 options (branch vendor/new-cop-options) | PRs open |
-| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8 open; Layout/HashAlignment separator variant in progress (branch fix/layout-hash-alignment-separator) |
+| W2 | Fix diverging cops: Lint/RedundantCopDisableDirective (740/203) in progress on branch fix/lint-redundant-cop-disable-directive; then Layout/MultilineMethodCallIndentation, Style/MethodCallWithArgsParentheses (omit_parentheses variant), Layout/RedundantLineBreak, Layout/MultilineOperationIndentation, Lint/UselessAssignment, Layout/HashAlignment (separator variant) | #8, #10 open; Layout/MultilineMethodCallIndentation in progress (branch fix/layout-multiline-method-call-indentation). Deferred until after the bump because upstream changed them in 1.89-1.91: Style/MethodCallWithArgsParentheses omit_parentheses (reparse verification), HashAlignment tail |
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | #3 → #4 → #5 → #7 open; ancestors/`^`/`` ` `` + repetition operators in progress (branches np/ancestors, np/repetition) |
-| W5 | IR schema + loader (branch ir/schema-and-loader) in progress; then Expr compiler, IrCop + registry, first translated cop | in progress |
+| W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); then IrCop + registry, first translated cop | in progress |
 | W6 | Translator scripts + pilot on 23 new cops | blocked on W1, W5 |
 
 ## Open PRs
@@ -35,6 +35,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - #7 np: `#helper`/`pred?`/`%param` resolution (base #5); 747/991 vendored patterns resolve on builtins alone
 - #8 fix: Lint/RedundantCopDisableDirective (base main) — sample FP 437→3, FN 121→111; remaining FN is cluster 4 below
 - #6 vendor: 8 new cop config options (base #2), makes the bump stack green
+- #9 ir: schema + loader + `--validate-ir` (base main)
+- #10 fix: Layout/HashAlignment separator variant (base main) — two structural causes; note it still replicates the 1.84.2 clobber-abort quirk that 1.91.0 removes, revisit after the bump
 - #4 np: `<>` unordered + mapping expansion (base #3)
 - #2 vendor: bump rubocop 1.91.0 / rails 2.37.0 / rspec 3.10.2 / performance 1.27.0 / ast 1.50.0 (see 05-vendor-bump-scope.md; 280 implemented cops have upstream behavior changes; oracle re-run on main after merge measures drift)
 
