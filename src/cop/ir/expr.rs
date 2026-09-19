@@ -27,19 +27,31 @@
 //!
 //! ## Matcher compilation order
 //!
-//! `matchers:` are compiled in `BTreeMap` (i.e. name) order, each seeing the
-//! ones compiled before it as `#helper` targets. A forward reference is an
-//! `UnknownMatcher`-style [`IrErrorKind::Pattern`] error rather than a cycle,
-//! which is how pattern-level acyclicity is enforced for free.
-
-use std::collections::BTreeMap;
+//! `matchers:` compile in **two passes**: every name is declared, then every
+//! pattern is compiled against that declaration set. Compilation only asks
+//! whether a `#helper` name is *known* ([`crate::node_pattern::collect_unresolved`]),
+//! and matching resolves it against the finished table through
+//! [`DocResolver`], so a matcher may refer to one declared later, to a
+//! mutually recursive partner, or to itself. That is upstream's own rule —
+//! `def_node_matcher` defines methods on the cop class, and a method body may
+//! name any other — and `Style/RedundantStructKeywordInit`'s
+//! `keyword_init?` = `{#redundant_keyword_init? #keyword_init_false?}` is the
+//! shape a single pass could not express, because `?` sorts before `_`.
+//!
+//! What that gives up is the acyclicity a single pass enforced for free. A
+//! matcher that recurses without descending (`a: "#a"`) overflows the stack at
+//! match time, exactly as upstream's method would; a matcher that recurses
+//! through `^`, or into a child, terminates because the chain and the subtree
+//! are finite. `predicates:` keep the DAG rule — their cycles are still
+//! rejected at load ([`IrErrorKind::Cycle`]) — because a predicate expression
+//! has no such descending step to make the recursion well-founded.
 
 use regex::RegexBuilder;
 
 use crate::node_pattern::{Arg, Arity, CompiledPattern, Resolver, predicates};
 
 use super::load::{IrError, IrErrorKind};
-use super::schema::{ConstValue, ExprSyntax, IrDocument, MAX_EXPR_DEPTH};
+use super::schema::{ConfigType, ConstScalar, ConstTable, ExprSyntax, IrDocument, MAX_EXPR_DEPTH};
 
 /// Largest `descendants(N)` depth an expression may ask for.
 pub const MAX_DESCEND_DEPTH: u8 = 8;
@@ -65,10 +77,19 @@ pub enum Attr {
     LastArgument,
     /// `.source` — the node's verbatim source text.
     Source,
-    /// `.line` — 1-based start line.
+    /// `.line` — 1-based line of the start of the node or loc part.
     Line,
-    /// `.column` — 0-based start column.
+    /// `.last_line` — 1-based line of its end (Parser's `Range#last_line`).
+    LastLine,
+    /// `.column` — 0-based column of its start.
     Column,
+    /// `.last_column` — 0-based column of its end.
+    LastColumn,
+    /// `.loc.<part>` — one of the node's `loc` sub-ranges, as a location
+    /// value. The same part vocabulary anchors use, so
+    /// `{ attr: [node.loc.dot, line] }` and `node.loc.dot.start` name the
+    /// same range.
+    Loc(LocPart),
     /// `.value` — a literal node's value (string/symbol/int/bool/nil).
     Value,
     /// `.type` — Parser-gem type name.
@@ -86,6 +107,67 @@ pub enum Attr {
     LastChild,
 }
 
+/// The `node.loc.<part>` vocabulary, shared by anchors (`load.rs`'s
+/// `anchor_segments`, `cop.rs`'s `parse_anchor`/`part_loc`) and by expressions
+/// (`{ attr: [x, "loc", "dot"] }` / `x.loc.dot`). One list, so a part that
+/// resolves in an anchor resolves in a guard and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocPart {
+    Expression,
+    Selector,
+    Dot,
+    Keyword,
+    EndKeyword,
+    Operator,
+    Begin,
+    End,
+}
+
+impl LocPart {
+    /// Every part name, for diagnostics.
+    pub const NAMES: &'static [&'static str] = &[
+        "expression",
+        "selector",
+        "dot",
+        "keyword",
+        "end_keyword",
+        "operator",
+        "begin",
+        "end",
+    ];
+
+    /// The part a `loc` path segment names, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "expression" => Self::Expression,
+            "selector" => Self::Selector,
+            "dot" => Self::Dot,
+            "keyword" => Self::Keyword,
+            "end_keyword" => Self::EndKeyword,
+            "operator" => Self::Operator,
+            "begin" => Self::Begin,
+            "end" => Self::End,
+            _ => return None,
+        })
+    }
+
+    /// The name this part is written with.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expression => "expression",
+            Self::Selector => "selector",
+            Self::Dot => "dot",
+            Self::Keyword => "keyword",
+            Self::EndKeyword => "end_keyword",
+            Self::Operator => "operator",
+            Self::Begin => "begin",
+            Self::End => "end",
+        }
+    }
+}
+
 fn attr_from_name(name: &str) -> Option<Attr> {
     Some(match name {
         "method_name" => Attr::MethodName,
@@ -97,7 +179,9 @@ fn attr_from_name(name: &str) -> Option<Attr> {
         "last_argument" => Attr::LastArgument,
         "source" => Attr::Source,
         "line" => Attr::Line,
+        "last_line" => Attr::LastLine,
         "column" => Attr::Column,
+        "last_column" => Attr::LastColumn,
         "value" => Attr::Value,
         "type" => Attr::Type,
         "parent_type" => Attr::ParentType,
@@ -227,7 +311,7 @@ pub enum Expr {
     },
     In {
         needle: Box<Expr>,
-        haystack: Vec<Expr>,
+        haystack: Haystack,
     },
     If {
         cond: Box<Expr>,
@@ -245,6 +329,21 @@ pub enum Expr {
         var: usize,
         body: Box<Expr>,
     },
+}
+
+/// What `in:` tests membership against.
+///
+/// A literal sequence is a list of expressions, one per member. The set forms
+/// name a whole collection instead — a `constants:` table or a `string_array`
+/// config key — so a cop can test against something a `.rubocop.yml` supplies
+/// without spelling its members in the document.
+#[derive(Debug, Clone)]
+pub enum Haystack {
+    /// `in: [x, [a, b, c]]`.
+    Items(Vec<Expr>),
+    /// `in: [x, consts.NAME]` / `in: [x, cfg.Key]` — an expression evaluating
+    /// to a list.
+    Set(Box<Expr>),
 }
 
 /// One hook's compiled expressions, positionally parallel to `IrDocument::hooks`.
@@ -265,8 +364,8 @@ pub struct CompiledDoc {
     pub predicates: Vec<Expr>,
     pub regexes: Vec<regex::Regex>,
     pub const_names: Vec<String>,
-    pub consts: Vec<BTreeMap<String, ConstValue>>,
-    /// Each `constants:` table as the `Arg::Set` of its keys, indexed like
+    pub consts: Vec<ConstTable>,
+    /// Each `constants:` table as the `Arg::Set` of its members, indexed like
     /// `const_names`.
     ///
     /// This is what a `%TABLE` reference inside a pattern resolves to, which is
@@ -291,19 +390,26 @@ impl CompiledDoc {
     }
 }
 
-/// Resolves `#helper` against the matchers compiled so far, and `%TABLE`
+/// Resolves `#helper` against the *declared* matcher names and `%TABLE`
 /// against the document's `constants:`.
-struct MatcherResolver<'a> {
+///
+/// Every declared name resolves to the same stand-in pattern, which is enough
+/// for compilation: `collect_unresolved` only asks whether a name is known,
+/// and the stand-in is never matched against — [`DocResolver`] answers at
+/// match time, from the finished table.
+struct DeclaredResolver<'a> {
     names: &'a [String],
-    compiled: &'a [CompiledPattern],
+    stand_in: &'a CompiledPattern,
     const_names: &'a [String],
     const_args: &'a [Arg],
 }
 
-impl Resolver for MatcherResolver<'_> {
+impl Resolver for DeclaredResolver<'_> {
     fn matcher(&self, name: &str) -> Option<&CompiledPattern> {
-        let index = self.names.iter().position(|n| n == name)?;
-        self.compiled.get(index)
+        self.names
+            .iter()
+            .any(|declared| declared == name)
+            .then_some(self.stand_in)
     }
 
     fn constant(&self, name: &str) -> Option<&Arg> {
@@ -329,10 +435,28 @@ impl Resolver for DocResolver<'_> {
     }
 }
 
-/// A `constants:` table as the set of its keys.
+/// A `constants:` table as the set of its members.
+///
+/// A string member becomes `Arg::Symbol` (with a leading `:` stripped, so
+/// `[":map", ":collect"]` and `[map, collect]` are the same set): upstream's
+/// set constants are `%i[…]` and `Arg::Symbol`/`Arg::Str` compare identically
+/// anyway (`predicates::Arg::accepts_value`). A bool member becomes its Ruby
+/// spelling, which is how `{true}` in a pattern reads it.
 #[must_use]
-pub fn const_table_arg(table: &BTreeMap<String, ConstValue>) -> Arg {
-    Arg::Set(table.keys().map(|key| Arg::Symbol(key.clone())).collect())
+pub fn const_table_arg(table: &ConstTable) -> Arg {
+    Arg::Set(
+        table
+            .members()
+            .into_iter()
+            .map(|member| match member {
+                ConstScalar::Str(text) => {
+                    Arg::Symbol(text.strip_prefix(':').unwrap_or(&text).to_string())
+                }
+                ConstScalar::Int(value) => Arg::Int(value),
+                ConstScalar::Bool(value) => Arg::Str(value.to_string()),
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,25 +539,30 @@ impl<'a> CompileCtx<'a> {
         Ok(ctx)
     }
 
+    /// Pass 1 declares every matcher name; pass 2 compiles every pattern
+    /// against that set. See the module docs for why, and for what it costs.
     fn compile_matchers(&mut self) -> Result<(), IrError> {
+        let stand_in = CompiledPattern::compile("_").expect("`_` is a valid pattern");
+        let names: Vec<String> = self.doc.matchers.keys().cloned().collect();
+        let mut compiled = Vec::with_capacity(names.len());
         for (name, decl) in &self.doc.matchers {
             let text = decl.pattern.trim();
             if text.is_empty() {
                 cerr!(self, Pattern, "matcher `{name}`: empty pattern");
             }
-            let resolver = MatcherResolver {
-                names: &self.matcher_names,
-                compiled: &self.matchers,
+            let resolver = DeclaredResolver {
+                names: &names,
+                stand_in: &stand_in,
                 const_names: &self.const_names,
                 const_args: &self.const_args,
             };
-            let compiled = match CompiledPattern::compile_with(text, &resolver) {
-                Ok(compiled) => compiled,
+            match CompiledPattern::compile_with(text, &resolver) {
+                Ok(pattern) => compiled.push(pattern),
                 Err(e) => cerr!(self, Pattern, "matcher `{name}`: {e}"),
-            };
-            self.matcher_names.push(name.clone());
-            self.matchers.push(compiled);
+            }
         }
+        self.matcher_names = names;
+        self.matchers = compiled;
         Ok(())
     }
 
@@ -649,16 +778,53 @@ fn compile_scalar(text: &str, ctx: &mut CompileCtx<'_>) -> Result<Expr, IrError>
             }
         }
     };
-    segments.try_fold(base, |of, segment| match attr_from_name(segment) {
-        Some(attr) => Ok(Expr::Attr {
+    let rest: Vec<&str> = segments.collect();
+    attr_path(base, &rest, text, ctx)
+}
+
+/// Fold `[.<attr>]*` onto `base`, where `loc` consumes the segment after it as
+/// a [`LocPart`] — the one place a path step is two segments wide.
+fn attr_path(
+    base: Expr,
+    segments: &[&str],
+    text: &str,
+    ctx: &CompileCtx<'_>,
+) -> Result<Expr, IrError> {
+    let mut of = base;
+    let mut index = 0;
+    while index < segments.len() {
+        let attr = if segments[index] == "loc" {
+            let Some(name) = segments.get(index + 1) else {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`{text}`: `loc` must be followed by a part name, one of {:?}",
+                    LocPart::NAMES
+                );
+            };
+            let Some(part) = LocPart::from_name(name) else {
+                cerr!(ctx, Expr, "`{text}`: unknown `loc` part `{name}`");
+            };
+            index += 2;
+            Attr::Loc(part)
+        } else {
+            let Some(attr) = attr_from_name(segments[index]) else {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`{text}`: unknown attribute `{}`",
+                    segments[index]
+                );
+            };
+            index += 1;
+            attr
+        };
+        of = Expr::Attr {
             of: Box::new(of),
             attr,
-        }),
-        None => Err(ctx.error(
-            IrErrorKind::Expr,
-            format!("`{text}`: unknown attribute `{segment}`"),
-        )),
-    })
+        };
+    }
+    Ok(of)
 }
 
 fn compile_op(
@@ -716,13 +882,40 @@ fn compile_op(
                 return Err(arity(ctx, "2"));
             }
             let needle = sub(0, ctx)?;
-            let Yaml::Sequence(members) = items[1] else {
-                cerr!(ctx, Expr, "`in`: the second operand must be a sequence");
+            let haystack = match items[1] {
+                Yaml::Sequence(members) => Haystack::Items(
+                    members
+                        .iter()
+                        .map(|member| compile_value(member, ctx, depth + 1))
+                        .collect::<Result<_, _>>()?,
+                ),
+                // A set-valued reference: the whole table or the whole config
+                // list is the haystack. Anything else — a bare literal, an
+                // operator — would silently degrade to a one-member test.
+                other => {
+                    let compiled = compile_value(other, ctx, depth + 1)?;
+                    match &compiled {
+                        Expr::Path(Target::Const(_)) => {}
+                        Expr::Path(Target::Cfg(slot)) => {
+                            let key = &ctx.config_names[*slot];
+                            let ty = ctx.doc.config[key].ty;
+                            if ty != ConfigType::StringArray {
+                                cerr!(
+                                    ctx,
+                                    Expr,
+                                    "`in`: config key `{key}` is `{ty}`, not `string_array`"
+                                );
+                            }
+                        }
+                        _ => cerr!(
+                            ctx,
+                            Expr,
+                            "`in`: the second operand must be a sequence, a `consts.<Table>` or a `string_array` `cfg.<Key>`"
+                        ),
+                    }
+                    Haystack::Set(Box::new(compiled))
+                }
             };
-            let haystack = members
-                .iter()
-                .map(|member| compile_value(member, ctx, depth + 1))
-                .collect::<Result<_, _>>()?;
             Ok(Expr::In {
                 needle: Box::new(needle),
                 haystack,
@@ -755,6 +948,14 @@ fn compile_op(
                     "`lookup`: the first operand must be a `consts.<Table>` reference"
                 );
             };
+            let name = &ctx.const_names[table];
+            if matches!(ctx.doc.constants[name], ConstTable::List(_)) {
+                cerr!(
+                    ctx,
+                    Expr,
+                    "`lookup`: `{name}` is a list, which has no values to look up; use `in:` to test membership"
+                );
+            }
             Ok(Expr::Lookup {
                 table,
                 key: Box::new(sub(1, ctx)?),
@@ -774,6 +975,20 @@ fn compile_op(
                     )
                 })?;
                 Attr::Arg(index as usize)
+            } else if name == "loc" {
+                let part = items
+                    .get(2)
+                    .and_then(|v| v.as_str())
+                    .and_then(LocPart::from_name);
+                let Some(part) = part else {
+                    cerr!(
+                        ctx,
+                        Expr,
+                        "`attr`: `loc` needs a part name, one of {:?}",
+                        LocPart::NAMES
+                    );
+                };
+                Attr::Loc(part)
             } else {
                 match attr_from_name(name) {
                     Some(attr) if items.len() == 2 => attr,

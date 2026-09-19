@@ -26,9 +26,10 @@ use crate::node_pattern::{Captures, NoResolver, Params, PredCtx, PredTarget, Res
 use crate::parse::source::SourceFile;
 
 use super::expr::{
-    Attr, CmpOp, Collection, CompiledDoc, Expr, Intrinsic, Lit, MatcherRef, QuantKind, Target,
+    Attr, CmpOp, Collection, CompiledDoc, Expr, Haystack, Intrinsic, Lit, MatcherRef, QuantKind,
+    Target,
 };
-use super::schema::ConstValue;
+use super::schema::{ConstScalar, ConstValue};
 
 /// A runtime value. Byte slices borrow from the parsed source or the compiled
 /// document wherever possible.
@@ -39,6 +40,9 @@ pub enum Value<'pr> {
     Str(Cow<'pr, [u8]>),
     Sym(Cow<'pr, [u8]>),
     Node(ruby_prism::Node<'pr>),
+    /// A `loc` part: a byte range with no node of its own, produced by
+    /// `{ attr: [x, "loc", "dot"] }`. Only the position attributes read it.
+    Loc(usize, usize),
     List(Vec<Value<'pr>>),
     Nil,
 }
@@ -53,6 +57,7 @@ impl Clone for Value<'_> {
             Value::Str(bytes) => Value::Str(bytes.clone()),
             Value::Sym(bytes) => Value::Sym(bytes.clone()),
             Value::Node(node) => Value::Node(dup_node(node)),
+            Value::Loc(start, end) => Value::Loc(*start, *end),
             Value::List(items) => Value::List(items.clone()),
             Value::Nil => Value::Nil,
         }
@@ -68,6 +73,19 @@ impl<'pr> Value<'pr> {
     #[must_use]
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
+    }
+
+    /// The byte range this value occupies: a node's own extent, or a `loc`
+    /// part's. Everything else has none.
+    #[must_use]
+    pub fn span(&self) -> Option<(usize, usize)> {
+        match self {
+            Value::Node(node) => {
+                Some((node.location().start_offset(), node.location().end_offset()))
+            }
+            Value::Loc(start, end) => Some((*start, *end)),
+            _ => None,
+        }
     }
 
     /// The node this value holds, if it is one.
@@ -239,11 +257,18 @@ pub fn eval<'pr>(expr: &Expr, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
         Expr::Cmp { op, lhs, rhs } => Value::Bool(compare(*op, &eval(lhs, ctx), &eval(rhs, ctx))),
         Expr::In { needle, haystack } => {
             let value = eval(needle, ctx);
-            Value::Bool(
-                haystack
+            let held = match haystack {
+                Haystack::Items(items) => items
                     .iter()
                     .any(|item| compare(CmpOp::Eq, &value, &eval(item, ctx))),
-            )
+                // A set reference evaluates to a `List`; anything else (a
+                // config key whose value is absent, say) holds nothing.
+                Haystack::Set(set) => match eval(set, ctx) {
+                    Value::List(items) => items.iter().any(|item| compare(CmpOp::Eq, &value, item)),
+                    _ => false,
+                },
+            };
+            Value::Bool(held)
         }
         Expr::If { cond, then, els } => {
             if eval(cond, ctx).truthy() {
@@ -259,6 +284,8 @@ pub fn eval<'pr>(expr: &Expr, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 return Value::Nil;
             };
+            // Only a map has values to look up; a list-valued table is a
+            // membership set, so `lookup` on one is `nil`.
             match ctx.doc.consts.get(*table).and_then(|t| t.get(text)) {
                 Some(ConstValue::Str(s)) => Value::str(s.as_bytes()),
                 Some(ConstValue::Int(i)) => Value::Int(*i),
@@ -292,9 +319,24 @@ fn path<'pr>(target: Target, ctx: &EvalCtx<'_, 'pr>) -> Value<'pr> {
         },
         Target::Bind(slot) => ctx.binds.get(slot).cloned().unwrap_or(Value::Nil),
         Target::Cfg(slot) => ctx.config.get(slot).map_or(Value::Nil, from_yaml),
-        // A bare `consts.Table` is only meaningful as `lookup`'s first operand,
-        // which the compiler consumes; reaching here means it was used as a value.
-        Target::Const(_) => Value::Nil,
+        // A table as a value is the list of its members, which is what
+        // `in: consts.NAME` tests against. (`lookup`'s first operand is
+        // consumed by the compiler and never evaluated.)
+        Target::Const(slot) => ctx.doc.consts.get(slot).map_or(Value::Nil, |table| {
+            Value::List(
+                table
+                    .members()
+                    .into_iter()
+                    .map(|member| match member {
+                        ConstScalar::Str(text) => Value::Sym(Cow::Owned(
+                            text.strip_prefix(':').unwrap_or(&text).as_bytes().to_vec(),
+                        )),
+                        ConstScalar::Int(value) => Value::Int(value),
+                        ConstScalar::Bool(value) => Value::Bool(value),
+                    })
+                    .collect(),
+            )
+        }),
         Target::Var(slot) => ctx.vars.borrow()[slot]
             .as_ref()
             .map_or(Value::Nil, |node| Value::Node(dup_node(node))),
@@ -318,6 +360,23 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .parent()
             .and_then(crate::node_pattern::parser_type_name)
             .map_or(Value::Nil, |name| Value::str(name.as_bytes()));
+    }
+    // The position family reads a byte range, so it applies to a `loc` part
+    // exactly as it does to a node. `last_line`/`last_column` are Parser's
+    // `Range#last_line`/`#last_column`: the line and column of `end_pos`.
+    if matches!(
+        attr,
+        Attr::Line | Attr::LastLine | Attr::Column | Attr::LastColumn
+    ) {
+        let Some((start, end)) = value.span() else {
+            return Value::Nil;
+        };
+        let at_start = matches!(attr, Attr::Line | Attr::Column);
+        let (line, column) = ctx
+            .src
+            .offset_to_line_col(if at_start { start } else { end });
+        let wants_line = matches!(attr, Attr::Line | Attr::LastLine);
+        return Value::Int(if wants_line { line } else { column } as i64);
     }
     let Some(node) = value.node() else {
         return Value::Nil;
@@ -352,12 +411,9 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .next_back()
             .map_or(Value::Nil, Value::Node),
         Attr::Source => Value::str(node.location().as_slice()),
-        Attr::Line => {
-            Value::Int(ctx.src.offset_to_line_col(node.location().start_offset()).0 as i64)
-        }
-        Attr::Column => {
-            Value::Int(ctx.src.offset_to_line_col(node.location().start_offset()).1 as i64)
-        }
+        Attr::Loc(part) => super::cop::part_loc(node, part).map_or(Value::Nil, |loc| {
+            Value::Loc(loc.start_offset(), loc.end_offset())
+        }),
         Attr::Value => literal_value(node),
         Attr::Type => crate::node_pattern::parser_type_name(node)
             .map_or(Value::Nil, |name| Value::str(name.as_bytes())),
@@ -371,7 +427,9 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .into_iter()
             .next_back()
             .map_or(Value::Nil, Value::Node),
-        Attr::ParentType => unreachable!("handled above"),
+        Attr::ParentType | Attr::Line | Attr::LastLine | Attr::Column | Attr::LastColumn => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -474,12 +532,14 @@ fn compare(op: CmpOp, lhs: &Value<'_>, rhs: &Value<'_>) -> bool {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         (Value::Nil, Value::Nil) => Some(Ordering::Equal),
-        // Two nodes compare by identity, i.e. by byte range — which is what
-        // `==` on Parser nodes effectively means (design §1.6).
-        (Value::Node(a), Value::Node(b)) => Some(
-            (a.location().start_offset(), a.location().end_offset())
-                .cmp(&(b.location().start_offset(), b.location().end_offset())),
-        ),
+        // Two nodes (or two `loc` parts) compare by identity, i.e. by byte
+        // range — which is what `==` on Parser nodes means (design §1.6).
+        (Value::Node(_) | Value::Loc(..), Value::Node(_) | Value::Loc(..)) => {
+            match (lhs.span(), rhs.span()) {
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
+                _ => None,
+            }
+        }
         _ => match (lhs.bytes(), rhs.bytes()) {
             (Some(a), Some(b)) => Some(a.as_ref().cmp(b.as_ref())),
             _ => None,
@@ -847,6 +907,29 @@ mod tests {
                 "{ in: [node.method_name, [\":now\", \":utc\"]] }",
             )
             .falsey(),
+            // `in:` over a whole set: a list-valued constant, a map-valued one
+            // (its keys), and a `string_array` config key.
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: [\":new\", \":now\"]\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: [utc, now]\n")
+                .falsey(),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, consts.METHODS] }")
+                .extra("constants:\n  METHODS: { new: \"now\" }\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, cfg.Allowed] }")
+                .extra("config:\n  Allowed: { type: string_array, default: [\"new\"] }\n"),
+            Case::new("Time.new", TIME_NEW, "{ in: [node.method_name, cfg.Allowed] }")
+                .extra("config:\n  Allowed: { type: string_array, default: [] }\n")
+                .falsey(),
+            // A list-valued constant is also a `%NAME` membership set, which
+            // is how upstream's `%i[…].to_set.freeze` constants read.
+            Case::new("x.is_a?(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: [\"is_a?\", \"kind_of?\"]\n"),
+            Case::new("x.foo(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
+                .more("  kindish:\n    pattern: \"(send _ %KIND_METHODS _)\"\n")
+                .extra("constants:\n  KIND_METHODS: [\"is_a?\", \"kind_of?\"]\n")
+                .falsey(),
             // --- values ---------------------------------------------------
             Case::new("Time.new", TIME_NEW, "{ if: [true, true, false] }"),
             Case::new("Time.new", TIME_NEW, "{ if: [false, true, false] }").falsey(),
@@ -899,6 +982,24 @@ mod tests {
             .more("  konst:\n    pattern: \"(const nil? :Time)\"\n"),
             Case::new("Time.new", TIME_NEW, "{ matches: [node, \"is_new\"] }")
                 .extra("predicates:\n  is_new:\n    expr: { eq: [node.method_name, \":new\"] }\n"),
+            // Two-pass matcher compilation, end to end: a union whose operands
+            // are declared after it — upstream's
+            // `Style/RedundantStructKeywordInit#keyword_init?` shape — and a
+            // self-recursive matcher that descends into the receiver.
+            Case::new("Time.new", TIME_NEW, "{ matches: [node, \"either?\"] }")
+                .more(
+                    "  either?:\n    pattern: \"{#date_new #time_new}\"\n  date_new:\n    pattern: \"(send (const nil? :Date) :new)\"\n  time_new:\n    pattern: \"(send (const nil? :Time) :new)\"\n",
+                ),
+            Case::new("Date.today", "(send (const nil? :Date) :today)", "{ matches: [node, \"either?\"] }")
+                .more(
+                    "  either?:\n    pattern: \"{#date_new #time_new}\"\n  date_new:\n    pattern: \"(send (const nil? :Date) :new)\"\n  time_new:\n    pattern: \"(send (const nil? :Time) :new)\"\n",
+                )
+                .falsey(),
+            Case::new("root.a.b", "(send _ :b)", "{ matches: [node, \"chain?\"] }")
+                .more("  chain?:\n    pattern: \"{(send nil? :root) (send #chain? _)}\"\n"),
+            Case::new("other.a.b", "(send _ :b)", "{ matches: [node, \"chain?\"] }")
+                .more("  chain?:\n    pattern: \"{(send nil? :root) (send #chain? _)}\"\n")
+                .falsey(),
             // `%CONST` inside a matcher resolves against the document's own
             // `constants:` — upstream's `%KIND_METHODS` spelling, verbatim.
             Case::new("x.is_a?(Integer)", "(send _ _ _)", "{ matches: [node, \"kindish\"] }")
@@ -1021,6 +1122,45 @@ mod tests {
             )
             .captures("[arg]"),
             Case::new("Time.new", TIME_NEW, "{ eq: [node.type, \"send\"] }"),
+            // --- positions, on a node and on a `loc` part -----------------
+            Case::new(
+                "array\n  .map(&:to_s)\n  .join\n",
+                "(send _ :join)",
+                "{ eq: [node.receiver.last_line, 2] }",
+            ),
+            Case::new("Time.new", TIME_NEW, "{ eq: [node.last_line, 1] }"),
+            Case::new("  Time.new", TIME_NEW, "{ eq: [node.last_column, 10] }"),
+            // `Style/MapJoin`'s `receiver.last_line < map_send.loc.dot.line`:
+            // the dot is on the line after the receiver ends.
+            Case::new(
+                "array\n  .map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ lt: [node.receiver.last_line, node.loc.dot.line] }",
+            ),
+            Case::new(
+                "array.map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ lt: [node.receiver.last_line, node.loc.dot.line] }",
+            )
+            .falsey(),
+            Case::new(
+                "array\n  .map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ eq: [node.loc.dot.column, 2] }",
+            ),
+            // The `attr` operator spelling of the same step.
+            Case::new(
+                "array.map(&:to_s)\n",
+                "(send _ :map ...)",
+                "{ eq: [{ attr: [{ attr: [node, \"loc\", \"selector\"] }, \"column\"] }, 6] }",
+            ),
+            // A part the node does not have, and a part of a non-node: both nil.
+            Case::new("Time.new", TIME_NEW, "{ eq: [node.loc.keyword, null] }"),
+            Case::new(
+                "Time.new",
+                TIME_NEW,
+                "{ eq: [node.method_name.line, null] }",
+            ),
             Case::new(
                 "x = Time.new",
                 TIME_NEW,

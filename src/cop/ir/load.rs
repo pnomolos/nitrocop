@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use crate::node_pattern;
 
-use super::expr::{CompileCtx, CompiledDoc, CompiledHook};
+use super::expr::{CompileCtx, CompiledDoc, CompiledHook, LocPart};
 use super::schema::{
     AutocorrectMode, ConfigType, CorrectionOp, IrDocument, LocationSpec, MatchSpec, SCHEMA_VERSION,
 };
@@ -48,12 +48,6 @@ const VIRTUAL_NODE_TYPES: &[&str] = &["numblock", "itblock"];
 const ACCESSORS: &[&str] = &[
     "receiver", "parent", "body", "value", "name", "block", "condition", "arguments",
     "first_argument", "last_argument", "left_sibling", "right_sibling",
-];
-
-/// `node.loc.<part>` names (design §1.2 "Anchor").
-#[rustfmt::skip]
-const PARTS: &[&str] = &[
-    "expression", "selector", "dot", "keyword", "end_keyword", "operator", "begin", "end",
 ];
 
 const EDGES: &[&str] = &["start", "stop"];
@@ -592,8 +586,31 @@ impl Validator<'_> {
                 "anchor `{path}`: unknown target `{target}` (expected `node`, `parent` or a declared `$capture`)"
             );
         }
+        // `loc` is optional before a part, so an anchor may be written the way
+        // upstream writes it (`node.loc.dot.start`) or the way the design's
+        // examples do (`node.dot.start`); both name the same `PARTS` entry
+        // that `{ attr: [node.loc.dot, line] }` names in an expression.
+        let mut expect_part = false;
         for segment in &segments[1..] {
-            if !ACCESSORS.contains(segment) && !PARTS.contains(segment) && !EDGES.contains(segment)
+            if std::mem::take(&mut expect_part) {
+                if LocPart::from_name(segment).is_none() {
+                    bail!(
+                        self,
+                        Location,
+                        Some(path),
+                        "anchor `{path}`: unknown `loc` part `{segment}`, expected one of {:?}",
+                        LocPart::NAMES
+                    );
+                }
+                continue;
+            }
+            if *segment == "loc" {
+                expect_part = true;
+                continue;
+            }
+            if !ACCESSORS.contains(segment)
+                && LocPart::from_name(segment).is_none()
+                && !EDGES.contains(segment)
             {
                 bail!(
                     self,
@@ -602,6 +619,14 @@ impl Validator<'_> {
                     "anchor `{path}`: unknown component `{segment}`"
                 );
             }
+        }
+        if expect_part {
+            bail!(
+                self,
+                Location,
+                Some(path),
+                "anchor `{path}`: `loc` must be followed by a part name"
+            );
         }
         Ok(segments)
     }
@@ -741,6 +766,61 @@ hooks:
         assert!(load_str(&source, "memory.cop.yml").is_ok());
         let err = load_str_with(&source, "memory.cop.yml", LoadMode::User).unwrap_err();
         assert_eq!(err.kind, IrErrorKind::Department);
+    }
+
+    /// `matchers:` compile in two passes, so a `#helper` may name a matcher
+    /// declared later (`a?` sorts before `b?` here, and `?` sorts before `_`,
+    /// which is what defeated the single pass), a mutually recursive partner,
+    /// or itself.
+    #[test]
+    fn matchers_resolve_forward_and_mutual_references() {
+        const MUTUAL: &str = r#"
+schema: 1
+cop: "Custom/Mutual"
+matchers:
+  a?:
+    pattern: "{(send nil? :stop) (send #b? _)}"
+  b?:
+    pattern: "{(send nil? :stop) (send #a? _)}"
+  self?:
+    pattern: "{(send nil? :stop) (send #self? _)}"
+hooks:
+  - on: [send]
+    match: "a?"
+    when: { matches: [node, "self?"] }
+    offense:
+      location: node
+      message: "x"
+"#;
+        let cop = load_str_with(MUTUAL, "memory.cop.yml", LoadMode::User).unwrap();
+        assert_eq!(cop.compiled.matcher_names, ["a?", "b?", "self?"]);
+    }
+
+    /// The DAG rule is kept for `predicates:`, whose bodies have no descending
+    /// step to make a recursion well-founded.
+    #[test]
+    fn predicate_cycles_are_still_rejected() {
+        const CYCLE: &str = r#"
+schema: 1
+cop: "Custom/Cycle"
+matchers:
+  probe:
+    pattern: "(send nil? :foo)"
+predicates:
+  one:
+    expr: { matches: [node, "two"] }
+  two:
+    expr: { matches: [node, "one"] }
+hooks:
+  - on: [send]
+    match: probe
+    when: { matches: [node, "one"] }
+    offense:
+      location: node
+      message: "x"
+"#;
+        let err = load_str_with(CYCLE, "memory.cop.yml", LoadMode::User).unwrap_err();
+        assert_eq!(err.kind, IrErrorKind::Cycle);
     }
 
     #[test]

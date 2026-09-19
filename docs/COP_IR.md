@@ -40,7 +40,7 @@ loaded cop, because a silently dropped cop is an invisible false negative.
 | `include` / `exclude` | list of globs | `[]` | Become `default_include`/`default_exclude`. |
 | `restrict_on_send` | list of method names | `[]` | Requires at least one `send`/`csend` hook. |
 | `config` | map | `{}` | Declared config keys. |
-| `constants` | map of map | `{}` | Frozen lookup tables. |
+| `constants` | map | `{}` | Frozen tables: a map of values, or a list of members. |
 | `matchers` | map | `{}` | Named NodePattern strings. |
 | `predicates` | map | `{}` | Named expression guards, usable as `#name` in patterns. |
 
@@ -63,6 +63,29 @@ config:
 match the declared type; `values:` is required for, and only for, `type: enum`,
 and the default must be a member.
 
+## `constants:`
+
+Upstream freezes a constant two ways and the IR mirrors both:
+
+```yaml
+constants:
+  # `FOO = { 'is_a?' => :Integer }.freeze` — a lookup table.
+  REPLACEMENTS: { "is_a?": "kind_of?" }
+  # `BAR = %i[map collect].to_set.freeze` — a membership set.
+  MAP_METHODS: [":map", ":collect"]
+```
+
+Both forms bind `%NAME` inside a pattern to the `Arg::Set` of the table's
+**members** — a map's members are its keys — so upstream's `%MAP_METHODS`
+spelling stays verbatim whichever form the constant has. A string member's
+leading `:` is optional and stripped (`[":map"]` and `[map]` are the same set);
+quote a `:`-prefixed member, because YAML's flow sequence will not take a bare
+one.
+
+Both forms also answer `in: consts.NAME` (see the `in` operator). The forms
+differ in exactly one place: `lookup:` needs values, so a list-valued table is a
+load error there.
+
 ## `matchers:` and `predicates:`
 
 ```yaml
@@ -77,10 +100,28 @@ matchers:
 Patterns are **copied verbatim from upstream, never synthesized**; each is
 fully compiled at load (`CompiledPattern::compile_with`), so an unresolvable
 `#helper`, `%param` or `pred?` is a load error rather than a silent `true`.
-Matchers are compiled in name order and each sees the ones before it as
-`#helper` targets, which makes the pattern reference graph acyclic by
-construction; declaring more capture names than the pattern has `$` slots is an
-error. A name may not be declared as both a matcher and a predicate.
+Declaring more capture names than the pattern has `$` slots is an error. A name
+may not be declared as both a matcher and a predicate.
+
+Matchers compile in **two passes** — every name is declared, then every pattern
+is compiled — so a `#helper` may name a matcher declared later, a mutually
+recursive partner, or itself. That is upstream's rule (`def_node_matcher`
+defines methods, and a method body may name any other), and it is what lets
+`Style/RedundantStructKeywordInit` copy
+
+```ruby
+def_node_matcher :keyword_init?, '{#redundant_keyword_init? #keyword_init_false?}'
+```
+
+verbatim, although `?` (0x3F) sorts before `_` (0x5F) and both operands are
+declared after it. The cost is that pattern-level acyclicity is no longer free:
+a matcher that recurses *without descending* (`a: "#a"`) overflows the stack at
+match time, exactly as upstream's method would. One that recurses through `^`,
+or into a child, terminates because the chain and the subtree are finite.
+
+`predicates:` keep the DAG rule — a `matches:` cycle between them is an
+`IrErrorKind::Cycle` at load — because a predicate expression has no descending
+step to make the recursion well-founded.
 
 ## `hooks:`
 
@@ -102,13 +143,20 @@ hooks:
         - { op: remove, range: { start: node.dot.start, stop: node.selector.stop } }
 ```
 
-**Anchors** are `<target>[.<accessor|part>]*[.start|.stop]`, where `target` is
-`node`, `parent` or a declared `$capture`; `accessor` is a structural accessor
-(`receiver`, `body`, `first_argument`, `left_sibling`, …) and `part` is a
-`node.loc.<part>` name
-(`expression`, `selector`, `dot`, `keyword`, `end_keyword`, `operator`, `begin`,
-`end`). A `location:` shorthand denotes a range and must **not** end in an edge;
-an anchor inside `{ start:, stop: }` or `at:` must.
+**Anchors** are `<target>[.<accessor>]*[.[loc.]<part>][.start|.stop]`, where
+`target` is `node`, `parent` or a declared `$capture`; `accessor` is a
+structural accessor (`receiver`, `body`, `first_argument`, `left_sibling`, …)
+and `part` is a `loc` part name (`expression`, `selector`, `dot`, `keyword`,
+`end_keyword`, `operator`, `begin`, `end`). The `loc.` before a part is
+optional, so `node.loc.dot.start` — upstream's own spelling — and
+`node.dot.start` are the same anchor. A `location:` shorthand denotes a range
+and must **not** end in an edge; an anchor inside `{ start:, stop: }` or `at:`
+must.
+
+Parts are one vocabulary: the same eight names, resolved by the same
+`cop.rs::part_loc`, are what an expression reads with `x.loc.<part>` (see
+[Attributes](#attributes)). A name that is not a part is a load error in both
+places (`Location` for an anchor, `Expr` for a guard).
 
 **Messages** interpolate `%{name}` over the hook's captures, its binds and the
 declared config keys. Every placeholder must resolve; a bare `%` is an error
@@ -149,16 +197,22 @@ self reference is a load error.
 | `not` | 1 expr | bool |
 | `eq`, `ne` | 2 exprs | bool |
 | `lt`, `le`, `gt`, `ge` | 2 exprs | bool |
-| `in` | `[expr, [expr, …]]` | bool — `eq` against any member |
+| `in` | `[expr, [expr, …]]`, `[expr, consts.<Table>]`, `[expr, cfg.<Key>]` | bool — `eq` against any member |
 | `if` | 3 exprs (cond, then, else) | the taken branch's value |
 | `lit` | 1 scalar | that literal, never a reference |
-| `lookup` | `[consts.<Table>, expr]` | the table's value, or `nil` |
-| `attr` | `[expr, "<attr>"]`, or `[expr, "arg", <int>]` | see attribute table |
+| `lookup` | `[consts.<Table>, expr]` | the map-valued table's value, or `nil` |
+| `attr` | `[expr, "<attr>"]`, `[expr, "arg", <int>]`, or `[expr, "loc", "<part>"]` | see attribute table |
 | `pred` | `[expr, "<name>", <arg>…]` | bool |
 | `matches` | `[expr, "<matcher or predicate>"]` | bool |
 | `regex` | `[expr, "<source>"]` or `[expr, "<source>", "<imx flags>"]` | bool |
 | `any_of`, `all_of`, `none_of` | quantifier mapping | bool |
 | `count` | quantifier mapping | int — matching elements |
+
+`in`'s second operand is a literal sequence, a `constants:` table (its members
+— a map's keys), or a `string_array` config key. The last is how a cop tests
+against something a `.rubocop.yml` supplies; a config key of any other type is
+a load error rather than a silently one-member test. So is any other expression
+there, for the same reason.
 
 Comparison rules: two nodes compare by byte range (identity, which is what `==`
 on Parser nodes means); ints, bools and `nil` compare by value; anything else
@@ -220,13 +274,46 @@ attribute of a non-node, or one the node does not have, is `nil`.
 | `arg` (index) | call | node or nil — `{ attr: [x, "arg", 1] }` |
 | `first_argument`, `last_argument` | call | node or nil |
 | `source` | any | string — verbatim source text |
-| `line` | any | int — 1-based start line |
-| `column` | any | int — 0-based start column |
+| `line` | node, loc part | int — 1-based line of the start |
+| `last_line` | node, loc part | int — 1-based line of the end |
+| `column` | node, loc part | int — 0-based column of the start |
+| `last_column` | node, loc part | int — 0-based column of the end |
+| `loc` (part) | any | loc part — `{ attr: [x, "loc", "dot"] }`, or `x.loc.dot` |
 | `value` | str, sym, int, true, false | the literal's value |
 | `type` | any | string — Parser-gem type name |
 | `parent_type` | any | string — sugar for `parent.type` |
 | `first_child`, `last_child` | any | node or nil — direct children, source order |
 | `left_sibling`, `right_sibling` | any | node or nil — the adjacent Parser-gem child of this node's parent |
+
+#### Positions and `loc` parts
+
+`line`, `last_line`, `column` and `last_column` are Parser's
+`Source::Range#line` / `#last_line` / `#column` / `#last_column`: the first two
+read the range's `begin_pos`, the last two its `end_pos`. They apply to a node
+and to a `loc` part alike, because both are just a byte range.
+
+`loc` is the one path step two segments wide — `x.loc.dot` in a scalar path,
+`{ attr: [x, "loc", "dot"] }` as an operator — and it yields a *location*, not a
+node: only the four position attributes read one, and its part vocabulary is
+the anchor vocabulary (`expression`, `selector`, `dot`, `keyword`,
+`end_keyword`, `operator`, `begin`, `end`). A part the node does not have is
+`nil`, as any other missing attribute is. This is what makes upstream's
+
+```ruby
+receiver.last_line < map_send.loc.dot.line
+```
+
+(`Style/MapJoin#removal_range`) expressible verbatim:
+
+```yaml
+when: { lt: [$map.receiver.last_line, $map.loc.dot.line] }
+```
+
+The two vocabularies are not yet *identical*: an anchor accessor is a step to a
+node (`condition`, `arguments`, `block`, `value`) and an expression attribute
+may yield bytes or an int instead (`method_name`, `arg_count`, `source`,
+`type`), so the accessor and attribute lists still differ where the two layers
+genuinely need different things. Parts, and the four positions, are shared.
 
 `left_sibling` / `right_sibling` mirror `RuboCop::AST::Node`'s: they index into
 the *Parser-gem* child list, where a `send`'s method name is a Symbol rather
@@ -347,7 +434,29 @@ is the identity test for it.
 
 An `if`/`elsif`/`else` over correction *ranges* has no `correct:` spelling.
 Write one hook per branch, each with the `when:` upstream tests for it
-(`Style/RedundantStructKeywordInit` has four).
+(`Style/RedundantStructKeywordInit` has four, `Style/MapJoin` three). Those
+conditions are often positional, which is what the `loc` part and position
+attributes are for: `Style/MapJoin`'s
+
+```ruby
+start_pos = if receiver.last_line < map_send.loc.dot.line
+              receiver.source_range.end_pos
+            else
+              map_send.loc.dot.begin_pos
+            end
+```
+
+is two hooks whose `when:` are `{ lt: [$map.receiver.last_line, $map.loc.dot.line] }`
+and its `ge:` complement, and whose `correct:` ranges start at
+`$map.receiver.loc.expression.stop` and `$map.loc.dot.start` respectively.
+
+**A node that is both a call and a block.** Prism has one `CallNode` for
+`array.map { … }`, and it answers to the Parser types `send` *and*
+`block`/`numblock`/`itblock`, in head position and in child position alike. So
+upstream's four `Style/MapJoin` patterns — one per block spelling, each with the
+map call as a `$`-captured child of the `join` call — copy over unchanged, and
+`map_node.any_block_type? ? map_node.send_node : map_node` collapses to the
+capture itself.
 
 A shipped document that fails to load is a **panic at startup**: it is a bug in
 the binary, not in the user's project, and `ir_embedded_cops_load` exercises
