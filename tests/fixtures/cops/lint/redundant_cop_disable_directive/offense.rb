@@ -57,3 +57,14 @@ def create_server(cloud_server) # rubocop:disable Lint/UnusedMethodArgument
 ^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Lint/UnusedMethodArgument`.
   raise NotImplementedError
 end
+
+# Bare (department-less) cop names: RuboCop's `Registry.qualified_cop_name`
+# resolves `LineLength` to `Layout/LineLength` and reports that name.
+x = 1 # rubocop:disable LineLength
+^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `Layout/LineLength`.
+
+# A bare name that no longer resolves (renamed to `Layout/HashAlignment`).
+# rubocop:disable AlignHash
+^ Lint/RedundantCopDisableDirective: Unnecessary disabling of `AlignHash` (unknown cop).
+h = { a: 1 }
+# rubocop:enable AlignHash

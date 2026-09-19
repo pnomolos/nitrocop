@@ -92,6 +92,20 @@ pub struct DisableDirective {
     pub used: bool,
 }
 
+impl DisableDirective {
+    /// RuboCop-qualified cop name for this directive.
+    ///
+    /// Mirrors `RuboCop::Cop::Registry.qualified_cop_name`: a bare cop name
+    /// whose short name matches exactly one registered cop is resolved to the
+    /// qualified name (`LineLength` -> `Layout/LineLength`), everything else
+    /// (departments, unknown names, ambiguous short names) is returned as
+    /// written. `Lint/RedundantCopDisableDirective` reports the qualified name
+    /// because RuboCop keys `CommentConfig#cop_disabled_line_ranges` by it.
+    pub fn qualified_name(&self) -> &str {
+        &self.key
+    }
+}
+
 /// Tracks line ranges where cops are disabled via inline comments.
 ///
 /// Supports `# rubocop:disable`, `# rubocop:enable`, `# rubocop:todo`,

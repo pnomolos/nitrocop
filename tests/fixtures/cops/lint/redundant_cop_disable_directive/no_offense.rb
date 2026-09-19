@@ -15,3 +15,14 @@ this_is_a_very_long_line_that_should_trigger_line_length_cop_aaaaaaaaaaaaaaaaaaa
 # rubocop:disable /BlockLength, Metrics/
 x = 1
 # rubocop:enable /BlockLength, Metrics/
+
+# Bare cop name that really suppresses an offense — `LineLength` qualifies to
+# `Layout/LineLength`, which fires on this line, so the directive is needed.
+this_is_a_very_long_line_that_should_trigger_line_length_cop_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb = 1 # rubocop:disable LineLength
+
+# Real department names stay conservative — never flagged.
+# rubocop:disable Metrics
+def long_method
+  1
+end
+# rubocop:enable Metrics

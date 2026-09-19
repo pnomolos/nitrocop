@@ -7567,3 +7567,112 @@ fn line_length_unused_disable_is_still_redundant() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------- Department-less (bare) directive names ----------
+//
+// RuboCop's `CommentConfig#analyze` runs every directive name through
+// `Registry.qualified_cop_name`, so `# rubocop:disable LineLength` is keyed as
+// `Layout/LineLength` and a bare name that resolves to nothing (e.g. the
+// pre-0.50 `AlignHash`) stays unqualified and is reported as an unknown cop.
+// nitrocop used to skip every name without a `/`, treating bare cop names as
+// department disables.
+
+fn redundant_directives(name: &str, body: &str) -> (PathBuf, Vec<Diagnostic>) {
+    let dir = temp_dir(name);
+    let file = write_file(&dir, "test.rb", body.as_bytes());
+    let config = load_config(None, Some(&dir), None).unwrap();
+    let registry = CopRegistry::default_registry();
+    let args = default_args();
+    let result = run_linter(
+        &discovered(&[file]),
+        &config,
+        &registry,
+        &args,
+        &TierMap::load(),
+        &AutocorrectAllowlist::load(),
+    );
+    let diagnostics = result
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.cop_name == "Lint/RedundantCopDisableDirective")
+        .collect();
+    (dir, diagnostics)
+}
+
+#[test]
+fn redundant_disable_bare_cop_name_is_qualified() {
+    // `LineLength` resolves to `Layout/LineLength`; the line is short, so the
+    // directive is redundant and the message uses the qualified name.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_bare_name",
+        "x = 1 # rubocop:disable LineLength\n",
+    );
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `Layout/LineLength`."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_bare_cop_name_with_offense_is_kept() {
+    // Same bare name, but now it really suppresses a `Layout/LineLength`
+    // offense, so it must not be flagged.
+    let long = "x".repeat(150);
+    let body = format!("y = \"{long}\" # rubocop:disable LineLength\n");
+    let (dir, diagnostics) = redundant_directives("redundant_disable_bare_name_used", &body);
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_bare_unknown_cop_name() {
+    // `AlignHash` was renamed to `Layout/HashAlignment`, so the short name no
+    // longer resolves — RuboCop reports it as an unknown cop.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_bare_unknown",
+        "# rubocop:disable AlignHash\nx = { a: 1 }\n# rubocop:enable AlignHash\n",
+    );
+
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unnecessary disabling of `AlignHash` (unknown cop)."
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_department_name_still_skipped() {
+    // A real department name stays conservative: nitrocop does not report
+    // department-level redundancy.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_department_name",
+        "# rubocop:disable Metrics\nx = 1\n# rubocop:enable Metrics\n",
+    );
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redundant_disable_malformed_bare_name_still_skipped() {
+    // `/BlockLength` is not a valid cop name; RuboCop ignores it silently and
+    // so must we — the leading `/` check runs on the raw text, before
+    // qualification would turn it into `Metrics/BlockLength`.
+    let (dir, diagnostics) = redundant_directives(
+        "redundant_disable_malformed_bare",
+        "# rubocop:disable /BlockLength, Metrics/\nx = 1\n# rubocop:enable /BlockLength, Metrics/\n",
+    );
+
+    assert_eq!(diagnostics.len(), 0, "got: {diagnostics:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}

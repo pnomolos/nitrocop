@@ -13,6 +13,48 @@ use crate::diagnostic::Severity;
 /// here. This struct exists so the cop name is registered and can be
 /// referenced in configuration (enabled/disabled/excluded).
 ///
+/// ## Fixed (2026-09-18): department-less directive names
+///
+/// `is_directive_redundant` skipped every name without a `/`, treating
+/// `# rubocop:disable LineLength` and `# rubocop:disable AlignHash` as
+/// department disables. RuboCop's `CommentConfig#analyze` runs each name
+/// through `Registry.qualified_cop_name` first, so:
+///   - a bare short name matching exactly one cop resolves (`LineLength` ->
+///     `Layout/LineLength`) and is checked — and *reported* — under that name;
+///   - a bare name matching nothing is an unknown cop (pre-0.50 names like
+///     `AlignHash`, `PredicateName`, `UselessComparison` are the corpus cases);
+///   - a bare name matching several cops makes RuboCop raise
+///     `AmbiguousCopName`, which aborts the file, so nitrocop must never flag;
+///   - a real department is expanded to its cops and reported as a
+///     `DEPARTMENT` offense, which nitrocop still declines to do.
+///
+/// The qualification already existed in `DisabledRanges` (the suppression key),
+/// it just was not exposed; `DisableDirective::qualified_name()` now is.
+/// The malformed-name guard (`/BlockLength`) has to run on the *raw* text,
+/// because qualification resolves its short name to `Metrics/BlockLength`.
+///
+/// ## Not fixed: include-gated cop cascade (~85% of remaining corpus FNs)
+///
+/// `Rails/CreateTableWithTimestamps`, `Rails/ThreeStateBooleanColumn`,
+/// `Rails/BulkChangeTable`, `Rails/ReversibleMigration`, `Rails/NotNullColumn`,
+/// `Rails/Output`, `Rake/*` and the rest of `compute_ig_cops.py`'s list carry
+/// cop-level `Include:` patterns that are *not* `**/`-prefixed. RuboCop
+/// resolves those relative to the config file's directory; the corpus oracle's
+/// main pass passes a config from a temp dir, so RuboCop never runs those cops
+/// and reports every one of their disable directives as redundant. nitrocop
+/// runs them (its `is_cop_match` is repo-relative), the directive is marked
+/// used, and this cop under-reports. The oracle papers over this for the cops
+/// themselves with a parallel include-gated pass
+/// (`bench/corpus/merge_include_gated.py`), but that pass does not cover
+/// `Lint/RedundantCopDisableDirective`, so the cascade lands here instead.
+/// Fixing it means either matching RuboCop's config-relative `Include`
+/// base_dir in `CopFilterSet` (see
+/// `docs/investigations/investigation-target-dir-relativization.md`) or
+/// extending the include-gated oracle pass to re-derive this cop. Both are
+/// outside this cop; do not "fix" it by ignoring include-gated cops when
+/// marking directives used — that would be wrong for real repos, where the
+/// config sits at the repo root and the cops do run.
+///
 /// ## Fixed (2026-09-18): Layout/LineLength self-suppression — 740 corpus FPs
 ///
 /// `Layout/LineLength` parsed `rubocop:disable` directives itself (a private
