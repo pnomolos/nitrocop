@@ -88,6 +88,21 @@ use crate::parse::source::SourceFile;
 ///   `BlockNode` whose parameters are `NumberedParametersNode` /
 ///   `ItParametersNode` must not break the walk (the same applies to
 ///   `disqualified_rhs?`'s `block_type?` test).
+/// * **`relevant_node?` is not an operator allow-list.** RuboCop's filter is
+///   "a `send` with a receiver, no dot, and a first argument", which also picks
+///   up `[]=` and user-defined operators. Two parser-gem shapes have to be
+///   subtracted instead of enumerated: `Builders::Default#match_op` emits
+///   `match_with_lvasgn` (never a `send`) whenever the left operand is a
+///   *static* regexp literal — `static_regexp_captures` returns an array, and
+///   an empty array is truthy, so this is every non-interpolated regexp, not
+///   just the named-capture ones; and `begin ... end while cond` is
+///   `while_post` / `until_post`, a type that is in neither
+///   `KEYWORD_ANCESTOR_TYPES` nor `UNALIGNED_RHS_TYPES` (Prism models it as a
+///   `WhileNode` / `UntilNode` carrying the begin-modifier flag).
+/// * **`SendNode#arguments` includes a block-pass argument.** Prism moves `&blk`
+///   out of the argument list into `CallNode#block` as a `BlockArgumentNode`, so
+///   `argument_in_method_call` misses `inputs.map &a >>\n  b` unless it is
+///   put back.
 /// * **Messages**: `used_indentation` is `rhs.column - indentation(lhs)` and
 ///   may be negative; `correct_indentation(node)` is the bare number (`Width`,
 ///   or `Width + Layout/IndentationWidth Width` for prefix keywords), not an
@@ -106,6 +121,18 @@ use crate::parse::source::SourceFile;
 /// RuboCop's filter is "a send with a receiver, no dot, and a first argument",
 /// which also covers `[]=` and any user-defined operator. Do not reintroduce
 /// them without corpus evidence.
+///
+/// ### Validation
+///
+/// 97 corpus repos cloned at their `bench/corpus/manifest.jsonl` SHAs — the 28
+/// carrying the oracle's default and `indented` examples plus the rest of the
+/// session's clone set as a regression guard — both tools run with
+/// oracle-identical invocation and diffed on `(path, line)` exactly as
+/// `bench/corpus/diff_results.py` does. On the 40-repo core subset the
+/// pre-change binary reproduced the oracle's default numbers exactly
+/// (19 FP / 39 FN, and per repo). After: default 0 FP / 0 FN over 3,591
+/// matches, `indented` 0 FP / 0 FN over 4,417 matches, and 0 message
+/// mismatches in either config.
 pub struct MultilineOperationIndentation;
 
 /// `correct_indentation` adds `Layout/IndentationWidth`'s `Width` on top of
@@ -405,6 +432,9 @@ impl OperationVisitor<'_, '_> {
                     });
                 }
             } else if let Some(while_node) = ancestor.as_while_node() {
+                if while_node.is_begin_modifier() {
+                    continue;
+                }
                 if Span::of(&while_node.predicate()).contains(span) {
                     return Some(KeywordNode {
                         keyword: "while".to_string(),
@@ -412,6 +442,9 @@ impl OperationVisitor<'_, '_> {
                     });
                 }
             } else if let Some(until_node) = ancestor.as_until_node() {
+                if until_node.is_begin_modifier() {
+                    continue;
+                }
                 if Span::of(&until_node.predicate()).contains(span) {
                     return Some(KeywordNode {
                         keyword: "until".to_string(),
@@ -578,13 +611,21 @@ fn disqualified_rhs(candidate: Span, ancestor: &ruby_prism::Node<'_>) -> bool {
 fn is_unaligned_rhs_type(node: &ruby_prism::Node<'_>) -> bool {
     if node.as_if_node().is_some()
         || node.as_unless_node().is_some()
-        || node.as_while_node().is_some()
-        || node.as_until_node().is_some()
         || node.as_for_node().is_some()
         || node.as_return_node().is_some()
         || node.as_array_node().is_some()
     {
         return true;
+    }
+    // `begin ... end while cond` is `while_post` / `until_post` in the parser
+    // gem, which is in neither `UNALIGNED_RHS_TYPES` nor
+    // `KEYWORD_ANCESTOR_TYPES`. Prism models it as a `WhileNode` / `UntilNode`
+    // carrying the begin-modifier flag.
+    if let Some(while_node) = node.as_while_node() {
+        return !while_node.is_begin_modifier();
+    }
+    if let Some(until_node) = node.as_until_node() {
+        return !until_node.is_begin_modifier();
     }
     // `kwbegin` is only a literal `begin ... end`. Prism also uses `BeginNode`
     // for a `def` or block body carrying `rescue` / `ensure`, which the parser
