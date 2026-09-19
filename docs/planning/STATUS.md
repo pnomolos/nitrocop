@@ -41,6 +41,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #12 ir: Expr compiler + evaluator (base #9, includes merge of np/predicate-resolution)
 - #14 ir: IrCopRunner + registry + `ir_cop_fixture_tests!` (base #12, includes merge of np/repetition); ~13 µs/file upper-bound overhead
 - #16 ir: first translated cop Style/TimeNow (base #14); engine fix: exact child arity for every sequence
+- #24 np: body/`(args)`/`rescue` mapping fidelity (base #13); 4 commits are cherry-picks from #19/#23 (already-applied on rebase), 2 new. **After merge, ir/* branches must re-run pilot fixture tests: body slots, parameterless blocks, keyword-less BeginNode, variable targets changed shape.**
 - #21 ir: user-cop discovery `.nitrocop/cops/**/*.cop.yml` + `AllCops.CustomCopPaths`, `(custom)` classification, fail-closed, cache key (base #16)
 - #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16)
 - #23 ir: pilot batch 2/2 (TallyMethod, SelectByKind, RedundantStructKeywordInit) (base #19). 7/8 landed; 8 engine additions incl. `_name` unification, `%TABLE` via `constants:`, `min_target_ruby:`, sibling access. Blocked on vocabulary: RSpec/MatchWithSimpleRegex (regex→string transform), Style/MapJoin (needs `.last_line` / loc-part line access in expressions)
@@ -74,7 +75,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - **ProjectIndexHelp** (5 new cops need a cross-file symbol index): build the index infra, or leave those 5 unimplemented.
 
 ## Merge order for the IR stream
-main ← #3 ← #4 ← #5 ← #7 ← #11 ← #13 (np) ; main ← #9 ← #12 (merges #7) ← #14 (merges #13) ← #16 ← pilot ; #15 (Python) on #12. Merging the np stack first flattens the merge commits in #12/#14.
+main ← #3 ← #4 ← #5 ← #7 ← #11 ← #13 ← #24 (np) ; main ← #9 ← #12 (merges #7) ← #14 (merges #13) ← #16 ← pilot ; #15 (Python) on #12. Merging the np stack first flattens the merge commits in #12/#14.
 
 ## Sequencing notes
 - After #2 merges: dispatch corpus oracle on main, then triage drift (W2). Three cops replicate RuboCop 1.84 crashes that upstream fixed: Layout/HashAlignment, Layout/IndentationWidth, Lint/LiteralAsCondition.
