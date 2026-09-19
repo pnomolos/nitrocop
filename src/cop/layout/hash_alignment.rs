@@ -141,6 +141,57 @@ use ruby_prism::Visit;
 ///     any inline explicit hash, including constant assignments and nested hash
 ///     values such as `locals: { user: ..., contributions: ... }`, causing the
 ///     large separator-style FN batch.
+///
+/// 13. **Clobber-abort threshold missed the separator's own width (FN, 2026-09-18):**
+///     `separator_style_correction_clobbers`'s newline-value branch predicted a
+///     corrector clobber whenever `key_delta > value_col + 1`, i.e. whenever the
+///     backward value-removal reached past the value line's indentation and the
+///     newline into the *previous* line at all. But that removal first consumes
+///     the previous line's own separator token (`:` = 1 char, `=>` = 2 chars)
+///     before it would reach into the key's own (independently edited) range --
+///     only then does it actually clobber. The off-by-one-ish threshold caused
+///     nitrocop to wrongly simulate a crash-and-abort for every pair past the
+///     first whose right-align key delta landed in that now-too-narrow window,
+///     silently dropping real offenses for the rest of the hash. Reproduced on
+///     `DamirSvrtan/fasterer` `lib/fasterer/offense.rb`'s `EXPLANATIONS` constant
+///     (18-pair hash with newline string values): nitrocop stopped after pair 14
+///     (`proc_call_vs_yield`), dropping 5 real offenses (`gsub_vs_tr` and later).
+///     Real RuboCop 1.84.2 does not crash on that file at all. Fixed by adding
+///     `+ operator_len` (1 for `:`, 2 for `=>`) to the threshold, matching where
+///     the removal range actually starts overlapping the key's own edit rather
+///     than just crossing the line boundary. Verified against the existing
+///     `emits_before_clobber` / `first_not_widest` / `first_value_newline_equal_key`
+///     fixtures (unchanged results) plus a new boundary case one character inside
+///     the old, wrong threshold.
+///
+/// 14. **Value-omission first pair silently skipped later pairs' value check
+///     (FN, 2026-09-18):** RuboCop's `Pair#value` for a Ruby 3.1 value-omission
+///     pair (`foo:`) is a synthesized node whose location equals the *key's* own
+///     location -- there's no separate value token in the source. When such a
+///     pair is `node.pairs.first` (the `separator`-style alignment reference),
+///     `SeparatorAlignment#value_delta` still calls `first_pair.value_delta`,
+///     which compares that synthesized column against each later pair's real
+///     value column -- almost always non-zero, so RuboCop keeps flagging later
+///     pairs even when their *keys* happen to align with the omitted first key.
+///     nitrocop stored `value_col: None` for an omission pair and skipped the
+///     comparison entirely whenever `first.value_col` was `None`, which silently
+///     accepted alignment (no offense) for every subsequent non-omission pair
+///     whose key length matched or exceeded the first pair's -- exactly the
+///     `{ foo:, bar: "x", baz: }`-shaped hash produced by Ruby's `def to_hash;
+///     { attr:, other: value, attr2: }; end` pattern. Reproduced across dozens of
+///     `antiwork/gumroad` `app/models/*_bank_account.rb` files and
+///     `Shopify/ruby-lsp` `test/fixtures/hash_literal_omitted_values.rb`. Only
+///     matters when `first` is the omission pair; a *non-first* omission pair
+///     was already handled correctly (RuboCop forces its own value delta to 0
+///     unconditionally, and nitrocop's `pair.value_col: None` already produced
+///     that skip). Fixed by introducing `first_pair_effective_value_col`, which
+///     returns the first pair's own key-start column when it is a value
+///     omission, and using it in both the colon/colon and rocket/rocket value
+///     comparisons. This is a distinct bug from the `rubocop_crashes_on_omission_pair`
+///     abort added for finding 9 above, which only fires when the *first
+///     non-omission* pair's key is strictly shorter than the omitted first key;
+///     equal-or-longer keys (as in the bank-account hashes) never triggered that
+///     abort and instead hit this value-comparison gap.
 pub struct HashAlignment;
 
 /// Which alignment style to use.
@@ -516,8 +567,19 @@ fn separator_style_correction_clobbers(first: &PairInfo, pair: &PairInfo) -> boo
         return !first.is_rocket && !pair.is_rocket && pair.key_char_len < first.key_char_len;
     }
 
+    // The corrector removes `key_delta` characters immediately before the value
+    // to shift it left. That removal walks backwards from the value's start:
+    // first through its own line's leading whitespace (`value_col` chars), then
+    // the newline, then (if it still needs more) into the *previous* line from
+    // its end, i.e. into `pair`'s own separator token (`:` is 1 char, `=>` is 2).
+    // Only once the removal reaches past the separator and into the key itself
+    // does it collide with the key's own (independent) insert-before edit and
+    // clobber. So the crash threshold is `value_col + 1 (newline) + operator_len`,
+    // not just `value_col + 1` -- the separator's width still absorbs some of the
+    // delta before any overlap occurs.
+    let operator_len: isize = if pair.is_rocket { 2 } else { 1 };
     let key_delta = first.key_end_col as isize - pair.key_end_col as isize;
-    key_delta > pair.value_col.unwrap_or(0) as isize + 1
+    key_delta > pair.value_col.unwrap_or(0) as isize + 1 + operator_len
 }
 
 /// RuboCop 1.84.2 crashes when checking a colon-style pair whose key is strictly shorter
@@ -647,6 +709,25 @@ fn has_bad_key_spacing(pair: &PairInfo) -> bool {
     false
 }
 
+/// RuboCop's `Pair#value` for a Ruby 3.1 value-omission pair (`foo:`) is a synthesized
+/// node whose location equals the *key's* location (there's no separate value token in
+/// the source). So when such a pair is used as the `first_pair` reference for a
+/// `separator`-style value-column comparison, its "value column" is really its own key's
+/// start column, not `None`. Using `None` (as a plain omitted-value pair would have) makes
+/// nitrocop silently skip the value check for every later pair instead of comparing against
+/// that synthesized column -- which is almost always different from a real value's column,
+/// so RuboCop still flags those later pairs. This only matters for `first`; a *non-first*
+/// omission pair still contributes a value delta of 0 unconditionally (RuboCop's
+/// `value_omission? ? 0 : ...`), which nitrocop already gets right because such a pair's own
+/// `value_col` is `None` and the comparison below is skipped for it.
+fn first_pair_effective_value_col(first: &PairInfo) -> Option<usize> {
+    if first.is_value_omission {
+        Some(first.col)
+    } else {
+        first.value_col
+    }
+}
+
 /// Check a hash under the "separator" alignment style.
 fn check_separator_style(source: &SourceFile, pairs: &[PairInfo]) -> Vec<AlignOffense> {
     let mut offenses = Vec::new();
@@ -697,7 +778,7 @@ fn check_separator_style(source: &SourceFile, pairs: &[PairInfo]) -> Vec<AlignOf
                 bad = true;
             }
             // Value should be aligned with first pair's value
-            if let (Some(fv), Some(pv)) = (first.value_col, pair.value_col) {
+            if let (Some(fv), Some(pv)) = (first_pair_effective_value_col(first), pair.value_col) {
                 if fv != pv {
                     bad = true;
                 }
@@ -708,7 +789,7 @@ fn check_separator_style(source: &SourceFile, pairs: &[PairInfo]) -> Vec<AlignOf
                 bad = true;
             }
             // Value should be aligned
-            if let (Some(fv), Some(pv)) = (first.value_col, pair.value_col) {
+            if let (Some(fv), Some(pv)) = (first_pair_effective_value_col(first), pair.value_col) {
                 if fv != pv {
                     bad = true;
                 }
@@ -1474,6 +1555,28 @@ mod tests {
             &HashAlignment,
             include_bytes!(
                 "../../../tests/fixtures/cops/layout/hash_alignment/always_ignore_separator_value_omission_first_pair_no_offense.rb"
+            ),
+            variant_config("separator", "separator", "always_ignore"),
+        );
+    }
+
+    #[test]
+    fn separator_always_ignore_value_omission_first_pair_offense_fixture() {
+        crate::testutil::assert_cop_offenses_full_with_config(
+            &HashAlignment,
+            include_bytes!(
+                "../../../tests/fixtures/cops/layout/hash_alignment/always_ignore_separator_value_omission_first_pair_offense.rb"
+            ),
+            variant_config("separator", "separator", "always_ignore"),
+        );
+    }
+
+    #[test]
+    fn separator_always_ignore_newline_value_absorbed_by_operator_offense_fixture() {
+        crate::testutil::assert_cop_offenses_full_with_config(
+            &HashAlignment,
+            include_bytes!(
+                "../../../tests/fixtures/cops/layout/hash_alignment/always_ignore_separator_newline_value_absorbed_by_operator_offense.rb"
             ),
             variant_config("separator", "separator", "always_ignore"),
         );
