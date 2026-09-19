@@ -50,6 +50,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #25 ir: ir_synth.py (Opus, schema-constrained to when/bind/offense) + ir_verify.py (8 hard gates incl. differential vs real RuboCop at two TargetRubyVersions, `-A` convergence, embedded_freshness) + CI job (base #23). Live TimeNow verify: PASS 8/8
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
+- #27 test: integration cache isolation (`default_args` no_cache, per-test temp cache dirs, no process-global env mutation) (base main)
 - #22 fix: Lint/UselessAssignment (base main) — VariableForce engine gains `RescueModifierNode` branch handling; two RuboCop quirks replicated (loop-shape structural equality, declaration-order chained-assignment suppression)
 - #20 fix: Layout/MultilineOperationIndentation (base main) — line-by-line port; 97-repo sample 19/39 → 0/0 (aligned), 49/173 → 0/0 (indented), zero message mismatches
 - #18 fix: Layout/RedundantLineBreak (base main) — 66-repo sample 41/81 → 0/4; residue is invalid-Ruby files Parser error-recovers and Prism does not (parse/discovery divergence, not cop logic); deleted ~560 lines of text-based backslash heuristics
@@ -60,7 +61,7 @@ Planning branch, not for upstream. Read this first when resuming.
 
 ## Cross-cutting findings
 - Review pass on #8/#22 found and fixed 5 defects (3 in `each_already_disabled` port: append-order adjacency, duplicate diagnostics, inline `N..N` adjacency; 2 in the loop-shape quirk: whitespace normalization broader than AST equality, op-assign reads). Pre-existing gaps noted on the PRs: short-name qualification is registry-wide not plugin-aware (9 ambiguous short names), department/`all` interactions in RCDD, `AllowCopDirectives` line length, `retry`-as-loop. Review of #17/#18/#20 in progress.
-- Test hygiene: `default_args()` in tests/integration.rs leaves the result cache on while other tests unset `NITROCOP_CACHE_DIR`; a failing run poisons `~/.cache/nitrocop`. Clear it before full runs; small fix PR pending.
+- Test hygiene: `default_args()` in tests/integration.rs leaves the result cache on while other tests unset `NITROCOP_CACHE_DIR`; a failing run poisons `~/.cache/nitrocop`. Fixed in #27.
 - Tab-indented files: `shared::util::indentation_of` counts spaces only; RuboCop's `indentation` uses `/\S/`. Bit three Layout cops (#17, #20, HashAlignment-adjacent). Audit in 07-tab-indentation-audit.md: fix `src/cop/shared/util.rs::indentation_of` in place (count `\t`), delete 5 cop-local reimplementations (pure dedup, corpus-neutral), then per-cop gated PRs for the 3 remaining spaces-only decision sites. **Do after #17/#20 merge** (they added local helpers that the dedup removes).
 - `gen_repo_config.py` writes to a fixed `/tmp/nitrocop_corpus_configs/corpus_config_<repo>.yml`; running `run_nitrocop.py` between generating a variant overlay and invoking RuboCop silently reverts the variant.
 - Local runs must be wrapped in `mise exec --` or `bundle info --path` plugin lookups fail silently and create phantom divergence.
