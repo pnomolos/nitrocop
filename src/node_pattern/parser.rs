@@ -490,17 +490,17 @@ mod tests {
         let ast = parser.parse().unwrap();
 
         match ast {
-            PatternNode::Capture { slot, inner } => match {
+            PatternNode::Capture { slot, inner } => {
                 assert_eq!(slot, 0);
-                *inner
-            } {
-                PatternNode::Alternatives(alts) => {
-                    assert_eq!(alts.len(), 2);
-                    assert!(matches!(&alts[0], PatternNode::SymbolLiteral(s) if s == "first"));
-                    assert!(matches!(&alts[1], PatternNode::SymbolLiteral(s) if s == "take"));
+                match *inner {
+                    PatternNode::Alternatives(alts) => {
+                        assert_eq!(alts.len(), 2);
+                        assert!(matches!(&alts[0], PatternNode::SymbolLiteral(s) if s == "first"));
+                        assert!(matches!(&alts[1], PatternNode::SymbolLiteral(s) if s == "take"));
+                    }
+                    _ => panic!("Expected Alternatives inside Capture"),
                 }
-                _ => panic!("Expected Alternatives inside Capture"),
-            },
+            }
             _ => panic!("Expected Capture"),
         }
     }

@@ -890,10 +890,6 @@ fn match_sequence<'pr>(
 mod tests {
     use super::*;
 
-    fn parse_ruby(source: &str) -> ruby_prism::ParseResult<'_> {
-        ruby_prism::parse(source.as_bytes())
-    }
-
     /// Helper: get first statement from parsed Ruby source.
     fn first_stmt<'a>(result: &'a ruby_prism::ParseResult<'a>) -> ruby_prism::Node<'a> {
         let root = result.node();
@@ -1020,6 +1016,277 @@ mod tests {
         let result_nil = ruby_prism::parse(source_nil);
         let node_nil = first_stmt(&result_nil);
         assert!(interpret_pattern("nil", &node_nil));
+    }
+
+    // ── Captures ──────────────────────────────────────────────────────────
+
+    /// Source text of a captured node, for readable assertions.
+    fn captured_src<'a>(captures: &'a Captures<'a>, slot: usize) -> &'a str {
+        let node = captures
+            .node(slot)
+            .unwrap_or_else(|| panic!("slot {slot} did not bind a node"));
+        std::str::from_utf8(node.location().as_slice()).unwrap()
+    }
+
+    fn captured_name<'a>(captures: &'a Captures<'a>, slot: usize) -> &'a str {
+        let bytes = captures
+            .name(slot)
+            .unwrap_or_else(|| panic!("slot {slot} did not bind a name"));
+        std::str::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn test_single_capture_binds_node() {
+        let result = ruby_prism::parse(b"obj.foo");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("$(send _ :foo)", &node).unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captured_src(&captures, 0), "obj.foo");
+
+        // A capture nested one level down binds the receiver instead.
+        let captures = match_with_captures("(send $_ :foo)", &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "obj");
+    }
+
+    #[test]
+    fn test_capture_binds_method_name_bytes() {
+        let result = ruby_prism::parse(b"obj.foo");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send _ $_)", &node).unwrap();
+        assert_eq!(captured_name(&captures, 0), "foo");
+        assert!(captures.node(0).is_none());
+    }
+
+    #[test]
+    fn test_capture_binds_absent_child() {
+        let result = ruby_prism::parse(b"require 'foo'");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send $nil? :require ...)", &node).unwrap();
+        assert!(captures[0].is_absent());
+    }
+
+    #[test]
+    fn test_multiple_captures_are_numbered_in_source_order() {
+        // Style/EvenOdd, verbatim from the pattern DB.
+        let pattern =
+            "(send {(send $_ :% (int 2)) (begin (send $_ :% (int 2)))} ${:== :!=} (int ${0 1}))";
+        let result = ruby_prism::parse(b"x % 2 == 0");
+        let node = first_stmt(&result);
+
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 3);
+
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "x");
+        assert_eq!(captured_name(&captures, 1), "==");
+        assert_eq!(captured_src(&captures, 2), "0");
+    }
+
+    #[test]
+    fn test_captures_inside_union_branches_share_slots() {
+        let pattern = "{(send $(send _ :rstrip) :lstrip) (send $(send _ :lstrip) :rstrip)}";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+
+        let first = ruby_prism::parse(b"s.rstrip.lstrip");
+        let node = first_stmt(&first);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "s.rstrip");
+
+        // The other branch writes the same slot.
+        let second = ruby_prism::parse(b"s.lstrip.rstrip");
+        let node = first_stmt(&second);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "s.lstrip");
+    }
+
+    #[test]
+    fn test_union_with_unbalanced_captures_does_not_compile() {
+        assert!(CompiledPattern::compile("{(send $_ :a) (send _ :b)}").is_none());
+        assert!(!interpret_pattern(
+            "{(send $_ :a) (send _ :b)}",
+            &first_stmt(&ruby_prism::parse(b"x.a"))
+        ));
+    }
+
+    #[test]
+    fn test_capture_is_unwound_when_a_union_branch_fails() {
+        // Branch 1 binds the receiver (`x.c`) before its method-name check
+        // fails; the winning branch must overwrite it with `x`.
+        let pattern = "{(send $_ :b) (send (send $_ :c) :d)}";
+        let result = ruby_prism::parse(b"x.c.d");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures(pattern, &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "x");
+    }
+
+    #[test]
+    fn test_capture_under_negation_never_survives() {
+        let result = ruby_prism::parse(b"x.a");
+        let node = first_stmt(&result);
+
+        // `!(send $_ :b)` succeeds because the inner pattern fails; the write
+        // the inner pattern made before failing must be rolled back.
+        let captures = match_with_captures("!(send $_ :b)", &node).unwrap();
+        assert_eq!(captures.len(), 1);
+        assert!(captures.get(0).is_none());
+    }
+
+    #[test]
+    fn test_capture_rest_binds_the_consumed_run() {
+        let result = ruby_prism::parse(b"foo(1, 2, 3)");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send nil? :foo $...)", &node).unwrap();
+        let run = captures[0].as_list().unwrap();
+        assert_eq!(run.len(), 3);
+
+        // An empty run still binds, as an empty list.
+        let empty = ruby_prism::parse(b"foo");
+        let node = first_stmt(&empty);
+        let captures = match_with_captures("(send nil? :foo $...)", &node).unwrap();
+        assert!(captures[0].as_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_capture_rest_backtracks_to_align_the_tail() {
+        // The rest must give back the children the trailing term needs, and
+        // the runs bound by the rejected splits must not leak.
+        let result = ruby_prism::parse(b"foo(1, 2, 3)");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send nil? :foo $... (int 3))", &node).unwrap();
+        let run = captures[0].as_list().unwrap();
+        let sources: Vec<&str> = run
+            .iter()
+            .map(|value| {
+                std::str::from_utf8(value.as_node().unwrap().location().as_slice()).unwrap()
+            })
+            .collect();
+        assert_eq!(sources, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_capture_after_rest() {
+        let result = ruby_prism::parse(b"foo(1, 2, 3)");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send nil? :foo ... $_)", &node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "3");
+    }
+
+    #[test]
+    fn test_rest_term_makes_sequence_arity_exact() {
+        let result = ruby_prism::parse(b"foo(1, 2, 3)");
+        let node = first_stmt(&result);
+
+        // `(int 1)` can only be the last child, which it is not.
+        assert!(!interpret_pattern("(send nil? :foo ... (int 1))", &node));
+        assert!(interpret_pattern("(send nil? :foo ... (int 3))", &node));
+    }
+
+    #[test]
+    fn test_captures_inside_union_and_rest_together() {
+        // Lint/SafeNavigationChain, verbatim from the pattern DB.
+        let pattern = "{(send $(csend ...) $_ ...) (send $(any_block (csend ...) ...) $_ ...)}";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 2);
+
+        let result = ruby_prism::parse(b"x&.foo.bar");
+        let node = first_stmt(&result);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captured_src(&captures, 0), "x&.foo");
+        assert_eq!(captured_name(&captures, 1), "bar");
+    }
+
+    #[test]
+    fn test_capture_of_symbol_and_string_values() {
+        let sym = ruby_prism::parse(b":foo");
+        let node = first_stmt(&sym);
+        let captures = match_with_captures("(sym $_)", &node).unwrap();
+        assert_eq!(captured_name(&captures, 0), "foo");
+
+        let string = ruby_prism::parse(b"'hello'");
+        let node = first_stmt(&string);
+        let captures = match_with_captures("(str $_)", &node).unwrap();
+        assert_eq!(captured_name(&captures, 0), "hello");
+    }
+
+    #[test]
+    fn test_no_captures_yields_empty_capture_set() {
+        let result = ruby_prism::parse(b"obj.foo");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures("(send _ :foo)", &node).unwrap();
+        assert!(captures.is_empty());
+        assert!(match_with_captures("(send _ :bar)", &node).is_none());
+    }
+
+    #[test]
+    fn test_pattern_db_capture_patterns_compile() {
+        use crate::node_pattern::pattern_db::PATTERNS;
+
+        let mut checked = 0;
+        for entry in PATTERNS {
+            if !entry.pattern.contains('$') {
+                continue;
+            }
+            checked += 1;
+            let compiled = CompiledPattern::compile(entry.pattern).unwrap_or_else(|| {
+                panic!("{} failed to compile: {}", entry.cop_name, entry.pattern)
+            });
+            assert!(
+                compiled.capture_count() > 0,
+                "{} has `$` but no capture slots",
+                entry.cop_name
+            );
+            // Union branches share slots, so the slot count never exceeds the
+            // number of `$` in the source pattern.
+            assert!(
+                compiled.capture_count() <= entry.pattern.matches('$').count(),
+                "{} allocated more slots than it has `$`",
+                entry.cop_name
+            );
+        }
+        assert!(
+            checked >= 10,
+            "expected several capture patterns, got {checked}"
+        );
+    }
+
+    #[test]
+    fn test_pattern_db_capture_counts() {
+        // Slot counts for real vendor patterns, checked against what RuboCop's
+        // compiler would allocate (union branches share a slot range).
+        for (pattern, expected) in [
+            // Style/Strip — one capture per branch, shared.
+            (
+                "{(call $(call _ :rstrip) :lstrip) (call $(call _ :lstrip) :rstrip)}",
+                1,
+            ),
+            // Lint/SafeNavigationChain — two per branch, shared.
+            (
+                "{(send $(csend ...) $_ ...) (send $(any_block (csend ...) ...) $_ ...)}",
+                2,
+            ),
+            // Style/EvenOdd — one inside the union, then two after it.
+            (
+                "(send {(send $_ :% (int 2)) (begin (send $_ :% (int 2)))} ${:== :!=} (int ${0 1}))",
+                3,
+            ),
+            // Performance/FlatMap — two shared inside the union, then two more.
+            (
+                "(call {$(block (call _ ${:collect :map}) ...) $(call _ ${:collect :map} (block_pass _))} ${:flatten :flatten!} $...)",
+                4,
+            ),
+        ] {
+            let compiled = CompiledPattern::compile(pattern).unwrap();
+            assert_eq!(compiled.capture_count(), expected, "pattern: {pattern}");
+        }
     }
 
     #[test]
