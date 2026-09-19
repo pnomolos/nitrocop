@@ -41,7 +41,8 @@ Planning branch, not for upstream. Read this first when resuming.
 - #14 ir: IrCopRunner + registry + `ir_cop_fixture_tests!` (base #12, includes merge of np/repetition); ~13 µs/file upper-bound overhead
 - #16 ir: first translated cop Style/TimeNow (base #14); engine fix: exact child arity for every sequence
 - #21 ir: user-cop discovery `.nitrocop/cops/**/*.cop.yml` + `AllCops.CustomCopPaths`, `(custom)` classification, fail-closed, cache key (base #16)
-- #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16); 2/2 in progress
+- #19 ir: pilot batch 1/2 (FileOpen, DataDefineOverride, RedundantMinMaxBy, PredicateWithKind) (base #16)
+- #23 ir: pilot batch 2/2 (TallyMethod, SelectByKind, RedundantStructKeywordInit) (base #19). 7/8 landed; 8 engine additions incl. `_name` unification, `%TABLE` via `constants:`, `min_target_ruby:`, sibling access. Blocked on vocabulary: RSpec/MatchWithSimpleRegex (regex→string transform), Style/MapJoin (needs `.last_line` / loc-part line access in expressions)
 - #15 ir: ir_extract.py / ir_classify.py / spec_to_fixture.py (base #12); pilot buckets A=2 B=10 C=11 (5 of C are ProjectIndexHelp)
 - #9 ir: schema + loader + `--validate-ir` (base main)
 - #22 fix: Lint/UselessAssignment (base main) — VariableForce engine gains `RescueModifierNode` branch handling; two RuboCop quirks replicated (loop-shape structural equality, declaration-order chained-assignment suppression)
@@ -56,6 +57,14 @@ Planning branch, not for upstream. Read this first when resuming.
 - Tab-indented files: `shared::util::indentation_of` counts spaces only; RuboCop's `indentation` uses `/\S/`. Bit three Layout cops (#17, #20, HashAlignment-adjacent). Each fix so far is cop-local; a shared audit of every `indentation_of` caller is pending.
 - `gen_repo_config.py` writes to a fixed `/tmp/nitrocop_corpus_configs/corpus_config_<repo>.yml`; running `run_nitrocop.py` between generating a variant overlay and invoking RuboCop silently reverts the variant.
 - Local runs must be wrapped in `mise exec --` or `bundle info --path` plugin lookups fail silently and create phantom divergence.
+
+## IR vocabulary gaps found by the pilot (design revisions)
+- Expressions cannot read loc parts (`node.loc.dot.line`) or `last_line`; anchors can. Fuse the vocabularies.
+- No string transforms (MatchWithSimpleRegex needs a Regexp::Parser-equivalent) — keep such cops in Rust.
+- `matchers:` compile in name order; a helper union named before its operands is unresolvable (RedundantStructKeywordInit). Consider two-pass declaration.
+- `constants:` needs a list-valued form; `in:` cannot take a `string_array` config value.
+- Extractor: merge `on_send`+`on_csend` into one hook, do not blanket `any_of` matchers, handle `%i[].to_set.freeze`, carry `Enabled`/`minimum_target_ruby_version`/department severity into the skeleton.
+- Verify: fixtures generated from real RuboCop JSON output are trustworthy; spec text is not (upstream spec asserted a wrong message once). Run differentials at default and 3.4 target Ruby; compare sets; check `-A` convergence, not single pass.
 
 ## Owner decisions needed
 - **Custom cop config location (PR #21 finding):** RuboCop 1.84 exits 2 on any unknown cop section (`Custom/Foo: {Enabled: true}`) in `.rubocop.yml`, but only warns on unknown `AllCops` params. Teams running both tools can carry `AllCops.CustomCopPaths` but cannot configure custom cops there. Options: (a) accept the limitation (documented in docs/CUSTOM_COPS.md), (b) add a nitrocop-only overlay file (`.nitrocop.yml`, contrary to upstream PLAN.md's initial stance), (c) per-cop config inside the `.cop.yml` document itself. Recommendation: (b) as a thin overlay merged after `.rubocop.yml`.
