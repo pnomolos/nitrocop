@@ -2,6 +2,16 @@
 
 Planning branch, not for upstream. Read this first when resuming.
 
+## Resume here (2026-09-19, end of session 1)
+Session 1 opened 29 PRs, none merged. Suggested merge order (each step keeps CI green):
+1. #1 (ci), #27 (test hygiene) — independent, tiny.
+2. Parity fixes on main: #8, #10, #17, #18, #20, #22 — independent of each other; review comments/fixes already pushed. Then dispatch `corpus-oracle.yml` on main (`gh workflow run corpus-oracle.yml -R pnomolos/nitrocop -r main`) to confirm the six cops.
+3. np stack in order: #3 → #4 → #5 → #7 → #11 → #13 → #24.
+4. Bump stack: #2 → #6 → #28, #29. Then dispatch the oracle again; expect drift across the 280 changed cops (05-vendor-bump-scope.md) — that is W2 round 2, prioritized by 05-rubocop-existing-cop-changes.tsv.
+5. IR stack: #9 → #12 → #14 → #16 → #19 → #23 → #26; #21 and #15 → #25 alongside. After #24 merges, re-run `cargo test --release --lib -- cop::ir` on the IR stack (body-slot shapes changed).
+6. W7 follow-ups (see table) each as its own gated PR.
+Worktrees on this machine: nitrocop-wt-{np1,bump,w2,w2b,ir,py,py2,disc,newcops,newcops2,hyg,review}. Budget gate: `~/.claude/hooks/usage_check.sh 80`.
+
 ## Goals
 1. Parity with RuboCop core. 2. Parity with common plugins. 3. Translation layer (RuboCop cop -> nitrocop IR). 4. Runtime user-extension format on the same IR.
 
@@ -26,7 +36,7 @@ Planning branch, not for upstream. Read this first when resuming.
 | W3 | Cop IR design (docs/planning/04-cop-ir-design.md) | drafted, awaiting owner review |
 | W4 | node_pattern completion PRs | done: #3 → #4 → #5 → #7 → #11 → #13 (752/991 vendored patterns resolve on builtins; 991/991 parse) |
 | W5 | #9 schema+loader open; Expr compiler/evaluator in progress (branch ir/expr, includes merge of np/predicate-resolution); #14 IrCop + #16 TimeNow open; 8-cop pilot batch in progress (branch ir/pilot-batch); #21 discovery open | in progress |
-| W8 | Hand-written Rust cops for the 9 bucket-C 1.91 cops (non-index): #28 batch 1 open; batch 2 (MisplacedMagicComment, DirectiveScope, PartitionInsteadOfDoubleSelect, ReduceToHash) in progress (branch cops/rubocop-1.91-batch-2, base #6) | in progress |
+| W8 | Hand-written Rust cops for the 9 bucket-C 1.91 cops (non-index): #28 + #29 open. 18 of 23 new 1.91 cops now have implementations (9 IR, 9 Rust); the 5 remaining need rubydex (see decision) | PRs open |
 | W7 | Post-merge follow-ups (from reviews): `Layout/IndentationWidth: Width` not read by MultilineMethodCallIndentation/MultilineOperationIndentation (hardcoded 2; inject like `MaxLineLength` in src/config/mod.rs ~L2361); RedundantLineBreak `InspectBlocks: true` over-reports multi-statement blocks (365 FP on puppet; Prism StatementsNode vs implicit `begin`), ignores `Layout/LineLength: Enabled: false` (dead `LineLengthEnabled` flag), missing `end_with_percent_blank_string?` guard; safe-navigation alignment base measured at `.` not `&`; `.()` proc call message; plugin-aware short-name qualification in RCDD; invalid-Ruby files (Parser error-recovers, Prism does not) are a shared residual FN source across Layout cops; shared tab-aware `indentation_of` + dedup; `Severity:` config parity; HashAlignment 1.91 semantics; MethodCallWithArgsParentheses omit_parentheses reparse rule | blocked on merges |
 | W6 | ir_extract.py / ir_classify.py / spec_to_fixture.py #15, #25 open. Pipeline complete; humans still needed for: wiring into embedded.rs, capture naming, semantic review of synthesized guards, spec fixture gaps, corpus gate | done (v1) |
 
@@ -36,6 +46,7 @@ Planning branch, not for upstream. Read this first when resuming.
 - #5 np: `#helper(args)`/`%param` lexing + builtin predicate registry (base #4)
 - #7 np: `#helper`/`pred?`/`%param` resolution (base #5); 747/991 vendored patterns resolve on builtins alone
 - #8 fix: Lint/RedundantCopDisableDirective (base main) — sample FP 437→3, FN 121→111; remaining FN is cluster 4 below
+- #29 cops: rubocop 1.91 batch 2 — Lint/MisplacedMagicComment, Style/DirectiveScope, Style/PartitionInsteadOfDoubleSelect, Style/ReduceToHash (base #6, sibling of #28; trivial register_all/count conflicts). Gaps: no shared magic-comment parser; src/parse/directives.rs lacks `disable-next`/`push`/`pop`/signed args (DirectiveScope carries its own port); no structural AST equality helper
 - #28 cops: rubocop 1.91 batch 1 — Lint/UnreachablePatternBranch, RSpec/DiscardedMatcher, RSpec/MatchWithSimpleRegex, Style/SelectByRange, Style/OneClassPerFile (base #6); differential-fuzzed vs RuboCop 1.91.0 (0 FP/0 FN); corpus gate pending until #6 merges
 - #6 vendor: 8 new cop config options (base #2), makes the bump stack green
 - #11 np: walker ancestor stack, `^`/`` ` ``/`%0`, ancestor predicates (base #7)
