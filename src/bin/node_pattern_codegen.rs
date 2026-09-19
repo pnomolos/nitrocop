@@ -307,6 +307,14 @@ impl CodeGenerator {
                     pattern_summary(&PatternNode::Subsequence(items.clone()))
                 ));
             }
+            PatternNode::AnyOrder(items) => {
+                // `<a b ...>` needs an assignment search over the children; the
+                // straight-line generator cannot express it.
+                self.writeln(&format!(
+                    "// TODO: any-order group: {}",
+                    pattern_summary(&PatternNode::AnyOrder(items.clone()))
+                ));
+            }
         }
     }
 

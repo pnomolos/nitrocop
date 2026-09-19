@@ -21,6 +21,14 @@ pub enum PatternNode {
     Subsequence(Vec<PatternNode>),
     /// [a b c]
     Conjunction(Vec<PatternNode>),
+    /// `<a b ...>` — an any-order group: every term must match a distinct
+    /// child, in any order, and a trailing `...` soaks up the rest.
+    ///
+    /// The vector mirrors RuboCop's `AnyOrder` node children
+    /// (`node_pattern/node.rb:179-201`): the trailing rest term, when present,
+    /// is the last element, so arity is `children.len()` without a rest and
+    /// `(children.len() - 1)..∞` with one.
+    AnyOrder(Vec<PatternNode>),
     /// `$pattern` — binds the matched value to a numbered capture slot.
     ///
     /// Slots are allocated by the parser in `$`-occurrence order (pre-order,
@@ -83,7 +91,29 @@ pub enum PatternError {
         /// Captures declared by the offending branch.
         found: usize,
     },
+    /// A `<>` any-order group put `...` anywhere but last.
+    ///
+    /// The grammar is `'<' node_pattern_list opt_rest '>'` (`parser.y:48`), so
+    /// at most one rest term and only in final position.
+    AnyOrderRestNotLast,
+    /// A `<>` any-order group declared more terms than the matcher will
+    /// search over.
+    ///
+    /// Matching `<>` is an assignment problem: the interpreter backtracks over
+    /// child-to-term assignments, which is worst-case factorial in the number
+    /// of terms. Every `<>` pattern in the vendored cop set has at most four
+    /// terms, so patterns above [`ANY_ORDER_MAX_TERMS`] are rejected at compile
+    /// time rather than risking a blow-up at match time.
+    AnyOrderTooManyTerms {
+        /// Non-rest terms the group declared.
+        found: usize,
+        /// The supported maximum, [`ANY_ORDER_MAX_TERMS`].
+        max: usize,
+    },
 }
+
+/// Maximum number of non-rest terms a `<>` any-order group may declare.
+pub const ANY_ORDER_MAX_TERMS: usize = 8;
 
 impl std::fmt::Display for PatternError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +121,13 @@ impl std::fmt::Display for PatternError {
             PatternError::UnbalancedUnionCaptures { expected, found } => write!(
                 f,
                 "each branch of {{}} must have the same number of captures (expected {expected}, found {found})"
+            ),
+            PatternError::AnyOrderRestNotLast => {
+                write!(f, "`...` is only allowed as the last term of a <> group")
+            }
+            PatternError::AnyOrderTooManyTerms { found, max } => write!(
+                f,
+                "<> any-order group has {found} terms, more than the supported maximum of {max}"
             ),
         }
     }
@@ -168,6 +205,7 @@ impl Parser {
             Token::LParen => self.parse_sequence(),
             Token::LBrace => self.parse_alternatives(),
             Token::LBracket => self.parse_conjunction(),
+            Token::LAngle => self.parse_any_order(),
             Token::Capture => {
                 self.advance();
                 // RuboCop allocates the slot before compiling the captured
@@ -391,6 +429,50 @@ impl Parser {
         Some(PatternNode::Alternatives(alts))
     }
 
+    /// Parse `<a b ...>` (grammar: `opt_capture '<' node_pattern_list opt_rest '>'`,
+    /// `parser.y:48-55`).
+    ///
+    /// An enclosing `$` is handled by [`Parser::parse_node`]'s capture arm, so
+    /// the group's own slot is allocated before its terms' — matching
+    /// `emit_capture`, which takes its storage slot before compiling the
+    /// wrapped list (`compiler/sequence_subcompiler.rb:155-162`).
+    fn parse_any_order(&mut self) -> Option<PatternNode> {
+        self.expect(&Token::LAngle);
+
+        let mut children = Vec::new();
+        while self.peek().is_some() && self.peek() != Some(&Token::RAngle) {
+            let node = self.parse_node()?;
+            children.push(node);
+        }
+        if !self.expect(&Token::RAngle) {
+            return None;
+        }
+
+        // `node_pattern_list opt_rest`: a rest term is only legal last.
+        let rest_positions: Vec<usize> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| is_rest_term(child))
+            .map(|(i, _)| i)
+            .collect();
+        if rest_positions.len() > 1 || rest_positions.iter().any(|i| *i + 1 != children.len()) {
+            self.error.get_or_insert(PatternError::AnyOrderRestNotLast);
+            return None;
+        }
+
+        let terms = children.len() - rest_positions.len();
+        if terms > ANY_ORDER_MAX_TERMS {
+            self.error
+                .get_or_insert(PatternError::AnyOrderTooManyTerms {
+                    found: terms,
+                    max: ANY_ORDER_MAX_TERMS,
+                });
+            return None;
+        }
+
+        Some(PatternNode::AnyOrder(children))
+    }
+
     fn parse_conjunction(&mut self) -> Option<PatternNode> {
         self.expect(&Token::LBracket);
         let mut items = Vec::new();
@@ -405,6 +487,15 @@ impl Parser {
 
         self.expect(&Token::RBracket);
         Some(PatternNode::Conjunction(items))
+    }
+}
+
+/// Whether `node` is `...` or `$...`.
+fn is_rest_term(node: &PatternNode) -> bool {
+    match node {
+        PatternNode::Rest => true,
+        PatternNode::Capture { inner, .. } => matches!(**inner, PatternNode::Rest),
+        _ => false,
     }
 }
 
@@ -424,7 +515,8 @@ fn shift_capture_slots(node: &mut PatternNode, delta: usize) {
         }
         PatternNode::Alternatives(items)
         | PatternNode::Conjunction(items)
-        | PatternNode::Subsequence(items) => {
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => {
             for item in items {
                 shift_capture_slots(item, delta);
             }
@@ -464,6 +556,10 @@ pub fn pattern_summary(node: &PatternNode) -> String {
         PatternNode::Conjunction(items) => {
             let inner: Vec<String> = items.iter().map(pattern_summary).collect();
             format!("[{}]", inner.join(" "))
+        }
+        PatternNode::AnyOrder(items) => {
+            let inner: Vec<String> = items.iter().map(pattern_summary).collect();
+            format!("<{}>", inner.join(" "))
         }
         PatternNode::Subsequence(items) => {
             let inner: Vec<String> = items.iter().map(pattern_summary).collect();

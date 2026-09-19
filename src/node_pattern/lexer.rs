@@ -28,6 +28,8 @@ pub enum Token {
     ParamRef(String),      // %1, %param
     Caret,                 // ^ (parent node ref)
     Backtick,              // ` (descend operator)
+    LAngle,                // < (any-order group)
+    RAngle,                // > (any-order group)
 }
 
 pub struct Lexer<'a> {
@@ -143,6 +145,14 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     tokens.push(Token::Backtick);
                 }
+                b'<' => {
+                    self.advance();
+                    tokens.push(Token::LAngle);
+                }
+                b'>' => {
+                    self.advance();
+                    tokens.push(Token::RAngle);
+                }
                 b'!' => {
                     self.advance();
                     tokens.push(Token::Negation);
@@ -166,7 +176,18 @@ impl<'a> Lexer<'a> {
                     // that runs to end of line (`lexer.rex`: `/\#(CALL)/` is
                     // tried before `/\#.*/`).
                     if self.peek().is_some_and(Self::is_call_start) {
-                        let name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        let mut name = self.read_while(|c| Self::is_ident_char(c) || c == b'?');
+                        // `CALL` in `lexer.rex` is `(?:CONST_NAME\.)?IDENTIFIER[!?]?`,
+                        // so `#Examples.all` is a single function-call token.
+                        if name.starts_with(|c: char| c.is_ascii_uppercase())
+                            && self.peek() == Some(b'.')
+                        {
+                            self.advance();
+                            name.push('.');
+                            name.push_str(
+                                &self.read_while(|c| Self::is_ident_char(c) || c == b'?'),
+                            );
+                        }
                         tokens.push(Token::HelperCall(name));
                     } else if self.peek() == Some(b'{') {
                         // Ruby string interpolation left in a pattern extracted
@@ -438,6 +459,62 @@ mod tests {
         let tokens = lexer.tokenize();
         assert_eq!(tokens.iter().filter(|t| **t == Token::LParen).count(), 2);
         assert_eq!(tokens.last(), Some(&Token::RBrace));
+    }
+
+    #[test]
+    fn test_lexer_any_order() {
+        let mut lexer = Lexer::new("<(sym :a) ...>");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0], Token::LAngle);
+        assert_eq!(tokens[1], Token::LParen);
+        assert_eq!(tokens[tokens.len() - 2], Token::Rest);
+        assert_eq!(tokens[tokens.len() - 1], Token::RAngle);
+    }
+
+    #[test]
+    fn test_lexer_captured_any_order() {
+        let mut lexer = Lexer::new("$<int str>");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::Capture,
+                Token::LAngle,
+                Token::Ident("int".to_string()),
+                Token::Ident("str".to_string()),
+                Token::RAngle,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_operator_symbols_are_not_angle_brackets() {
+        let mut lexer = Lexer::new("{:< :> :<=> :<<}");
+        let tokens = lexer.tokenize();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LBrace,
+                Token::SymbolLiteral("<".to_string()),
+                Token::SymbolLiteral(">".to_string()),
+                Token::SymbolLiteral("<=>".to_string()),
+                Token::SymbolLiteral("<<".to_string()),
+                Token::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lexer_const_qualified_function_call() {
+        let mut lexer = Lexer::new("{#ExampleGroups.all #Examples.all}");
+        assert_eq!(
+            lexer.tokenize(),
+            vec![
+                Token::LBrace,
+                Token::HelperCall("ExampleGroups.all".to_string()),
+                Token::HelperCall("Examples.all".to_string()),
+                Token::RBrace,
+            ]
+        );
     }
 
     #[test]

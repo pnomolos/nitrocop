@@ -8,7 +8,15 @@
 //!
 //! NodeMatch, Wildcard, Rest, NilPredicate, SymbolLiteral, IntLiteral,
 //! StringLiteral, TrueLiteral, FalseLiteral, NilLiteral, Alternatives,
-//! Conjunction, Negation, Capture, TypePredicate, Ident.
+//! Subsequence, AnyOrder, Conjunction, Negation, Capture, TypePredicate, Ident.
+//!
+//! ## Any-order groups
+//!
+//! `<a b ...>` matches when every term matches a distinct child, in any order.
+//! The matcher backtracks over child-to-term assignments (see
+//! [`assign_any_order`]) where RuboCop compiles a greedy first-fit loop; the
+//! parser caps a group at `ANY_ORDER_MAX_TERMS` non-rest terms so the search
+//! cannot blow up.
 //!
 //! ## Captures
 //!
@@ -21,8 +29,6 @@
 //! Known divergences from RuboCop's compiler, in addition to the stubs below:
 //!
 //! - `(int $_)` / `(float $_)` bind the literal node, not the numeric value.
-//! - `{a b | c}` does not build a subsequence for the multi-term group, so each
-//!   term is treated as its own branch (`builder.rb:57-68`).
 //! - A pattern list without `...` still tolerates extra trailing children,
 //!   which RuboCop rejects on arity; with `...` present the arity is exact.
 //!
@@ -161,6 +167,9 @@ fn parser_type_for_node(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
         ruby_prism::Node::BeginNode { .. } => Some("begin"),
         ruby_prism::Node::AssocNode { .. } => Some("pair"),
         ruby_prism::Node::HashNode { .. } => Some("hash"),
+        // `foo(k: 1)` is a `KeywordHashNode` in Prism and a plain `hash` in the
+        // Parser gem.
+        ruby_prism::Node::KeywordHashNode { .. } => Some("hash"),
         ruby_prism::Node::LocalVariableReadNode { .. } => Some("lvar"),
         ruby_prism::Node::InstanceVariableReadNode { .. } => Some("ivar"),
         ruby_prism::Node::ClassVariableReadNode { .. } => Some("cvar"),
@@ -304,9 +313,16 @@ fn get_children<'pr>(
             children.push(MatchChild::Node(assoc.value()));
         }
         "hash" => {
-            let hash = node.as_hash_node()?;
-            for elem in hash.elements().iter() {
-                children.push(MatchChild::Node(elem));
+            if let Some(hash) = node.as_hash_node() {
+                for elem in hash.elements().iter() {
+                    children.push(MatchChild::Node(elem));
+                }
+            } else if let Some(kw) = node.as_keyword_hash_node() {
+                for elem in kw.elements().iter() {
+                    children.push(MatchChild::Node(elem));
+                }
+            } else {
+                return None;
             }
         }
         "lvar" => {
@@ -711,6 +727,11 @@ fn matches_node<'pr>(
         // where `match_sequence` splices it; anywhere else it matches nothing.
         PatternNode::Subsequence(_) => false,
 
+        // Likewise `<>`: it consumes a run of children, so it is only
+        // meaningful as a term of a child list (RuboCop forbids it in sequence
+        // head position too — `ForbidInSeqHead`, `node.rb:179`).
+        PatternNode::AnyOrder(_) => false,
+
         PatternNode::Rest => true,
     }
 }
@@ -839,7 +860,8 @@ fn as_rest_term(pattern: &PatternNode) -> Option<Option<usize>> {
 /// (RuboCop's `Node#variadic?`).
 fn is_variadic_term(pattern: &PatternNode) -> bool {
     match pattern {
-        PatternNode::Subsequence(_) => true,
+        PatternNode::Subsequence(_) | PatternNode::AnyOrder(_) => true,
+        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => true,
         PatternNode::Alternatives(alts) => alts.iter().any(is_variadic_term),
         _ => as_rest_term(pattern).is_some(),
     }
@@ -848,11 +870,146 @@ fn is_variadic_term(pattern: &PatternNode) -> bool {
 /// Whether a term can consume an unbounded number of children.
 fn contains_rest(pattern: &PatternNode) -> bool {
     match pattern {
-        PatternNode::Alternatives(items) | PatternNode::Subsequence(items) => {
-            items.iter().any(contains_rest)
+        PatternNode::Alternatives(items)
+        | PatternNode::Subsequence(items)
+        | PatternNode::AnyOrder(items) => items.iter().any(contains_rest),
+        // `$<a ...>` is unbounded exactly when the group it wraps is.
+        PatternNode::Capture { inner, .. } if matches!(**inner, PatternNode::AnyOrder(_)) => {
+            contains_rest(inner)
         }
         _ => as_rest_term(pattern).is_some(),
     }
+}
+
+/// `Some((capture_slot, children))` if `pattern` is a `<>` any-order group,
+/// optionally wrapped in a `$`.
+fn as_any_order_term(pattern: &PatternNode) -> Option<(Option<usize>, &[PatternNode])> {
+    match pattern {
+        PatternNode::AnyOrder(items) => Some((None, items.as_slice())),
+        PatternNode::Capture { slot, inner } => match &**inner {
+            PatternNode::AnyOrder(items) => Some((Some(*slot), items.as_slice())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Split an any-order group's children into its terms and its trailing rest
+/// (`term_nodes` / `rest_node`, `node.rb:184-196`).
+fn split_any_order(items: &[PatternNode]) -> (&[PatternNode], Option<Option<usize>>) {
+    match items.last().and_then(as_rest_term) {
+        Some(slot) => (&items[..items.len() - 1], Some(slot)),
+        None => (items, None),
+    }
+}
+
+/// Assign `actuals` to `terms` so that every term matches a distinct child.
+///
+/// Children are walked in order; each is tried against every still-unused term
+/// and, when the group has a trailing rest, against the rest bucket. This is a
+/// full backtracking search, where RuboCop compiles a greedy first-fit loop
+/// (`sequence_subcompiler.rb:88-107`): the search accepts every assignment
+/// first-fit accepts plus a few first-fit rejects (`<_ int>` against `(1 :a)`,
+/// where the wildcard has to give up the integer). The divergence needs two
+/// terms that can match the same child *and* an order that defeats first-fit;
+/// no vendored `<>` pattern is in that shape.
+fn assign_any_order<'pr>(
+    terms: &[PatternNode],
+    actuals: &[MatchChild<'pr>],
+    index: usize,
+    used: &mut [bool],
+    leftovers: &mut Vec<usize>,
+    has_rest: bool,
+    env: &mut MatchEnv<'pr>,
+) -> bool {
+    if index == actuals.len() {
+        return used.iter().all(|matched| *matched);
+    }
+    // Every remaining term still needs a child of its own.
+    let unused = used.iter().filter(|matched| !**matched).count();
+    if actuals.len() - index < unused {
+        return false;
+    }
+
+    for (slot, term) in terms.iter().enumerate() {
+        if used[slot] {
+            continue;
+        }
+        let mark = env.mark();
+        used[slot] = true;
+        if matches_child(term, &actuals[index], env)
+            && assign_any_order(terms, actuals, index + 1, used, leftovers, has_rest, env)
+        {
+            return true;
+        }
+        used[slot] = false;
+        env.rollback(mark);
+    }
+
+    if has_rest {
+        leftovers.push(index);
+        if assign_any_order(terms, actuals, index + 1, used, leftovers, has_rest, env) {
+            return true;
+        }
+        leftovers.pop();
+    }
+    false
+}
+
+/// Match a `<>` group against the head of `actuals`, then the rest of the
+/// sequence against what is left.
+fn match_any_order<'pr>(
+    group_slot: Option<usize>,
+    items: &[PatternNode],
+    rest_terms: &[&PatternNode],
+    actuals: &[MatchChild<'pr>],
+    env: &mut MatchEnv<'pr>,
+    exact: bool,
+) -> bool {
+    let (terms, rest) = split_any_order(items);
+    let has_rest = rest.is_some();
+    // Arity: exactly `terms.len()` children without a rest, `terms.len()..∞`
+    // with one (`node.rb:197-201`).
+    let max_take = if has_rest { actuals.len() } else { terms.len() };
+
+    for take in terms.len()..=max_take {
+        if take > actuals.len() {
+            break;
+        }
+        let mark = env.mark();
+        let mut used = vec![false; terms.len()];
+        let mut leftovers = Vec::new();
+        if assign_any_order(
+            terms,
+            &actuals[..take],
+            0,
+            &mut used,
+            &mut leftovers,
+            has_rest,
+            env,
+        ) {
+            if let Some(Some(slot)) = rest {
+                // A captured rest accumulates the children that matched no
+                // term, in child order (`sequence_subcompiler.rb:141-152`).
+                let run = leftovers
+                    .iter()
+                    .map(|i| capture_value_for(&actuals[*i]))
+                    .collect();
+                env.set(slot, CaptureValue::List(run));
+            }
+            if let Some(slot) = group_slot {
+                // `$<...>` binds the whole run the group consumed
+                // (`visit_capture`, `sequence_subcompiler.rb:155-162`).
+                let run = actuals[..take].iter().map(capture_value_for).collect();
+                env.set(slot, CaptureValue::List(run));
+            }
+            if match_sequence(rest_terms, &actuals[take..], env, exact) {
+                return true;
+            }
+        }
+        env.rollback(mark);
+    }
+    false
 }
 
 /// Match a list of pattern children against a list of actual children.
@@ -906,6 +1063,10 @@ fn match_sequence<'pr>(
             env.rollback(mark);
         }
         return false;
+    }
+
+    if let Some((group_slot, items)) = as_any_order_term(term) {
+        return match_any_order(group_slot, items, rest_terms, actuals, env, exact);
     }
 
     if let Some(capture_slot) = as_rest_term(term) {
@@ -1570,5 +1731,197 @@ mod tests {
         let pat = "{(send _ :foo) (csend _ :foo)}";
         assert!(interpret_pattern(pat, &node_send));
         assert!(interpret_pattern(pat, &node_csend));
+    }
+
+    // ── `<>` any-order groups ─────────────────────────────────────────────
+
+    #[test]
+    fn test_any_order_matches_in_either_order() {
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        for source in [b"foo(:a, 'b')".as_slice(), b"foo('b', :a)".as_slice()] {
+            let result = ruby_prism::parse(source);
+            let node = first_stmt(&result);
+            assert!(
+                interpret_pattern(pattern, &node),
+                "{} should match",
+                String::from_utf8_lossy(source)
+            );
+        }
+    }
+
+    #[test]
+    fn test_any_order_requires_every_term() {
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        // Missing the string element.
+        let result = ruby_prism::parse(b"foo(:a, :b)");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_without_rest_has_exact_arity() {
+        // Without a trailing `...` the group consumes exactly as many children
+        // as it has terms, so an extra child inside its run is fatal. (An extra
+        // child *after* it is still tolerated by the pre-existing child-list
+        // permissiveness documented in the module header.)
+        let pattern = "(send nil? :foo <(sym _) (str _)>)";
+        let result = ruby_prism::parse(b"foo(1, :a, 'b')");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_with_rest_absorbs_extra_children() {
+        let pattern = "(send nil? :foo <(sym _) ...>)";
+        let result = ruby_prism::parse(b"foo(1, 'b', :a, 2)");
+        let node = first_stmt(&result);
+        assert!(interpret_pattern(pattern, &node));
+
+        // Still requires the term itself.
+        let result = ruby_prism::parse(b"foo(1, 'b', 2)");
+        let node = first_stmt(&result);
+        assert!(!interpret_pattern(pattern, &node));
+    }
+
+    #[test]
+    fn test_any_order_captured_rest_collects_unmatched_children() {
+        let pattern = "(send nil? :foo <(sym _) $...>)";
+        let result = ruby_prism::parse(b"foo(1, :a, 'b')");
+        let node = first_stmt(&result);
+
+        let captures = match_with_captures(pattern, &node).unwrap();
+        let run = captures[0].as_list().expect("rest binds a list");
+        assert_eq!(run.len(), 2);
+        let texts: Vec<&str> = run
+            .iter()
+            .map(|value| {
+                std::str::from_utf8(value.as_node().unwrap().location().as_slice()).unwrap()
+            })
+            .collect();
+        assert_eq!(texts, vec!["1", "'b'"]);
+    }
+
+    #[test]
+    fn test_captured_any_order_binds_whole_run() {
+        let pattern = "(send nil? :foo $<(sym _) (str _)>)";
+        let result = ruby_prism::parse(b"foo('b', :a)");
+        let node = first_stmt(&result);
+
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+        let captures = compiled.match_captures(&node).unwrap();
+        let run = captures[0].as_list().expect("group binds a list");
+        assert_eq!(run.len(), 2);
+    }
+
+    #[test]
+    fn test_any_order_capture_slots_are_numbered_outside_in() {
+        // The `$` on the group takes the lower slot, then the inner `$`.
+        let compiled = CompiledPattern::compile("(send nil? :foo $<(sym $_) ...>)").unwrap();
+        assert_eq!(compiled.capture_count(), 2);
+
+        let result = ruby_prism::parse(b"foo(1, :a)");
+        let node = first_stmt(&result);
+        let captures = compiled.match_captures(&node).unwrap();
+        assert_eq!(captures[0].as_list().unwrap().len(), 2);
+        assert_eq!(captured_name(&captures, 1), "a");
+    }
+
+    #[test]
+    fn test_any_order_inside_union_branch() {
+        // Both branches declare one capture, as RuboCop requires.
+        let pattern = "(send nil? :foo {<(sym $_) ...> (hash <(pair (sym $_) true) ...>)})";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+
+        let result = ruby_prism::parse(b"foo(1, :skip)");
+        let node = first_stmt(&result);
+        assert_eq!(
+            captured_name(&compiled.match_captures(&node).unwrap(), 0),
+            "skip"
+        );
+
+        let result = ruby_prism::parse(b"foo(a: 1, skip: true)");
+        let node = first_stmt(&result);
+        assert_eq!(
+            captured_name(&compiled.match_captures(&node).unwrap(), 0),
+            "skip"
+        );
+
+        let result = ruby_prism::parse(b"foo(a: 1, skip: false)");
+        let node = first_stmt(&result);
+        assert!(compiled.match_captures(&node).is_none());
+    }
+
+    #[test]
+    fn test_vendor_pending_without_reason_pattern() {
+        // rubocop-rspec `RSpec/PendingWithoutReason#metadata_without_reason?`,
+        // verbatim — the one vendored pattern that needs `<>`.
+        let pattern = "(send #rspec?\n \
+            {#ExampleGroups.all #Examples.all} ...\n \
+            {\n \
+              <(sym ${:pending :skip}) ...>\n \
+              (hash <(pair (sym ${:pending :skip}) true) ...>)\n \
+            }\n \
+          )";
+        let compiled = CompiledPattern::compile(pattern).unwrap();
+        assert_eq!(compiled.capture_count(), 1);
+
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', :pending do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert_eq!(
+            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            "pending"
+        );
+
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', skip: true do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert_eq!(
+            captured_name(&compiled.match_captures(&call).unwrap(), 0),
+            "skip"
+        );
+
+        // No pending/skip metadata at all.
+        let result = ruby_prism::parse(b"RSpec.describe 'thing', :focus do\nend");
+        let node = first_stmt(&result);
+        let call = node.as_call_node().unwrap().as_node();
+        assert!(compiled.match_captures(&call).is_none());
+    }
+
+    #[test]
+    fn test_any_order_term_cap_is_enforced_at_compile_time() {
+        use super::super::parser::{ANY_ORDER_MAX_TERMS, Parser, PatternError};
+
+        let terms = (0..=ANY_ORDER_MAX_TERMS)
+            .map(|i| format!("(sym :s{i})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pattern = format!("(send nil? :foo <{terms}>)");
+        assert!(CompiledPattern::compile(&pattern).is_none());
+
+        let mut lexer = Lexer::new(&pattern);
+        let mut parser = Parser::new(lexer.tokenize());
+        assert!(parser.parse().is_none());
+        assert_eq!(
+            parser.error(),
+            Some(&PatternError::AnyOrderTooManyTerms {
+                found: ANY_ORDER_MAX_TERMS + 1,
+                max: ANY_ORDER_MAX_TERMS,
+            })
+        );
+
+        // One fewer term is fine.
+        let terms = (0..ANY_ORDER_MAX_TERMS)
+            .map(|i| format!("(sym :s{i})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(CompiledPattern::compile(&format!("(send nil? :foo <{terms}>)")).is_some());
+    }
+
+    #[test]
+    fn test_any_order_rest_must_be_last() {
+        assert!(CompiledPattern::compile("(send nil? :foo <... (sym _)>)").is_none());
     }
 }
