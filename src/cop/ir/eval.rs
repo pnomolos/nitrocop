@@ -361,6 +361,8 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
         Attr::Value => literal_value(node),
         Attr::Type => crate::node_pattern::parser_type_name(node)
             .map_or(Value::Nil, |name| Value::str(name.as_bytes())),
+        Attr::LeftSibling => sibling(node, ctx, -1),
+        Attr::RightSibling => sibling(node, ctx, 1),
         Attr::FirstChild => descendants(node, 1)
             .into_iter()
             .next()
@@ -371,6 +373,24 @@ fn attr_of<'pr>(value: &Value<'pr>, attr: Attr, ctx: &EvalCtx<'_, 'pr>) -> Value
             .map_or(Value::Nil, Value::Node),
         Attr::ParentType => unreachable!("handled above"),
     }
+}
+
+/// `Node#left_sibling` / `#right_sibling`, over the enclosing-node chain.
+///
+/// The chain is the only place the node's parent can come from, so the parent
+/// is the innermost entry that actually has this node as a direct Parser-gem
+/// child — which is `ancestors.last()` for `node` and one above it for
+/// `parent`, without either having to say which it is. A node that is not on
+/// the chain at all (a `$capture` from deeper in the match) has no reachable
+/// parent and answers `nil`.
+fn sibling<'pr>(node: &ruby_prism::Node<'pr>, ctx: &EvalCtx<'_, 'pr>, offset: isize) -> Value<'pr> {
+    for parent in ctx.ancestors.iter().rev() {
+        if crate::node_pattern::interpreter::is_parser_child(node, parent) {
+            return crate::node_pattern::interpreter::parser_sibling(node, parent, offset)
+                .map_or(Value::Nil, Value::Node);
+        }
+    }
+    Value::Nil
 }
 
 fn name_of<'pr>(node: &ruby_prism::Node<'pr>) -> Value<'pr> {

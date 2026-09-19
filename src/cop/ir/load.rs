@@ -47,7 +47,7 @@ const VIRTUAL_NODE_TYPES: &[&str] = &["numblock", "itblock"];
 #[rustfmt::skip]
 const ACCESSORS: &[&str] = &[
     "receiver", "parent", "body", "value", "name", "block", "condition", "arguments",
-    "first_argument", "last_argument",
+    "first_argument", "last_argument", "left_sibling", "right_sibling",
 ];
 
 /// `node.loc.<part>` names (design §1.2 "Anchor").

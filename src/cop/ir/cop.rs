@@ -795,7 +795,7 @@ impl Anchor {
             AnchorTarget::Capture(slot) => dup_node(caps.node(slot)?),
         };
         for accessor in &self.accessors {
-            current = accessor_node(&current, accessor)?;
+            current = accessor_node(&current, accessor, ancestors)?;
         }
         let loc = match &self.part {
             Some(part) => part_loc(&current, part)?,
@@ -821,14 +821,31 @@ impl Anchor {
 
 /// The structural accessors of `load::ACCESSORS`.
 ///
+/// `left_sibling` / `right_sibling` read the enclosing-node chain; everything
+/// else is a field of the node itself.
+///
 /// `parent` and `name` are in that vocabulary but resolve to no node here:
 /// `parent` mid-path would need the ancestor chain of a node the walker never
 /// visited, and `name` is bytes rather than a node. Both fail closed.
 fn accessor_node<'pr>(
     node: &ruby_prism::Node<'pr>,
     accessor: &str,
+    ancestors: &[ruby_prism::Node<'pr>],
 ) -> Option<ruby_prism::Node<'pr>> {
     match accessor {
+        // The chain is the only place a parent can come from, so the parent is
+        // the innermost entry that has this node as a direct Parser-gem child.
+        // A `send`'s method name is not a node, so `Struct.new(kw: nil)` finds
+        // nothing before the hash while `Struct.new(:foo, kw: nil)` finds
+        // `:foo` — exactly `left_sibling` plus upstream's `.is_a?(AST::Node)`.
+        "left_sibling" | "right_sibling" => {
+            let offset = if accessor == "left_sibling" { -1 } else { 1 };
+            ancestors.iter().rev().find_map(|parent| {
+                crate::node_pattern::interpreter::is_parser_child(node, parent)
+                    .then(|| crate::node_pattern::interpreter::parser_sibling(node, parent, offset))
+                    .flatten()
+            })
+        }
         "receiver" => node.as_call_node()?.receiver(),
         "block" => node.as_call_node()?.block(),
         "arguments" => node.as_call_node()?.arguments().map(|a| a.as_node()),

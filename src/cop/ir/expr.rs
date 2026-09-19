@@ -75,6 +75,11 @@ pub enum Attr {
     Type,
     /// `.parent_type` — Parser-gem type name of the enclosing node.
     ParentType,
+    /// `.left_sibling` / `.right_sibling` — the adjacent Parser-gem child of
+    /// this node's own parent, or `Nil` when there is none (or when it is a
+    /// name rather than a node, as a `send`'s method name is).
+    LeftSibling,
+    RightSibling,
     /// `.first_child` / `.last_child` — direct children, in source order.
     FirstChild,
     /// See [`Attr::FirstChild`].
@@ -96,6 +101,8 @@ fn attr_from_name(name: &str) -> Option<Attr> {
         "value" => Attr::Value,
         "type" => Attr::Type,
         "parent_type" => Attr::ParentType,
+        "left_sibling" => Attr::LeftSibling,
+        "right_sibling" => Attr::RightSibling,
         "first_child" => Attr::FirstChild,
         "last_child" => Attr::LastChild,
         _ => return None,
