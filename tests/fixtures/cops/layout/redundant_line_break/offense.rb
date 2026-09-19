@@ -622,3 +622,16 @@ def calculate(a, eSquared, phiPrime, osgb_fo)
       * ((1.0 - eSquared * Math.sin(phiPrime)**2)**-1.5)
   rho
 end
+
+# Same expression as the trailing-whitespace case in no_offense.rb, but without
+# the two trailing spaces on the closing brace: the joined line is 119 chars and
+# fits under MaxLineLength.
+params[:advanced_search] = {
+^ Layout/RedundantLineBreak: Redundant line break detected.
+  filter_elements: [
+    {
+      repository_column_id: 'aaaaaaaaaaaaaaaa',
+      operator: 'yesterday'
+    }
+  ]
+}

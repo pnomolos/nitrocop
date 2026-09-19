@@ -533,3 +533,16 @@ on_supported_os.each do |os, facts|
     end
   end
 end
+
+# Trailing whitespace on the LAST line of the expression is never followed by a
+# newline, so none of RuboCop's `to_single_line` substitutions strip it. The
+# joined length is 119 characters without it and 121 with it, which is what
+# suppresses the offense here (see the matching offense.rb case).
+params[:advanced_search] = {
+  filter_elements: [
+    {
+      repository_column_id: 'aaaaaaaaaaaaaaaa',
+      operator: 'yesterday'
+    }
+  ]
+}  

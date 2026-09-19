@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
+use regex::bytes::Regex;
 use ruby_prism::Visit;
 
 use crate::cop::{Cop, CopConfig};
@@ -336,6 +338,26 @@ use crate::parse::source::SourceFile;
 ///   covered in fixtures while preserving the broad value-only split-string
 ///   guard needed for RuboCop-accepted hash values, return expressions, and
 ///   long call arguments.
+///
+/// ## Fixes applied (2026-09-18)
+/// - **Verbatim `to_single_line` port**: `too_long` no longer reconstructs the
+///   joined line by trimming each physical line and gluing them with a single
+///   space. It now joins the raw lines of the span with `\n` and applies
+///   RuboCop's five `to_single_line` substitutions literally (via
+///   `regex::bytes`, with the backreference expanded into the two same-quote
+///   cases and the `(?=(&)?\.\w)` lookahead emulated by a capture). Two
+///   whitespace details were the actual divergence:
+///   - trailing whitespace on the **last** line of the span is never followed
+///     by a newline, so nothing strips it — `params[...] = {` … `}  ` measures
+///     121 chars in RuboCop and 119 in the old reconstruction (scinote-web
+///     `repository_rows_service_spec.rb`, LubyRuffy/fofa `ziptest.rb`);
+///   - the chain-dot rule `/\n\s*(?=(&)?\.\w)/` consumes only the newline
+///     and the *following* indent, so the previous line's trailing padding and
+///     its line-continuation backslash both survive into the joined string
+///     (xwmx/pandoc-ruby `test_pandoc_ruby.rb`, tamc/excel_to_code).
+///
+///   Sampled corpus effect (21 repos reproducing the oracle's per-repo counts):
+///   FP 39 → 23, FN unchanged.
 pub struct RedundantLineBreak;
 
 impl Cop for RedundantLineBreak {
@@ -861,53 +883,24 @@ impl<'a, 'pr> RedundantLineBreakVisitor<'a, 'pr> {
             .offset_to_line_col(end_offset.saturating_sub(1).max(start_offset));
 
         let lines: Vec<&[u8]> = self.source.lines().collect();
-        let mut combined = Vec::new();
-        let mut prev_had_backslash = false;
+        let mut joined: Vec<u8> = Vec::new();
         for line_num in start_line..=end_line {
             if line_num > lines.len() {
                 break;
             }
-            let line = lines[line_num - 1];
-            // Strip trailing whitespace, then strip trailing backslash (line continuation).
-            // Only remove the line-continuation backslash, NOT backslashes that are part of
-            // content (e.g., \1_\2 in regex replacements, \d in character classes).
-            let trimmed_end = trim_trailing_whitespace(line);
-            let had_backslash = trimmed_end.ends_with(b"\\");
-            let without_continuation = if had_backslash {
-                trim_trailing_whitespace(&trimmed_end[..trimmed_end.len() - 1])
-            } else {
-                trimmed_end
-            };
-            if combined.is_empty() {
-                combined.extend_from_slice(without_continuation);
-            } else {
-                let trimmed = trim_leading_whitespace(without_continuation);
-                // RuboCop's to_single_line merges string literals across backslash:
-                //   /(["']) *\\\n\s*\1/ → '' (same quote = merge)
-                //   /" *\\\n\s*'/ → '" + \'' (different quotes)
-                if prev_had_backslash && merge_string_continuation(&mut combined, trimmed) {
-                    // Merged string continuation — already handled
-                } else if starts_with_method_chain_dot(trimmed)
-                    || (ends_with_safe_navigation_operator(&combined)
-                        && trimmed.first().is_some_and(|b| is_word_char(*b)))
-                {
-                    // RuboCop's chain-dot collapse regex `/\n\s*(?=(&)?\.\w)/`
-                    // does NOT strip a preceding backslash, so a line ending in
-                    // `\` joined to a `.method` continuation keeps the `\` in
-                    // the joined source, inflating the length check.
-                    if prev_had_backslash {
-                        combined.push(b'\\');
-                    }
-                    combined.extend_from_slice(trimmed);
-                } else {
-                    combined.push(b' ');
-                    combined.extend_from_slice(trimmed);
-                }
+            if line_num > start_line {
+                joined.push(b'\n');
             }
-            prev_had_backslash = had_backslash;
+            let mut line = lines[line_num - 1];
+            // Prism keeps the CR of a CRLF pair in its line slices; RuboCop's
+            // `processed_source.lines` does not expose it as source content.
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            joined.extend_from_slice(line);
         }
 
-        utf8_char_count(&combined) > self.max_line_length
+        utf8_char_count(&to_single_line(&joined)) > self.max_line_length
     }
 
     fn comment_within(&self, start_offset: usize, end_offset: usize) -> bool {
@@ -1990,43 +1983,6 @@ fn starts_with_method_chain_dot(trimmed: &[u8]) -> bool {
     }
 }
 
-/// Merge string continuation across a backslash line break, matching
-/// RuboCop's `to_single_line` regex patterns:
-///   - `/(["']) *\\\n\s*\1/` → `''` (same quote: merge the strings)
-///   - `/" *\\\n\s*'/` → `" + '` (different quotes: use concatenation)
-///   - `/' *\\\n\s*"/` → `' + "` (different quotes: use concatenation)
-///
-/// Returns true if a merge was performed, false otherwise.
-fn merge_string_continuation(combined: &mut Vec<u8>, next_trimmed: &[u8]) -> bool {
-    if combined.is_empty() || next_trimmed.is_empty() {
-        return false;
-    }
-    let last = combined[combined.len() - 1];
-    let first = next_trimmed[0];
-    if last != b'"' && last != b'\'' {
-        return false;
-    }
-    if first != b'"' && first != b'\'' {
-        return false;
-    }
-    if last == first {
-        // Same quote: merge the two string literals into one
-        // "foo" \ "bar" → "foobar"
-        combined.pop(); // Remove trailing quote
-        combined.extend_from_slice(&next_trimmed[1..]); // Skip leading quote
-    } else {
-        // Different quotes: use + operator
-        // "foo" \ 'bar' → "foo" + 'bar'
-        combined.extend_from_slice(b" + ");
-        combined.extend_from_slice(next_trimmed);
-    }
-    true
-}
-
-fn ends_with_safe_navigation_operator(trimmed: &[u8]) -> bool {
-    trimmed.ends_with(b"&.")
-}
-
 fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -2135,6 +2091,54 @@ fn is_branch_terminator(trimmed: &[u8]) -> bool {
 /// RuboCop measures line length in characters, not bytes. For multi-byte UTF-8
 /// (e.g. CJK characters), byte length > char length, causing FNs when using
 /// byte length.
+/// Ruby's `\s` character class: `[ \t\r\n\f\v]`.
+const RUBY_WS: &str = r"[ \t\r\n\x0B\x0C]";
+
+/// Faithful port of RuboCop's `CheckSingleLineSuitability#to_single_line`:
+///
+/// ```ruby
+/// source
+///   .gsub(/" *\\\n\s*'/, %q(" + '))  # Double quote, backslash, then single quote
+///   .gsub(/' *\\\n\s*"/, %q(' + "))  # Single quote, backslash, then double quote
+///   .gsub(/(["']) *\\\n\s*\1/, '')   # Double or single quote, backslash, same quote
+///   .gsub(/\n\s*(?=(&)?\.\w)/, '')   # Method chaining, including `&.`
+///   .gsub(/\s*\\?\n\s*/, ' ')        # Any other line break, with or without backslash
+/// ```
+///
+/// Reproducing these substitutions verbatim matters: the two whitespace-sensitive
+/// details are that the chain-dot rule (4th) consumes only the newline and the
+/// *following* indentation — leaving the previous line's trailing padding and
+/// line-continuation backslash in place — and that trailing whitespace on the
+/// last line of the span is never followed by a newline, so nothing strips it.
+/// Both inflate RuboCop's measured length relative to a naive
+/// trim-and-join-with-one-space reconstruction.
+fn to_single_line(source: &[u8]) -> Vec<u8> {
+    // The backreference in RuboCop's third pattern is expanded into the two
+    // concrete quote characters; patterns 1 and 2 have already consumed the
+    // mixed-quote cases, so the two passes cannot overlap.
+    static RE_DQ_SQ: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r#""\x20*\\\n{RUBY_WS}*'"#)).unwrap());
+    static RE_SQ_DQ: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r#"'\x20*\\\n{RUBY_WS}*""#)).unwrap());
+    static RE_DQ_DQ: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r#""\x20*\\\n{RUBY_WS}*""#)).unwrap());
+    static RE_SQ_SQ: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r#"'\x20*\\\n{RUBY_WS}*'"#)).unwrap());
+    // `(?=(&)?\.\w)` is emulated by capturing the lookahead text and putting it
+    // back; the regex crate has no lookaround. `\w` is Ruby's ASCII `\w`.
+    static RE_CHAIN_DOT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"\n{RUBY_WS}*(&?\.[A-Za-z0-9_])")).unwrap());
+    static RE_ANY_BREAK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"{RUBY_WS}*\\?\n{RUBY_WS}*")).unwrap());
+
+    let s = RE_DQ_SQ.replace_all(source, &b"\" + '"[..]);
+    let s = RE_SQ_DQ.replace_all(&s, &b"' + \""[..]);
+    let s = RE_DQ_DQ.replace_all(&s, &b""[..]);
+    let s = RE_SQ_SQ.replace_all(&s, &b""[..]);
+    let s = RE_CHAIN_DOT.replace_all(&s, &b"$1"[..]);
+    RE_ANY_BREAK.replace_all(&s, &b" "[..]).into_owned()
+}
+
 fn utf8_char_count(bytes: &[u8]) -> usize {
     // UTF-8 continuation bytes match the pattern 10xxxxxx (0x80..0xBF).
     // Every other byte is the start of a new character.
