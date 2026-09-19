@@ -485,17 +485,32 @@ impl ChainVisitor<'_> {
     /// `extra_indentation` subtracts the operator length.
     fn expected_relative_to_receiver(
         &self,
-        _call_node: &ruby_prism::CallNode<'_>,
+        call_node: &ruby_prism::CallNode<'_>,
         receiver: &ruby_prism::Node<'_>,
     ) -> usize {
         let splat_adj = splat_operator_length(self.source, receiver);
         let effective_width = self.width.saturating_sub(splat_adj);
+        let (start, _) = self.receiver_alignment_base(call_node, receiver);
+        let (_, base_col) = self.source.offset_to_line_col(start);
+        base_col + effective_width
+    }
 
-        if let Some(base_col) = find_hash_method_base_col(self.source, receiver) {
-            base_col + effective_width
-        } else {
-            find_chain_root_col(self.source, receiver) + effective_width
+    /// RuboCop's `receiver_alignment_base`: the hash/`begin`-method base in the
+    /// receiver chain if there is one, else `first_call_has_a_dot(node).receiver`.
+    /// Returns that range's `(start_offset, end_offset)`.
+    fn receiver_alignment_base(
+        &self,
+        call_node: &ruby_prism::CallNode<'_>,
+        receiver: &ruby_prism::Node<'_>,
+    ) -> (usize, usize) {
+        if let Some(range) = find_hash_method_base_range(self.source, receiver) {
+            return range;
         }
+        if let Some(range) = first_dotted_call_receiver_range(call_node) {
+            return range;
+        }
+        let loc = receiver.location();
+        (loc.start_offset(), loc.end_offset())
     }
 
     fn expected_aligned(
@@ -653,7 +668,10 @@ impl ChainVisitor<'_> {
         if is_trailing_dot {
             format!("Align `{selector_str}` with `{base_name}` on line {base_line}.")
         } else {
-            format!("Align `.{selector_str}` with `{base_name}` on line {base_line}.")
+            // `right_hand_side` is `dot.join(selector)`, so the operator text is
+            // part of the reported source: `&.foo` for safe navigation.
+            let operator = call_operator_text(self.source, call_node);
+            format!("Align `{operator}{selector_str}` with `{base_name}` on line {base_line}.")
         }
     }
 
@@ -692,19 +710,38 @@ impl ChainVisitor<'_> {
             std::str::from_utf8(name).unwrap_or("?").to_string()
         } else if call_node.message_loc().is_some() {
             let name = call_node.name().as_slice();
-            format!(".{}", std::str::from_utf8(name).unwrap_or("?"))
+            let operator = call_operator_text(self.source, call_node);
+            format!("{operator}{}", std::str::from_utf8(name).unwrap_or("?"))
         } else {
             // Implicit call (proc call) — `a\n  .(args)`
             ".(".to_string()
         };
 
-        let (base_name, base_line) = find_receiver_relative_base_description(self.source, receiver);
+        // RuboCop's `base_source` is `@base.source[/[^\n]*/]` — the literal
+        // first line of the base range, not a reconstruction.
+        let (start, end) = self.receiver_alignment_base(call_node, receiver);
+        let (base_line, _) = self.source.offset_to_line_col(start);
+        let base_name = self
+            .source
+            .try_byte_slice(start, end)
+            .and_then(|text| text.lines().next())
+            .unwrap_or("?")
+            .to_string();
 
         format!(
             "Indent `{selector_str}` {} spaces more than `{base_name}` on line {base_line}.",
             self.width
         )
     }
+}
+
+/// The literal call-operator text (`.` or `&.`).
+fn call_operator_text(source: &SourceFile, call_node: &ruby_prism::CallNode<'_>) -> String {
+    call_node
+        .call_operator_loc()
+        .and_then(|loc| source.try_byte_slice(loc.start_offset(), loc.end_offset()))
+        .unwrap_or(".")
+        .to_string()
 }
 
 /// Get the line number of the selector/method name for a call node.
@@ -1951,104 +1988,48 @@ fn splat_operator_length(source: &SourceFile, receiver: &ruby_prism::Node<'_>) -
     0
 }
 
-/// RuboCop's `find_hash_method_base_in_receiver_chain` for
-/// `indented_relative_to_receiver` style.
-///
-/// Walks the receiver chain downward. For each call node, checks if its
-/// receiver is:
-/// 1. A hash literal (`HashNode`) → return that call's dot column
-/// 2. A parenthesized expression (`ParenthesesNode`) where the dot is on
-///    the same line as the closing paren → return that call's dot column
-///
-/// This handles patterns like:
-/// ```ruby
-/// { a: 1, b: 2 }.keys     # base = `.keys` dot
-///                  .first  # indented relative to `.keys`
-///
-/// (date_columns + cols).uniq    # base = `.uniq` dot
-///                        .each  # indented relative to `.uniq`
-/// ```
-fn find_hash_method_base_col(source: &SourceFile, node: &ruby_prism::Node<'_>) -> Option<usize> {
-    let call = node.as_call_node()?;
-    let recv = call.receiver()?;
-
-    // Check if receiver is a hash literal (HashNode or KeywordHashNode —
-    // RuboCop's `hash_type?` matches both)
-    if recv.as_hash_node().is_some() || recv.as_keyword_hash_node().is_some() {
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (_, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            return Some(dot_col);
+/// RuboCop's `first_call_has_a_dot(node).receiver` as a `(start, end)` range.
+fn first_dotted_call_receiver_range(node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+    let receiver = node.receiver()?;
+    if let Some(receiver_call) = receiver.as_call_node() {
+        if let Some(deeper) = first_dotted_call_receiver_range(&receiver_call) {
+            return Some(deeper);
         }
     }
-    // Check if receiver is a parenthesized expression with dot on
-    // the same line as the closing paren
-    if recv.as_parentheses_node().is_some() {
-        let (recv_end_line, _) = source.offset_to_line_col(recv.location().end_offset());
-        if let Some(dot_loc) = call.call_operator_loc() {
-            let (dot_line, dot_col) = source.offset_to_line_col(dot_loc.start_offset());
-            if dot_line == recv_end_line {
-                return Some(dot_col);
-            }
-        }
+    if node.call_operator_loc().is_some() {
+        let loc = receiver.location();
+        return Some((loc.start_offset(), loc.end_offset()));
     }
-
-    // Recurse into receiver chain
-    find_hash_method_base_col(source, &recv)
+    None
 }
 
-/// Build base description for `indented_relative_to_receiver` messages.
-///
-/// Returns (base_source_text, base_line) matching RuboCop's `base_source`
-/// which is `@base.source[/[^\n]*/]` — the first line of the base range.
-///
-/// For hash/paren chains, the base is the dot+selector (e.g., `.keys`).
-/// For normal chains, the base is the chain root (e.g., `Thing`).
-fn find_receiver_relative_base_description(
-    source: &SourceFile,
-    receiver: &ruby_prism::Node<'_>,
-) -> (String, usize) {
-    // Check for hash/paren method base first
-    if let Some((desc, line)) = find_hash_method_base_description(source, receiver) {
-        return (desc, line);
-    }
-
-    // Normal chain: base is the chain root receiver
-    find_chain_root_description(source, receiver)
-}
-
-/// Build description for hash/paren method base.
-/// Walks receiver chain looking for hash/paren receivers (same logic as
-/// `find_hash_method_base_col`), returns the dot+selector text.
-fn find_hash_method_base_description(
+/// RuboCop's `find_hash_method_base_in_receiver_chain` as a `(start, end)`
+/// range covering `dot.join(selector)`.
+fn find_hash_method_base_range(
     source: &SourceFile,
     node: &ruby_prism::Node<'_>,
-) -> Option<(String, usize)> {
+) -> Option<(usize, usize)> {
     let call = node.as_call_node()?;
     let recv = call.receiver()?;
 
     let is_hash = recv.as_hash_node().is_some() || recv.as_keyword_hash_node().is_some();
-    let is_paren_same_line = if recv.as_parentheses_node().is_some() {
-        if let Some(dot_loc) = call.call_operator_loc() {
+    let is_paren_same_line = recv.as_parentheses_node().is_some()
+        && call.call_operator_loc().is_some_and(|dot_loc| {
             let (recv_end_line, _) = source.offset_to_line_col(recv.location().end_offset());
             let (dot_line, _) = source.offset_to_line_col(dot_loc.start_offset());
             dot_line == recv_end_line
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+        });
 
     if is_hash || is_paren_same_line {
-        let name = std::str::from_utf8(call.name().as_slice()).unwrap_or("?");
         if let Some(dot_loc) = call.call_operator_loc() {
-            let (line, _) = source.offset_to_line_col(dot_loc.start_offset());
-            return Some((format!(".{name}"), line));
+            let end = call
+                .message_loc()
+                .map_or_else(|| dot_loc.end_offset(), |loc| loc.end_offset());
+            return Some((dot_loc.start_offset(), end));
         }
     }
 
-    // Recurse into receiver chain
-    find_hash_method_base_description(source, &recv)
+    find_hash_method_base_range(source, &recv)
 }
 
 fn find_chain_start_line(source: &SourceFile, node: &ruby_prism::Node<'_>) -> usize {

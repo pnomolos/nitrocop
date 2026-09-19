@@ -68,3 +68,9 @@ trigger = proc do
   described_class.new(url: url, inputs: { name: 'value' }).
       nonce_name = 'stuff'
 end
+
+# `base_source` is the literal first line of the base range, so the whole
+# argument list shows up, not a reconstruction.
+# nitrocop-expect: 63:1 Layout/MultilineMethodCallIndentation: Indent `.collect` 2 spaces more than `answer_options(answer, course)` on line 62.
+answer_options(answer, course)
+ .collect { |o| o }

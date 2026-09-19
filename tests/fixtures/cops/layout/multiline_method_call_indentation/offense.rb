@@ -347,3 +347,12 @@ def list
     ^^^^^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `.preload_all_dates` with `joins(:dates, :translations)` on line 278.
   subquery
 end
+
+# Safe navigation: `right_hand_side` is `dot.join(selector)`, so the reported
+# source is `&.foo`, not `.foo`.
+def links(item)
+  item.edition_organisations
+      .first
+    &.organisation
+    ^^^^^^^^^^^^^^ Layout/MultilineMethodCallIndentation: Align `&.organisation` with `.edition_organisations` on line 292.
+end
