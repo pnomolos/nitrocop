@@ -434,7 +434,29 @@ is the identity test for it.
 
 An `if`/`elsif`/`else` over correction *ranges* has no `correct:` spelling.
 Write one hook per branch, each with the `when:` upstream tests for it
-(`Style/RedundantStructKeywordInit` has four).
+(`Style/RedundantStructKeywordInit` has four, `Style/MapJoin` three). Those
+conditions are often positional, which is what the `loc` part and position
+attributes are for: `Style/MapJoin`'s
+
+```ruby
+start_pos = if receiver.last_line < map_send.loc.dot.line
+              receiver.source_range.end_pos
+            else
+              map_send.loc.dot.begin_pos
+            end
+```
+
+is two hooks whose `when:` are `{ lt: [$map.receiver.last_line, $map.loc.dot.line] }`
+and its `ge:` complement, and whose `correct:` ranges start at
+`$map.receiver.loc.expression.stop` and `$map.loc.dot.start` respectively.
+
+**A node that is both a call and a block.** Prism has one `CallNode` for
+`array.map { … }`, and it answers to the Parser types `send` *and*
+`block`/`numblock`/`itblock`, in head position and in child position alike. So
+upstream's four `Style/MapJoin` patterns — one per block spelling, each with the
+map call as a `$`-captured child of the `join` call — copy over unchanged, and
+`map_node.any_block_type? ? map_node.send_node : map_node` collapses to the
+capture itself.
 
 A shipped document that fails to load is a **panic at startup**: it is a bug in
 the binary, not in the user's project, and `ir_embedded_cops_load` exercises

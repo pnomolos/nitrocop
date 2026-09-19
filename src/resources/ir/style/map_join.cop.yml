@@ -1,0 +1,114 @@
+schema: 1
+cop: "Style/MapJoin"
+version_added: "1.85"
+enabled_default: pending
+tier: preview
+# `Safe: false` in config/default.yml — the receiver is not provably an Array.
+autocorrect: unsafe
+restrict_on_send: [join]
+docs: |
+  Checks for `map { |x| x.to_s }.join` and similar calls where the `map` is
+  redundant because `Array#join` implicitly calls `#to_s` on each element.
+
+matchers:
+  # Verbatim from vendor/rubocop @ v1.91.0 lib/rubocop/cop/style/map_join.rb.
+  # Prism has one `CallNode` for a call carrying a block, and it answers to the
+  # Parser type `block`/`numblock`/`itblock` in child position, so all four
+  # patterns match the same node shape the upstream ones do.
+  map_to_s_join?:
+    pattern: |
+      (call
+        $(call _ ${:map :collect} (block_pass (sym :to_s)))
+        :join ...)
+    captures: [map, method]
+  map_to_s_block_join?:
+    pattern: |
+      (call
+        $(block
+          (call _ ${:map :collect})
+          (args (arg _x))
+          (send (lvar _x) :to_s))
+        :join ...)
+    captures: [map, method]
+  map_to_s_numblock_join?:
+    pattern: |
+      (call
+        $(numblock
+          (call _ ${:map :collect})
+          1
+          (send (lvar :_1) :to_s))
+        :join ...)
+    captures: [map, method]
+  map_to_s_itblock_join?:
+    pattern: |
+      (call
+        $(itblock
+          (call _ ${:map :collect})
+          :it
+          (send (lvar :it) :to_s))
+        :join ...)
+    captures: [map, method]
+
+hooks:
+  # Upstream's `on_send` is one hook; `register_offense` is shared, and only
+  # `remove_map_call` branches. It branches over *ranges*, so each outcome is
+  # its own hook, carrying the condition upstream tests for it:
+  #
+  # | hook | upstream branch                       | range                                    |
+  # |------|---------------------------------------|------------------------------------------|
+  # | 1    | `removal_range`, receiver ends earlier | receiver end -> map end                  |
+  # | 2    | `removal_range`, else                 | map's dot -> map end                     |
+  # | 3    | `no_receiver_range`                   | map start -> join's dot end              |
+  #
+  # `map_send` is `map_node.any_block_type? ? map_node.send_node : map_node`,
+  # which in Prism is the same node either way — `array.map { … }` is one
+  # `CallNode` whose selector is `map` — so `$map` serves as both.
+  - &mj_base
+    on: [send, csend]
+    match: &mj_match
+      any_of:
+        - "map_to_s_join?"
+        - "map_to_s_block_join?"
+        - "map_to_s_numblock_join?"
+        - "map_to_s_itblock_join?"
+    # `receiver.last_line < map_send.loc.dot.line`: the `.map` is on a later
+    # line than the receiver ends on, so the dot belongs to the removed span.
+    when:
+      all:
+        - &mj_has_receiver { ne: [$map.receiver, null] }
+        - { lt: [$map.receiver.last_line, $map.loc.dot.line] }
+    offense: &mj_offense
+      location: $map.selector
+      message: "Remove redundant `%{method}(&:to_s)` before `join`."
+      correct:
+        - op: remove
+          range:
+            start: $map.receiver.loc.expression.stop
+            stop: $map.loc.expression.stop
+
+  # `removal_range`, else branch: the dot is on the receiver's last line, so
+  # the removal starts at the dot itself.
+  - <<: *mj_base
+    when:
+      all:
+        - *mj_has_receiver
+        - { ge: [$map.receiver.last_line, $map.loc.dot.line] }
+    offense:
+      <<: *mj_offense
+      correct:
+        - op: remove
+          range:
+            start: $map.loc.dot.start
+            stop: $map.loc.expression.stop
+
+  # `no_receiver_range`: nothing precedes `map`, so the whole `map(…).` goes,
+  # including the `join` call's own dot.
+  - <<: *mj_base
+    when: { eq: [$map.receiver, null] }
+    offense:
+      <<: *mj_offense
+      correct:
+        - op: remove
+          range:
+            start: $map.loc.expression.start
+            stop: node.loc.dot.stop

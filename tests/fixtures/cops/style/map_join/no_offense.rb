@@ -1,0 +1,10 @@
+array.map(&:to_i).join(', ')
+array.map { |x| x.to_i }.join(', ')
+array.map(&:to_s)
+array.map(&:to_s).compact
+array.join(', ')
+array.map { |x| x.to_s(16) }.join(', ')
+array.map { |x, y| x.to_s }.join(', ')
+array.map { _1.to_s(16) }.join(', ')
+join(', ')
+array.each(&:to_s).join(', ')
