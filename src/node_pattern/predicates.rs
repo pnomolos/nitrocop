@@ -85,6 +85,29 @@ pub enum Arg {
     Unresolved,
 }
 
+/// Whether the Ruby regexp `/body/flags` finds a match in `value`.
+///
+/// Ruby's Onigmo and Rust's `regex` agree on the constructs the vendored
+/// patterns use, but not in general (no backreferences or lookaround in
+/// `regex`); a body `regex` refuses to compile is treated as matching nothing
+/// rather than as matching everything.
+///
+/// The compile happens per call. Exactly one vendored pattern
+/// (`InternalAffairs/StyleDetectedApiUse`) carries a regexp atom, so this is
+/// not a hot path; the IR's `Matcher` compiler hoists it into the
+/// `regexes: Vec<regex::Regex>` table the design allocates for it (§3.1).
+fn regexp_matches(body: &str, flags: &str, value: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let mut builder = regex::RegexBuilder::new(body);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .ignore_whitespace(flags.contains('x'));
+    builder.build().is_ok_and(|regexp| regexp.is_match(text))
+}
+
 impl Arg {
     /// Whether this argument, used as a matcher, accepts `name`.
     ///
@@ -94,10 +117,34 @@ impl Arg {
     /// closed rather than silently accepting everything.
     #[must_use]
     pub fn accepts_name(&self, name: &[u8]) -> bool {
+        self.accepts_value(name)
+    }
+
+    /// Whether this argument, used as a matcher, accepts the byte slice
+    /// `value` — upstream's `arg === value`.
+    ///
+    /// Symbols and strings compare by bytes, a `Set` by membership, and a
+    /// regexp by search. [`Arg::Unresolved`] never matches, so an unbound
+    /// parameter fails closed rather than silently accepting everything.
+    #[must_use]
+    pub fn accepts_value(&self, value: &[u8]) -> bool {
         match self {
-            Arg::Symbol(s) | Arg::Str(s) => s.as_bytes() == name,
-            Arg::Set(items) => items.iter().any(|item| item.accepts_name(name)),
-            _ => false,
+            Arg::Symbol(text) | Arg::Str(text) => text.as_bytes() == value,
+            Arg::Set(items) => items.iter().any(|item| item.accepts_value(value)),
+            Arg::Int(number) => {
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|text| text.replace('_', "").parse::<i64>().ok())
+                    == Some(*number)
+            }
+            Arg::Float(number) => {
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|text| text.replace('_', "").parse::<f64>().ok())
+                    == Some(*number)
+            }
+            Arg::Regexp { body, flags } => regexp_matches(body, flags, value),
+            Arg::Unresolved => false,
         }
     }
 

@@ -24,6 +24,9 @@
 
 use std::ops::Index;
 
+use super::predicates::Arg;
+use super::resolve::{NO_RESOLVER, Params, Resolver};
+
 // A duplicated `Node` handle must not imply duplicated ownership; this fails the
 // build if upstream ever gives the handle drop glue.
 const _: () = assert!(!std::mem::needs_drop::<ruby_prism::Node<'static>>());
@@ -161,24 +164,80 @@ impl<'pr> Index<usize> for Captures<'pr> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark(usize);
 
-/// Mutable capture state threaded through a match attempt.
-#[derive(Debug)]
-pub struct MatchEnv<'pr> {
+/// Mutable capture state threaded through a match attempt, plus the two
+/// read-only inputs a term may need to resolve itself: the `%param` bindings
+/// and the owner's resolver (`resolve.rs`).
+pub struct MatchEnv<'pr, 'r> {
     slots: Vec<Option<CaptureValue<'pr>>>,
     /// Journal of `(slot, previous value)` pairs, newest last.
     trail: Vec<(usize, Option<CaptureValue<'pr>>)>,
+    params: &'r Params,
+    resolver: &'r dyn Resolver,
 }
 
-impl<'pr> MatchEnv<'pr> {
-    /// Create an environment with `capture_count` empty slots.
+impl std::fmt::Debug for MatchEnv<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatchEnv")
+            .field("slots", &self.slots)
+            .field("trail", &self.trail)
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The parameter set a `MatchEnv` with no bindings points at.
+static NO_PARAMS: std::sync::LazyLock<Params> = std::sync::LazyLock::new(Params::new);
+
+impl<'pr, 'r> MatchEnv<'pr, 'r> {
+    /// Create an environment with `capture_count` empty slots, no `%param`
+    /// bindings and the empty resolver.
     #[must_use]
     pub fn new(capture_count: usize) -> Self {
+        Self::with_inputs(capture_count, &NO_PARAMS, &NO_RESOLVER)
+    }
+
+    /// Create an environment carrying `params` and `resolver`.
+    #[must_use]
+    pub fn with_inputs(
+        capture_count: usize,
+        params: &'r Params,
+        resolver: &'r dyn Resolver,
+    ) -> Self {
         let mut slots = Vec::new();
         slots.resize_with(capture_count, || None);
         Self {
             slots,
             trail: Vec::new(),
+            params,
+            resolver,
         }
+    }
+
+    /// The `%param` bindings this match was invoked with.
+    #[must_use]
+    pub fn params(&self) -> &'r Params {
+        self.params
+    }
+
+    /// The owner's resolver.
+    #[must_use]
+    pub fn resolver(&self) -> &'r dyn Resolver {
+        self.resolver
+    }
+
+    /// The value of a `%param`, or [`Arg::Unresolved`] when it is unbound.
+    #[must_use]
+    pub fn positional_param(&self, number: usize) -> Arg {
+        self.params.get(number).cloned().unwrap_or(Arg::Unresolved)
+    }
+
+    /// The value of a `%name`, or [`Arg::Unresolved`] when it is unbound.
+    #[must_use]
+    pub fn named_param(&self, name: &str) -> Arg {
+        self.params
+            .get_named(name)
+            .cloned()
+            .unwrap_or(Arg::Unresolved)
     }
 
     /// Record the current journal position, to be passed to [`Self::rollback`].
@@ -220,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_rollback_restores_previous_value() {
-        let mut env: MatchEnv<'_> = MatchEnv::new(2);
+        let mut env: MatchEnv<'_, '_> = MatchEnv::new(2);
         env.set(0, CaptureValue::Name(b"first"));
         let mark = env.mark();
         env.set(0, CaptureValue::Name(b"second"));
@@ -235,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_rollback_to_start_clears_everything() {
-        let mut env: MatchEnv<'_> = MatchEnv::new(1);
+        let mut env: MatchEnv<'_, '_> = MatchEnv::new(1);
         let mark = env.mark();
         env.set(0, CaptureValue::Absent);
         env.rollback(mark);
@@ -244,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_out_of_range_set_is_ignored() {
-        let mut env: MatchEnv<'_> = MatchEnv::new(1);
+        let mut env: MatchEnv<'_, '_> = MatchEnv::new(1);
         env.set(5, CaptureValue::Absent);
         assert_eq!(env.into_captures().len(), 1);
     }
